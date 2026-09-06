@@ -1,0 +1,41 @@
+[package]
+name = "moyai-hub"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+build = "build.rs"
+
+[features]
+default = ["tauri-desktop"]
+tauri-desktop = ["dep:tauri", "dep:tauri-build", "dep:rfd", "tauri/custom-protocol"]
+
+[lib]
+name = "moyai_hub"
+path = "src/lib.rs"
+
+[[bin]]
+name = "moyai-hub"
+path = "src/main.rs"
+required-features = ["tauri-desktop"]
+
+[dependencies]
+axum = "0.8.6"
+fs2 = "0.4.3"
+reqwest = { version = "0.12.24", default-features = false, features = ["json", "stream", "rustls-tls"] }
+rfd = { version = "0.15.4", optional = true }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+tauri = { version = "2.9.2", optional = true }
+thiserror = "2.0.17"
+tempfile = "3.23.0"
+tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "process", "io-std"] }
+futures-core = "0.3.31"
+futures-util = "0.3.32"
+rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "pem", "ring", "x509-parser"] }
+sha2 = "0.10.9"
+time = "0.3.47"
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
+ulid = { version = "1.2.1", features = ["serde"] }
+
+[build-dependencies]
+tauri-build = { version = "2.5.1", optional = true }

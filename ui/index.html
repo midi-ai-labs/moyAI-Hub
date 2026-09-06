@@ -1,0 +1,486 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>
+      moyAI Hub
+    </title>
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <a href="#overview" class="brand">
+          <span class="brand-mark">
+            m
+          </span>
+          <span>
+            moyAI
+            <b>
+              Hub
+            </b>
+            <small>
+              モデル管理
+            </small>
+          </span>
+        </a>
+        <div class="workspace-label">
+          ページ内の移動
+        </div>
+        <nav aria-label="ページ内の移動">
+          <a href="#device-network" class="nav-link"><span>⇄</span><span>端末ネットワーク</span></a>
+          <a href="#overview" class="nav-link">
+            ◉
+            <span>
+              概要
+            </span>
+          </a>
+          <a href="#models" class="nav-link">
+            ▦
+            <span>
+              モデル
+            </span>
+            <span id="nav-model-count" class="count">
+              0
+            </span>
+          </a>
+          <a href="#clients" class="nav-link">
+            ▣
+            <span>
+              接続端末
+            </span>
+            <span id="nav-client-count" class="count">
+              0
+            </span>
+          </a>
+          <a href="#revisions" class="nav-link">
+            ↻
+            <span>
+              カタログ変更
+            </span>
+          </a>
+        </nav>
+        <div class="sidebar-footer">
+          <span class="dev-tag">
+            開発版
+          </span>
+          <p>
+            v0.1.0 · 管理基盤
+          </p>
+          <small>
+            この Hub を経由するモデル実行を管理します。
+          </small>
+        </div>
+      </aside>
+      <main>
+        <header id="overview">
+          <div>
+            <p class="eyebrow">
+              管理の概要
+            </p>
+            <h1>
+              モデルと端末を、ひとつの場所で。
+            </h1>
+            <p class="subtle">
+              端末ネットワークを開き、参加する端末・接続の許可・モデルの割当を管理します。
+            </p>
+          </div>
+          <div class="header-status">
+            <span class="dot" id="header-dot">
+            </span>
+            <span id="header-status">
+              モデル接続は停止中
+            </span>
+          </div>
+        </header>
+        <div id="notice" role="status" aria-live="polite" class="notice" hidden>
+        </div>
+        <section class="metrics" aria-label="概要">
+          <div class="metric">
+            <span>
+              登録モデル
+            </span>
+            <strong id="metric-models">
+              0
+            </strong>
+            <small id="metric-hosts">
+              0 配置
+            </small>
+          </div>
+          <div class="metric">
+            <span>
+              ホストのロード状態
+            </span>
+            <div class="load-counts"><div><strong id="metric-ready">0</strong><span>ロード済み</span></div><div><strong id="metric-unknown">0</strong><span>状態不明</span></div></div>
+            <small>不明でも実行できる場合があります</small>
+          </div>
+          <div class="metric">
+            <span>
+              接続端末
+            </span>
+            <strong id="metric-clients">
+              0
+            </strong>
+            <small>
+              生存確認が届いている端末
+            </small>
+          </div>
+          <div class="metric">
+            <span>
+              カタログ更新番号
+            </span>
+            <strong id="metric-revision">
+              —
+            </strong>
+            <small>
+              設定変更は再確認の対象
+            </small>
+          </div>
+        </section>
+        <section class="panel server-panel" aria-labelledby="server-heading">
+          <div class="section-title">
+            <div>
+              <p class="eyebrow">
+                はじめに
+              </p>
+              <h2 id="server-heading">
+                端末ネットワークから始める
+              </h2>
+            </div>
+          </div>
+          <div class="network-introduction">
+            <p class="subtle">このHubのIPを指定してネットワークを開始し、共通設定と参加コードをDesktopへ渡します。モデル接続とGatewayもまとめて起動します。</p>
+            <a id="open-device-network" class="primary-link" href="#device-network">端末ネットワークを設定する →</a>
+          </div>
+          <div id="gateway-summary" class="execution-summary" role="status"><h3>モデルの実行状況</h3><p id="gateway-status">モデル実行は停止中</p><p id="gateway-detail" class="subtle">停止や切断の後も、接続先の処理が終わるまで実行枠を保持します。</p></div>
+          <div id="gateway-recovery" hidden><label class="checkbox"><input id="provider-quiescent" type="checkbox"/>接続先のモデル実行が終了したことを確認しました</label><button id="acknowledge-gateway" type="button" disabled>実行保留を解除</button></div>
+          <details class="technical-details"><summary>実行経路の詳しい説明</summary><p class="footnote">Hub 本体は会話本文を中継せず、別プロセスの Gateway が生成を中継します。実行枠の上限はこの経路だけに適用し、モデルホストへの直接利用は計数・制限しません。</p></details>
+          <details id="manual-server-connection" data-details-key="manual-server-connection" class="manual-server-details">
+            <summary>従来の手動接続（同じPC内）</summary>
+            <p class="subtle">従来の接続先URLとトークンを手動設定する構成向けです。端末ネットワークを使う場合、この手動サーバーの開始は不要です。両方を同時には開始できません。</p>
+            <div class="section-title"><h3>手動サーバー</h3><span id="server-badge" class="badge gray">停止中</span></div>
+            <form id="server-form">
+              <div class="server-fields">
+                <label>
+                  待受アドレス
+                  <input id="bind" name="bind" value="127.0.0.1:9470" required spellcheck="false" autocomplete="off"/>
+                  <small>手動接続は同じPC内だけで利用できます。</small>
+                </label>
+                <label>
+                  接続用トークン
+                  <div class="input-action">
+                    <input id="token" name="token" type="password" placeholder="32 文字以上のトークン" minlength="32" maxlength="256" required autocomplete="off"/>
+                    <button id="generate-token" type="button" class="secondary">生成</button>
+                  </div>
+                  <small>起動中だけ有効。端末へ安全に共有してください。</small>
+                </label>
+                <button id="start-server" class="primary" type="submit">サーバーを開始</button>
+                <button id="stop-server" class="danger" type="button" hidden>停止</button>
+              </div>
+            </form>
+            <label class="checkbox"><input id="enable-gateway" type="checkbox" form="server-form"/>モデル実行も有効にする（Gateway）</label>
+          </details>
+        </section>
+        <section class="panel" id="device-network" aria-labelledby="network-heading"></section>
+        <section class="panel" id="models" aria-labelledby="models-heading">
+          <div class="section-title">
+            <div>
+              <p class="eyebrow">
+                モデルの管理
+              </p>
+              <h2 id="models-heading">
+                登録モデル
+              </h2>
+            </div>
+            <button id="refresh-models" class="secondary">
+              ↻ 状態を確認
+            </button>
+          </div>
+          <div class="register-card">
+            <div>
+              <h3>
+                ホストからモデルを追加
+              </h3>
+              <p class="subtle">
+                IP:port を入力すると、モデル候補を自動で取得します。
+              </p>
+            </div>
+            <form id="register-form">
+              <div class="registration-fields">
+                <label>
+                  接続方式
+                  <select id="profile">
+                    <option value="openai_compatible_chat">
+                      OpenAI 互換 / oMLX
+                    </option>
+                    <option value="lmstudio_chat">
+                      LM Studio
+                    </option>
+                  </select>
+                </label>
+                <label>
+                  ホストの IP:port
+                  <input id="endpoint" placeholder="192.168.1.20:1234" spellcheck="false" autocomplete="off" required/>
+                </label>
+                <button id="discover" type="button" class="secondary">
+                  モデルを取得
+                </button>
+              </div>
+              <p id="discovery-status" class="field-status" role="status" aria-live="polite">
+                ホストを指定してください。
+              </p>
+              <div class="registration-fields">
+                <label>
+                  モデル
+                  <select id="model" required disabled>
+                    <option value="">
+                      モデル候補
+                    </option>
+                  </select>
+                </label>
+                <label>
+                  表示名
+                  <input id="label" placeholder="例: 開発用 Qwen" maxlength="160" required/>
+                </label>
+                <button id="register" type="submit" class="primary" disabled>
+                  ＋ モデルを登録
+                </button>
+              </div>
+              <label class="checkbox"><input id="allow-tools" type="checkbox"/>ツール利用を許可（管理者確認）</label>
+              <p class="footnote">ホストが機能を未報告の場合の管理者宣言です。このモデルでツール利用を確認した場合に選択してください。ホストの報告値とは別の確認方法です。</p>
+              <details class="registration-options">
+                <summary>
+                  同じモデルの別ホスト・容量を設定
+                </summary>
+                <div class="registration-fields">
+                  <label>
+                    同じモデルとしてまとめる
+                    <select id="logical-model">
+                      <option value="">
+                        新しいモデルとして登録
+                      </option>
+                    </select>
+                    <small>
+                      同一モデルのホストを束ねる場合に選択
+                    </small>
+                  </label>
+                  <label>
+                    実行枠を共有するグループ
+                    <select id="capacity-pool">
+                      <option value="">
+                        このホストに新しいグループを作成
+                      </option>
+                    </select>
+                    <small>
+                      同じ GPU / 実行枠を共有する場合に選択
+                    </small>
+                  </label>
+                  <label>
+                    新しいグループの実行上限
+                    <input id="capacity" type="number" min="1" max="1024" value="1" required/>
+                  </label>
+                </div>
+              </details>
+            </form>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>
+                    モデル / ホスト
+                  </th>
+                  <th>
+                    状態
+                  </th>
+                  <th>
+                    確認した対応機能
+                  </th>
+                  <th>
+                    共有する実行枠
+                  </th>
+                  <th>
+                    最終確認
+                  </th>
+                  <th>
+                    <span class="sr-only">
+                      操作
+                    </span>
+                  </th>
+                </tr>
+              </thead>
+              <tbody id="model-rows">
+              </tbody>
+            </table>
+          </div>
+          <div id="models-empty" class="empty">
+            <span>
+              ▦
+            </span>
+            <h3>
+              モデルはまだ登録されていません
+            </h3>
+            <p>
+              まずは上のフォームに、LLM ホストの IP:port を入力してください。
+            </p>
+          </div>
+          <div class="legend">
+            <span>
+              <i class="dot blue">
+              </i>
+              ロード済み
+            </span>
+            <span>
+              <i class="dot green">
+              </i>
+              未ロード
+            </span>
+            <span>
+              <i class="dot red">
+              </i>
+              モデルなし
+            </span>
+            <span>
+              <i class="dot gray">
+              </i>
+              状態不明 / 接続不可
+            </span>
+          </div>
+          <p class="footnote">ロード状態が不明でも、モデル一覧で存在を確認できた OpenAI 互換 / oMLX には実行を試せます。</p>
+          <details class="technical-details"><summary>モデル状態と実行枠の詳しい説明</summary><p class="footnote">モデル一覧への掲載とロード状態は別の情報です。ホストが報告しないロード状態は推測しません。ロード済み表示も生成の成功を保証しません。同じ GPU を使うホストは同じ実行枠グループ（容量プール）にまとめます。上限は Gateway 経由の要求に適用します。</p></details>
+        </section>
+        <section class="panel" id="clients" aria-labelledby="clients-heading">
+          <div class="section-title">
+            <div>
+              <p class="eyebrow">
+                接続の確認
+              </p>
+              <h2 id="clients-heading">
+                接続端末
+              </h2>
+            </div>
+            <span class="live-caption">
+              <i class="dot green">
+              </i>
+              2 秒ごとに更新
+            </span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>
+                    端末 / 識別 ID
+                  </th>
+                  <th>
+                    接続元 IP
+                  </th>
+                  <th>
+                    端末の申告状態
+                  </th>
+                  <th>
+                    カタログ確認
+                  </th>
+                  <th>
+                    最終生存確認
+                  </th>
+                </tr>
+              </thead>
+              <tbody id="client-rows">
+              </tbody>
+            </table>
+          </div>
+          <div id="clients-empty" class="empty compact">
+            <h3>
+              接続している端末はありません
+            </h3>
+            <p>
+              サーバーを開始し、対応クライアントを登録すると、ここに表示されます。
+            </p>
+          </div>
+          <p class="footnote">
+            端末の状態は Desktop からの申告です。「操作待ち」に戻っても、接続先の処理が続く場合があります。上の実行状況で「上流終了確認待ち」を確認してください。
+          </p>
+          <details class="technical-details"><summary>端末の識別と生存確認について</summary><p class="footnote">IP は表示情報であり、端末の識別と認証には専用 ID とトークンを使います。30 秒間の生存確認（heartbeat）がない端末は切断として表示します。サーバー再起動時には再登録が必要です。</p></details>
+        </section>
+        <section class="panel" id="revisions" aria-labelledby="revision-heading">
+          <div class="section-title">
+            <div>
+              <p class="eyebrow">
+                変更の再確認
+              </p>
+              <h2 id="revision-heading">
+                カタログの変更
+              </h2>
+            </div>
+            <span class="subtle">
+              直近 64 件
+            </span>
+          </div>
+          <p class="subtle">
+            モデルや実行枠の設定を変更すると、カタログ更新番号が進みます。Desktop では次に Hub へ送信する前に、変更内容の確認が必要です。
+          </p>
+          <div id="revision-rows" class="revision-list">
+          </div>
+          <p id="revisions-empty" class="subtle">
+            変更履歴はまだありません。
+          </p>
+        </section>
+        <footer>
+          moyAI Hub
+          <span>
+            ·
+          </span>
+          <span id="hub-identity">
+            ローカル管理
+          </span>
+          <span>
+            ·
+          </span>
+          開発版
+        </footer>
+      </main>
+    </div>
+    <dialog id="edit-dialog" aria-labelledby="edit-heading">
+      <form id="edit-form">
+        <div class="section-title">
+          <h2 id="edit-heading">
+            モデル配置を編集
+          </h2>
+          <button type="button" id="close-edit" class="icon-button" aria-label="閉じる">
+            ×
+          </button>
+        </div>
+        <p id="edit-target" class="subtle">
+        </p>
+        <label>
+          表示名
+          <input id="edit-label" required maxlength="160"/>
+        </label>
+        <label>
+          グループの実行上限
+          <input id="edit-capacity" type="number" min="1" max="1024" required/>
+        </label>
+        <p class="footnote">
+          この実行枠グループを共有するすべての登録先に適用されます。
+        </p>
+        <label class="checkbox">
+          <input id="edit-enabled" type="checkbox"/>
+          割当候補に含める（OFF はメンテナンス）
+        </label>
+        <p id="edit-error" class="field-status" role="status">
+        </p>
+        <div class="dialog-actions">
+          <button type="button" class="danger" id="remove-model">
+            配置を削除
+          </button>
+          <button type="submit" class="primary" id="save-edit">
+            変更を保存
+          </button>
+        </div>
+      </form>
+    </dialog>
+    <script type="module" src="/src/main.ts">
+    </script>
+  </body>
+</html>

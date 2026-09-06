@@ -1,0 +1,381 @@
+//! Process ownership and metadata-only companion control. Credentials travel through stdin.
+use crate::gateway::{CancelScope, Gateway, Grant};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::{
+    fs::{File, OpenOptions},
+    io,
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    process::{Child, ChildStdin, ChildStdout, Command},
+};
+
+const MARKER: &str = "gateway-uncertain.json";
+const LOCK: &str = "gateway-execution.lock";
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Init {
+    hub_url: String,
+    control_token: String,
+    data_directory: PathBuf,
+    #[serde(default)]
+    network: Option<GatewayNetwork>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayNetwork {
+    pub bind: std::net::SocketAddr,
+    pub advertise_ip: std::net::IpAddr,
+    pub certificate_pem: String,
+    pub private_key_pem: String,
+    pub ca_certificate_pem: String,
+}
+
+#[derive(Clone)]
+pub struct GatewayControl {
+    base_url: String,
+    token: String,
+    client: reqwest::Client,
+    network_base_url: Option<String>,
+}
+#[derive(Debug)]
+pub struct ControlError {
+    pub status: u16,
+    pub code: String,
+}
+impl GatewayControl {
+    pub fn for_loopback(base_url: String, token: String) -> Result<Self, String> {
+        let url = reqwest::Url::parse(&base_url).map_err(|_| "Gateway の待受先が無効です。")?;
+        if url.scheme() != "http"
+            || url.host_str() != Some("127.0.0.1")
+            || url.port().is_none()
+            || url.path() != "/"
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || token.len() < 32
+            || token.len() > 256
+        {
+            return Err("Gateway の待受先または認証が無効です。".into());
+        }
+        Ok(Self {
+            base_url: base_url.trim_end_matches('/').into(),
+            network_base_url: None,
+            token,
+            client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|_| "Gateway client を作成できません。")?,
+        })
+    }
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+    pub fn network_base_url(&self) -> Option<&str> {
+        self.network_base_url.as_deref()
+    }
+    pub fn with_network_base_url(mut self, base: String) -> Result<Self, String> {
+        let url = reqwest::Url::parse(&base).map_err(|_| "Gateway TLS の待受先が無効です。")?;
+        let ip = url
+            .host_str()
+            .and_then(|s| s.trim_matches(['[', ']']).parse::<std::net::IpAddr>().ok());
+        if url.scheme() != "https"
+            || ip.is_none_or(|ip| ip.is_unspecified() || ip.is_multicast())
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || url.path() != "/"
+        {
+            return Err("Gateway TLS の待受先が無効です。".into());
+        }
+        self.network_base_url = Some(base.trim_end_matches('/').into());
+        Ok(self)
+    }
+    pub fn token_matches(&self, candidate: &str) -> bool {
+        candidate.len() == self.token.len()
+            && candidate
+                .bytes()
+                .zip(self.token.bytes())
+                .fold(0_u8, |v, (a, b)| v | (a ^ b))
+                == 0
+    }
+    async fn request<T: Serialize>(
+        &self,
+        path: &str,
+        body: Option<&T>,
+    ) -> Result<Value, ControlError> {
+        let builder = if let Some(body) = body {
+            self.client
+                .post(format!("{}{path}", self.base_url))
+                .json(body)
+        } else {
+            self.client.get(format!("{}{path}", self.base_url))
+        };
+        let response = builder
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await
+            .map_err(|_| ControlError {
+                status: 503,
+                code: "gateway_unavailable".into(),
+            })?;
+        let status = response.status().as_u16();
+        let bytes = response.bytes().await.map_err(|_| ControlError {
+            status: 503,
+            code: "gateway_unavailable".into(),
+        })?;
+        if bytes.len() > 64 * 1024 {
+            return Err(ControlError {
+                status: 503,
+                code: "gateway_unavailable".into(),
+            });
+        }
+        let value: Value = serde_json::from_slice(&bytes).map_err(|_| ControlError {
+            status: 503,
+            code: "gateway_unavailable".into(),
+        })?;
+        if !(200..300).contains(&status) {
+            return Err(ControlError {
+                status,
+                code: value
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("gateway_unavailable")
+                    .into(),
+            });
+        }
+        Ok(value)
+    }
+    pub async fn grant(&self, grant: &Grant) -> Result<Value, ControlError> {
+        self.request("/control/grants", Some(grant)).await
+    }
+    pub async fn cancel(&self, scope: &CancelScope) -> Result<Value, ControlError> {
+        self.request("/control/cancel", Some(scope)).await
+    }
+    pub async fn status(&self) -> Result<Value, ControlError> {
+        self.request::<Value>("/control/state", None).await
+    }
+}
+
+pub struct GatewayProcess {
+    pub control: GatewayControl,
+    child: Child,
+    stdin: Option<ChildStdin>,
+    stdout: BufReader<ChildStdout>,
+    directory: PathBuf,
+}
+impl GatewayProcess {
+    pub async fn start(
+        executable: &Path,
+        hub_url: String,
+        directory: &Path,
+    ) -> Result<Self, String> {
+        Self::start_with_network(executable, hub_url, directory, None).await
+    }
+    pub async fn start_with_network(
+        executable: &Path,
+        hub_url: String,
+        directory: &Path,
+        network: Option<GatewayNetwork>,
+    ) -> Result<Self, String> {
+        if directory.join(MARKER).exists() {
+            return Err("前回の実行終了を確認できません。provider の実行停止を確認してから保留を解除してください。".into());
+        }
+        let marker = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(directory.join(MARKER))
+            .map_err(|_| "Gateway の実行記録を作成できません。")?;
+        serde_json::to_writer(
+            &marker,
+            &json!({"schema_version":1,"reason":"execution_process_not_confirmed_clean"}),
+        )
+        .map_err(|_| "Gateway の実行記録を書けません。")?;
+        marker
+            .sync_all()
+            .map_err(|_| "Gateway の実行記録を同期できません。")?;
+        let secret = format!("{}{}", ulid::Ulid::new(), ulid::Ulid::new());
+        let init = Init {
+            hub_url,
+            control_token: secret.clone(),
+            data_directory: directory.to_path_buf(),
+            network,
+        };
+        let mut command = Command::new(executable);
+        command
+            .arg("--gateway")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.as_std_mut().creation_flags(0x08000000);
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|_| "Gateway を起動できません。実行終了は未確認です。")?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or("Gateway の初期化パイプを開けません。")?;
+        let mut bytes = serde_json::to_vec(&init).map_err(|_| "Gateway を初期化できません。")?;
+        bytes.push(b'\n');
+        stdin
+            .write_all(&bytes)
+            .await
+            .map_err(|_| "Gateway へ初期化情報を送れません。")?;
+        let mut stdout = BufReader::new(
+            child
+                .stdout
+                .take()
+                .ok_or("Gateway の応答パイプを開けません。")?,
+        );
+        let mut ready = String::new();
+        tokio::time::timeout(Duration::from_secs(8), stdout.read_line(&mut ready))
+            .await
+            .map_err(|_| "Gateway の起動確認が期限切れです。")?
+            .map_err(|_| "Gateway の起動を確認できません。")?;
+        let value: Value =
+            serde_json::from_str(&ready).map_err(|_| "Gateway の起動応答が無効です。")?;
+        let base = value
+            .get("base_url")
+            .and_then(Value::as_str)
+            .ok_or("Gateway の待受先がありません。")?;
+        let mut control = GatewayControl::for_loopback(base.into(), secret)?;
+        if let Some(base) = value.get("network_base_url").and_then(Value::as_str) {
+            control = control.with_network_base_url(base.into())?;
+        }
+        Ok(Self {
+            control,
+            child,
+            stdin: Some(stdin),
+            stdout,
+            directory: directory.to_path_buf(),
+        })
+    }
+    pub async fn stop(mut self) -> bool {
+        // EOF closes admission; already claimed upstream work drains in the child process.
+        drop(self.stdin.take());
+        let mut completion = String::new();
+        let completed = tokio::time::timeout(
+            Duration::from_secs(3),
+            self.stdout.read_line(&mut completion),
+        )
+        .await;
+        let clean = matches!(completed,Ok(Ok(count)) if count>0)
+            && serde_json::from_str::<Value>(&completion)
+                .ok()
+                .is_some_and(|v| v.get("clean") == Some(&Value::Bool(true)));
+        if !clean {
+            return false;
+        }
+        if !matches!(tokio::time::timeout(Duration::from_secs(2),self.child.wait()).await,Ok(Ok(status)) if status.success())
+        {
+            return false;
+        }
+        std::fs::remove_file(self.directory.join(MARKER)).is_ok()
+    }
+}
+
+pub fn uncertain(directory: &Path) -> bool {
+    directory.join(MARKER).exists()
+}
+pub fn acknowledge_quiescent(directory: &Path) -> Result<(), String> {
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(directory.join(LOCK))
+        .map_err(|_| "Gateway 状態を確認できません。")?;
+    fs2::FileExt::try_lock_exclusive(&lock)
+        .map_err(|_| "前回の Gateway がまだ実行中です。終了を待ってください。")?;
+    if uncertain(directory) {
+        std::fs::remove_file(directory.join(MARKER)).map_err(|_| "実行保留を解除できません。")?;
+    }
+    Ok(())
+}
+
+pub async fn run_companion() -> Result<(), io::Error> {
+    let mut stdin = BufReader::new(tokio::io::stdin());
+    let mut input = String::new();
+    tokio::time::timeout(Duration::from_secs(10), stdin.read_line(&mut input))
+        .await
+        .map_err(|_| io::Error::other("gateway initialization timeout"))??;
+    if input.len() > 64 * 1024 {
+        return Err(io::Error::other("gateway initialization too large"));
+    }
+    let init: Init = serde_json::from_str(&input)
+        .map_err(|_| io::Error::other("invalid gateway initialization"))?;
+    let _lock: File = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(init.data_directory.join(LOCK))?;
+    fs2::FileExt::try_lock_exclusive(&_lock)?;
+    let gateway = Gateway::new(init.hub_url, init.control_token)
+        .map_err(|_| io::Error::other("gateway client unavailable"))?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let base_url = format!("http://{}/", listener.local_addr()?);
+    let router = gateway.clone().router();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await });
+    let (network_server, network_base_url) = if let Some(network) = init.network {
+        let listener = tokio::net::TcpListener::bind(network.bind).await?;
+        let public = std::net::SocketAddr::new(network.advertise_ip, listener.local_addr()?.port());
+        let acceptor = crate::network::tls::acceptor(
+            &network.certificate_pem,
+            &network.private_key_pem,
+            &network.ca_certificate_pem,
+            false,
+        )
+        .map_err(|_| io::Error::other("gateway TLS unavailable"))?;
+        let listener = crate::network::tls::NetworkListener::new(listener, acceptor)
+            .with_idle(Duration::from_secs(305))
+            .with_authority(public.to_string());
+        let router = gateway.clone().network_router();
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<crate::network::tls::TlsPeer>(),
+            )
+            .await
+        });
+        (Some(task), Some(format!("https://{public}")))
+    } else {
+        (None, None)
+    };
+    let mut stdout = tokio::io::stdout();
+    stdout
+        .write_all(
+            format!(
+                "{}\n",
+                json!({"base_url":base_url,"network_base_url":network_base_url})
+            )
+            .as_bytes(),
+        )
+        .await?;
+    stdout.flush().await?;
+    input.clear();
+    // Hub death and explicit stop both close this pipe. No parent heartbeat guesses are used.
+    let _ = stdin.read_line(&mut input).await;
+    let clean = gateway.drain().await;
+    stdout
+        .write_all(format!("{}\n", json!({"clean":clean})).as_bytes())
+        .await?;
+    stdout.flush().await?;
+    server.abort();
+    if let Some(server) = network_server {
+        server.abort();
+    }
+    Ok(())
+}

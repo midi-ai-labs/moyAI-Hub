@@ -1,0 +1,33 @@
+.network-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; margin: 20px 0; }
+.network-card { padding: 22px; border: 1px solid var(--line); border-radius: 13px; background: #fff; margin-top: 18px; min-width: 0; }
+.network-grid > .network-card { margin-top: 0; }
+.network-card h3 { margin: 0 0 15px; font-size: 16px; }
+.network-card form, #network-device-form { display: grid; gap: 14px; }
+.network-card label { display: grid; gap: 7px; font-size: 13px; }
+.network-card input, .network-card select, #network-device-form input { width: 100%; min-width: 0; padding: 10px 12px; border: 1px solid #cbd5e2; border-radius: 8px; background: #fff; color: #26384c; font: inherit; }
+.network-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.network-actions { display: flex; gap: 9px; flex-wrap: wrap; margin-top: 14px; }
+.network-card fieldset, #network-device-form fieldset { border: 1px solid var(--line); border-radius: 8px; padding: 12px; min-width: 0; }
+.network-card legend, #network-device-form legend { font-size: 13px; padding: 0 5px; }
+.network-memberships { display: flex; flex-wrap: wrap; gap: 9px 16px; max-height: 170px; overflow: auto; }
+.network-card .network-check, #network-device-form .network-check { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.network-card .network-check input, #network-device-form .network-check input { flex: 0 0 17px; width: 17px; min-width: 17px; height: 17px; padding: 0; margin: 0; accent-color: var(--accent); }
+.network-check span { min-width: 0; overflow-wrap: anywhere; }
+.network-mono { font: 12px/1.7 Consolas, monospace; overflow-wrap: anywhere; color: var(--muted); }
+.network-card details { margin-top: 12px; }
+.network-card summary { cursor: pointer; font-size: 13px; padding: 6px 0; }
+.network-table { min-width: 720px; }
+.network-table td { max-width: 270px; vertical-align: top; }
+.network-table small { display: block; margin-top: 7px; line-height: 1.65; }
+.network-table code { overflow-wrap: anywhere; font-size: 11px; }
+.network-search { max-width: 320px; }
+.network-tag { display: inline-block; padding: 4px 8px; margin: 3px; border-radius: 6px; background: #edf2fa; font-size: 12px; }
+.network-group-list { list-style: none; padding: 0; }
+.network-group-list li, .network-rule { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 13px 0; border-bottom: 1px solid var(--line); }
+.network-group-list span, .network-rule p { color: var(--muted); font-size: 13px; }
+.network-rule strong { overflow-wrap: anywhere; }
+.network-rule p { margin: 6px 0 0; }
+#network-invite-receipt { padding: 15px; margin-top: 17px; background: #f0f5ff; border: 1px solid #c9d9fa; border-radius: 10px; }
+#network-invite-code { letter-spacing: .12em; font: 18px Consolas, monospace; }
+#network-device-dialog { width: min(560px, calc(100vw - 40px)); }
+@media (max-width: 1050px) { .network-grid { grid-template-columns: minmax(0, 1fr); } }
