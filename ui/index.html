@@ -28,7 +28,7 @@
           ページ内の移動
         </div>
         <nav aria-label="ページ内の移動">
-          <a href="#device-network" class="nav-link"><span>⇄</span><span>端末ネットワーク</span></a>
+          <a href="#device-network" class="nav-link"><span>⇄</span><span>ネットワーク設定</span></a>
           <a href="#overview" class="nav-link">
             ◉
             <span>
@@ -47,12 +47,13 @@
           <a href="#clients" class="nav-link">
             ▣
             <span>
-              接続端末
+              接続端末 <small id="nav-pending-count" class="network-pending-count" hidden></small>
             </span>
             <span id="nav-client-count" class="count">
               0
             </span>
           </a>
+          <a href="#mcp-history" class="nav-link"><span>≡</span><span>MCP履歴</span></a>
           <a href="#revisions" class="nav-link">
             ↻
             <span>
@@ -116,13 +117,13 @@
           </div>
           <div class="metric">
             <span>
-              接続端末
+              登録端末
             </span>
             <strong id="metric-clients">
               0
             </strong>
-            <small>
-              生存確認が届いている端末
+            <small id="metric-clients-detail">
+              承認待ち・稼働状況を確認
             </small>
           </div>
           <div class="metric">
@@ -149,7 +150,7 @@
             </div>
           </div>
           <div class="network-introduction">
-            <p class="subtle">このHubのIPを指定してネットワークを開始し、共通設定と参加コードをDesktopへ渡します。モデル接続とGatewayもまとめて起動します。</p>
+            <p class="subtle">このHubのIPを指定してネットワークを開始し、共通設定をDesktopへ渡します。届いた参加申請は「接続端末」で許可します。モデル接続とGatewayもまとめて起動します。</p>
             <a id="open-device-network" class="primary-link" href="#device-network">端末ネットワークを設定する →</a>
           </div>
           <div id="gateway-summary" class="execution-summary" role="status"><h3>モデルの実行状況</h3><p id="gateway-status">モデル実行は停止中</p><p id="gateway-detail" class="subtle">停止や切断の後も、接続先の処理が終わるまで実行枠を保持します。</p></div>
@@ -353,7 +354,7 @@
           <div class="section-title">
             <div>
               <p class="eyebrow">
-                接続の確認
+                参加の承認と端末の管理
               </p>
               <h2 id="clients-heading">
                 接続端末
@@ -365,6 +366,9 @@
               2 秒ごとに更新
             </span>
           </div>
+          <div id="network-clients-management"></div>
+          <details id="model-client-details" class="technical-details"><summary>モデル接続の生存確認（詳細）</summary>
+          <p class="footnote">モデル通信の接続ごとの情報です。端末の参加・停止・所属は上の一覧で管理します。</p>
           <div class="table-wrap">
             <table>
               <thead>
@@ -392,17 +396,19 @@
           </div>
           <div id="clients-empty" class="empty compact">
             <h3>
-              接続している端末はありません
+              モデル接続はありません
             </h3>
             <p>
-              サーバーを開始し、対応クライアントを登録すると、ここに表示されます。
+              Desktopがモデル通信用の接続を作ると、ここに表示されます。
             </p>
           </div>
           <p class="footnote">
             端末の状態は Desktop からの申告です。「操作待ち」に戻っても、接続先の処理が続く場合があります。上の実行状況で「上流終了確認待ち」を確認してください。
           </p>
-          <details class="technical-details"><summary>端末の識別と生存確認について</summary><p class="footnote">IP は表示情報であり、端末の識別と認証には専用 ID とトークンを使います。30 秒間の生存確認（heartbeat）がない端末は切断として表示します。サーバー再起動時には再登録が必要です。</p></details>
+          <p class="footnote">ここに表示する ID はモデル通信の接続 ID です。端末の永続 ID とは別で、サーバー再起動時に作り直します。30 秒間の生存確認がない接続は切断として表示します。</p>
+          </details>
         </section>
+        <section class="panel" id="mcp-history" aria-labelledby="history-heading"></section>
         <section class="panel" id="revisions" aria-labelledby="revision-heading">
           <div class="section-title">
             <div>

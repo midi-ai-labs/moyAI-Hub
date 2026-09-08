@@ -3,6 +3,8 @@ import { availability, capabilityLabel, changeSummary, DiscoveryOwner, gatewaySt
 import type { Discovery, DeploymentRow, Snapshot } from "./state.ts";
 import { reconcileModelRows } from "./model_rows.ts";
 import { attachDeviceNetwork } from "./network.ts";
+import { attachHistory } from "./history.ts";
+import "./history.css";
 import "./style.css";
 function el<T extends HTMLElement = HTMLElement>(id: string): T {
     const node = document.getElementById(id);
@@ -106,15 +108,12 @@ function render(next: Snapshot) {
     pending = null;
     snapshot = next;
     const models = next.store.catalog.models, pools = next.store.catalog.capacity_pools;
-    const connected = next.clients.filter(client => client.connection === "connected").length;
     setText("metric-models", models.length);
     setText("nav-model-count", models.length);
     setText("metric-hosts", `${next.deployments.length} 件の登録先`);
     const loaded = loadCounts(next.deployments);
     setText("metric-ready", loaded.ready);
     setText("metric-unknown", loaded.unknown);
-    setText("metric-clients", connected);
-    setText("nav-client-count", connected);
     setText("metric-revision", next.store.revision);
     setText("header-status", next.server.running ? "モデル接続は稼働中" : "モデル接続は停止中");
     el("header-dot").className = `dot ${next.server.running ? "green" : "gray"}`;
@@ -432,6 +431,19 @@ button("remove-model").addEventListener("click", () => {
         setText("edit-error", "この配置を削除します。最後の配置の場合は論理モデルも削除され、端末の再設定が必要になります。");
     }
 });
-const deviceNetwork = attachDeviceNetwork(el("device-network"), interactionActive);
+const history = attachHistory(el("mcp-history"));
+document.addEventListener("click", event => {
+    const target = (event.target as HTMLElement).closest<HTMLButtonElement>("button[data-network-history]");
+    if (target && !target.disabled) history.showDevice(target.dataset.networkHistory!);
+});
+const deviceNetwork = attachDeviceNetwork(el("device-network"), el("network-clients-management"), interactionActive, network => {
+    history.updateNetwork(network);
+    const pendingCount = network.join_requests.filter(request => request.status === "pending").length;
+    setText("metric-clients", network.devices.length);
+    setText("metric-clients-detail", `承認待ち ${pendingCount} 台 / オンライン ${network.devices.filter(device => device.online).length} 台`);
+    setText("nav-client-count", network.devices.length + pendingCount);
+    setText("nav-pending-count", `承認待ち ${pendingCount}`);
+    el("nav-pending-count").hidden = pendingCount === 0;
+});
 void poll();
 setInterval(() => void poll(), 2000);

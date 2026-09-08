@@ -1,45 +1,66 @@
 import { invoke } from "@tauri-apps/api/core";
-import { NetworkEdits, networkDeviceStatus, networkDevices, networkServerAddress, networkSubject } from "./network_state.ts";
-import type { NetworkSnapshot, NetworkSubject } from "./network_state.ts";
+import { NetworkEdits, networkAdmissionStatus, networkCertificateStatus, networkClientAction, networkClients, networkDeviceStatus, networkDiagnosticMatches, networkDiagnosticStages, networkDiagnosticTarget, networkGatewayPort, networkServerAddress, networkSubject } from "./network_state.ts";
+import type { NetworkClientAction, NetworkClientFilter, NetworkDiagnostics, NetworkSnapshot, NetworkSubject } from "./network_state.ts";
 import "./network.css";
 
 const escape = (value: unknown) => String(value ?? "").replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]!);
 const when = (value: number | null) => value ? new Date(value).toLocaleString("ja-JP") : "未確認";
 
-export function attachDeviceNetwork(host: HTMLElement, interactionActive: () => boolean): { refresh: () => Promise<void> } {
+export function attachDeviceNetwork(host: HTMLElement, clientsHost: HTMLElement, interactionActive: () => boolean,
+    onSnapshot: (snapshot: NetworkSnapshot) => void): { refresh: () => Promise<void> } {
     host.innerHTML = `<div class="section-title"><div><p class="eyebrow">端末間のタスク委任</p><h2 id="network-heading">端末ネットワーク</h2></div><button id="network-refresh" class="secondary">最新情報を取得</button></div>
       <p class="subtle">端末を登録し、どの端末からどの端末へ依頼できるかを管理します。一つの端末で送信と受付の両方を使えます。</p>
       <p id="network-notice" class="field-status" role="status" aria-live="polite"></p>
       <div class="network-grid"><section class="network-card"><h3>1. ネットワークを開く <span id="network-server-status" class="badge gray">停止中</span></h3>
         <form id="network-server-form"><div class="network-fields"><label>このHubのIP<input id="network-ip" placeholder="例: 192.168.1.10" required autocomplete="off" spellcheck="false" /></label><label>ポート<input id="network-port" value="9471" inputmode="numeric" required /></label></div>
         <p class="footnote">端末から届く、このPCの具体的なIPを指定します。TLS証明書を自動で作成し、モデル接続とGatewayもまとめて開始・停止します。従来のモデルサーバーが稼働中の場合は先に停止してください。</p><div class="network-actions"><button id="network-start" class="primary">ネットワークを開始</button><button id="network-stop" type="button" class="danger" hidden>ネットワークを停止</button></div></form>
-        <div class="network-actions"><button id="network-copy-config" type="button" class="secondary">共通設定をコピー</button><button id="network-save-config" type="button" class="secondary">設定ファイルを保存</button></div>
+        <div class="network-actions"><button id="network-copy-config" type="button" class="secondary">共通設定をコピー</button><button id="network-save-config" type="button" class="secondary">設定ファイルを保存</button><button id="network-diagnose" type="button" class="secondary">接続状態を診断</button></div>
+        <section id="network-diagnostic-result" aria-label="接続診断の結果" aria-live="polite" hidden></section>
         <p class="footnote">共通設定にはHubのURLと公開CAだけが含まれます。各Desktopの「moyAI Hub → 端末連携」で読み込みます。</p>
-        <details><summary>接続と証明書の詳細</summary><p id="network-identity" class="network-mono"></p><p id="network-ca" class="network-mono"></p></details></section>
-      <section class="network-card"><h3>2. 端末の参加を許可する</h3><form id="network-invite-form"><label>登録する端末名<input id="network-invite-label" placeholder="例: Win19" maxlength="160" required autocomplete="off" /></label>
-        <fieldset><legend>所属グループ（複数選択可）</legend><div id="network-invite-groups" class="network-memberships"></div></fieldset><button class="primary">参加コードを発行</button></form>
-        <div id="network-invite-receipt" hidden><label>参加コード<input id="network-invite-code" readonly autocomplete="off" /></label><p id="network-invite-expiry" class="footnote"></p><button id="network-copy-invite" class="secondary">コードをコピー</button></div>
-        <p class="footnote">管理者が許可した端末だけが参加できます。参加コードは10分以内に1回だけ使えます。失効した端末を自動で再登録しません。</p></section></div>
-      <section class="network-card"><div class="section-title"><h3>登録端末</h3><label class="network-search">端末を検索<input id="network-search" type="search" placeholder="端末名・IP・グループ" /></label></div>
-        <div class="table-wrap"><table class="network-table"><thead><tr><th>端末</th><th>状態・受付</th><th>所属グループ</th><th>最終確認</th><th>操作</th></tr></thead><tbody id="network-device-rows"></tbody></table></div><p id="network-devices-empty" class="subtle">登録端末はありません。参加コードを発行し、Desktopから参加してください。</p></section>
+        <details data-details-key="network-connection-details"><summary>接続と証明書の詳細</summary><p id="network-identity" class="network-mono"></p><p id="network-ca" class="network-mono"></p>
+          <form id="network-settings-form"><label>モデル通信用ポート（Gateway）<input id="network-gateway-port" inputmode="numeric" autocomplete="off" placeholder="自動" /></label><p class="footnote">空欄または0は自動です。ファイアウォールで固定ポートが必要な場合は1〜65535を指定します。稼働中の変更は次回のネットワーク開始時に適用します。</p><button type="submit" class="secondary">ポート設定を保存</button></form>
+          <p id="network-gateway-bind" class="network-mono"></p>
+          <p id="network-certificate-status" class="footnote" role="status"></p><dl id="network-certificate-times" class="network-certificate-times"></dl>
+          <button id="network-renew-certificate" type="button" class="secondary">証明書を今すぐ更新</button><p class="footnote">HubとGatewayの証明書を更新します。新しい接続から適用し、進行中の通信は継続します。</p>
+        </details></section>
+      <section class="network-card"><h3>2. 接続端末で参加を許可する</h3>
+        <p class="subtle">各Desktopへ共通設定を渡してください。Desktopから届いた申請のPC名とIPを確認し、「許可」を押すと参加できます。</p>
+        <a href="#clients" class="primary-link">接続端末・承認待ちを確認する <span id="network-pending-summary"></span> →</a>
+        <p class="footnote">端末名と所属グループは、許可した後でも編集できます。ほかの端末への依頼には、下の接続ルールを設定します。</p></section></div>
       <div class="network-grid"><section class="network-card"><h3>グループ</h3><p class="footnote">所属は排他的ではありません。例:「開発」「GPU搭載」の両方へ同じ端末を追加できます。</p>
         <form id="network-group-form"><label>編集するグループ<select id="network-group-id"><option value="">新しいグループを追加</option></select></label><label>グループ名<input id="network-group-label" maxlength="160" required /></label><button class="secondary">グループを保存</button></form><ul id="network-group-list" class="network-group-list"></ul></section>
       <section class="network-card"><h3>3. 方向付きの接続許可</h3><form id="network-rule-form"><div class="network-fields"><label>送信元<select id="network-rule-from" required></select></label><label>受入先<select id="network-rule-to" required></select></label></div>
         <div class="network-fields"><label>依頼の経路<select id="network-rule-usage"><option value="direct">直接の依頼</option><option value="delegated">再委任の宛先</option></select></label><label>扱い<select id="network-rule-effect"><option value="allow">許可する</option><option value="deny">拒否する（個別例外）</option></select></label></div>
         <label>公開対象<select id="network-rule-profile"><option value="">この宛先の公開対象すべて</option></select></label><label>最大の委任段数<select id="network-rule-depth"><option value="1">1段</option><option value="2">2段（例: 00 → 19 → 20）</option><option value="3">3段</option></select></label><button class="primary">接続ルールを追加</button></form>
         <p class="footnote">矢印は一方向です。逆向きは別に許可します。再委任には直前の端末からの直接許可と、最初の依頼元から宛先への再委任許可の両方が必要です。</p></section></div>
-      <section class="network-card"><h3>接続ルールと個別例外</h3><div id="network-rule-list"></div><p class="footnote">端末の失効やルール変更は新しい受付を止めます。既に実行しているタスクの停止完了は、Desktopの委任経路と停止状況で確認してください。</p></section>
+      <section class="network-card"><h3>接続ルールと個別例外</h3><div id="network-rule-list"></div><p class="footnote">端末の停止・失効やルール変更は新しい受付を止めます。既に実行しているタスクの停止完了は、Desktopの委任経路と停止状況で確認してください。</p></section>`;
+    clientsHost.innerHTML = `<p class="subtle">申請の許可と、登録後の名前・所属・利用の停止をここで管理します。承認状態と稼働状態は別の情報です。</p>
+      <div class="network-client-toolbar"><label class="network-search">端末を検索<input id="network-search" type="search" placeholder="PC名・IP・グループ・識別ID" /></label>
+        <label>表示<select id="network-filter"><option value="all">すべての端末</option><option value="pending">承認待ちのみ</option></select></label>
+        <button id="network-clients-refresh" class="secondary">最新情報を取得</button></div>
+      <p id="network-clients-summary" class="footnote"></p><p id="network-clients-notice" class="field-status" role="status" aria-live="polite"></p>
+      <div class="table-wrap"><table class="network-table"><thead><tr><th>PC名・観測IP</th><th>承認状態</th><th>稼働状態</th><th>所属グループ</th><th>時刻</th><th>操作</th></tr></thead><tbody id="network-device-rows"></tbody></table></div>
+      <p id="network-devices-empty" class="subtle">まだ端末はありません。共通設定をDesktopへ渡し、Desktopから参加を申請してください。</p>
+      <p class="footnote">「停止」は新しい利用を止める操作です。登録情報と接続ルールは保持し、「再許可」で戻せます。実行中のタスクは即座には止まりません。停止完了はDesktopの委任経路で確認してください。</p>
+      <details class="technical-details network-legacy-invite" data-details-key="network-legacy-invite"><summary>従来の参加コードで登録する（互換）</summary><div class="network-card">
+        <form id="network-invite-form"><label>登録する端末名<input id="network-invite-label" placeholder="例: Win19" maxlength="160" required autocomplete="off" /></label>
+        <fieldset><legend>所属グループ（複数選択可）</legend><div id="network-invite-groups" class="network-memberships"></div></fieldset><button class="secondary">参加コードを発行</button></form>
+        <div id="network-invite-receipt" hidden><label>参加コード<input id="network-invite-code" readonly autocomplete="off" /></label><p id="network-invite-expiry" class="footnote"></p><button id="network-copy-invite" class="secondary">コードをコピー</button></div>
+        <p class="footnote">コード入力に対応したDesktopで使う互換手順です。参加コードは10分以内に1回だけ使えます。</p></div></details>
       <dialog id="network-device-dialog" aria-labelledby="network-device-title"><form id="network-device-form"><div class="section-title"><h2 id="network-device-title">端末を管理</h2><button id="network-device-close" type="button" class="icon-button" aria-label="閉じる">×</button></div>
         <p id="network-device-id" class="network-mono"></p><label>端末名<input id="network-device-label" maxlength="160" required /></label><fieldset><legend>所属グループ（複数選択可）</legend><div id="network-device-groups" class="network-memberships"></div></fieldset>
-        <label class="network-check"><input id="network-device-revoked" type="checkbox" /><span>この端末の認証を失効する</span></label><p class="footnote">失効は元に戻せません。実行中のタスクの停止完了とは別です。再参加には新しい参加コードが必要です。</p><p id="network-device-error" class="field-status" role="status"></p><div class="network-actions"><button class="primary" id="network-device-save">変更を保存</button></div></form></dialog>`;
-    const node = <T extends HTMLElement = HTMLElement>(id: string) => host.querySelector<T>(`#${id}`)!;
+        <details id="network-device-revoke-details"><summary>端末認証の恒久失効（元に戻せません）</summary><label class="network-check"><input id="network-device-revoked" type="checkbox" /><span>この端末の認証を恒久的に失効する</span></label><p class="footnote">一時的に利用を止める場合は、一覧の「停止」を使ってください。恒久失効は再許可できず、実行中のタスクの停止完了を意味しません。</p></details>
+        <p id="network-device-error" class="field-status" role="status"></p><div class="network-actions"><button class="primary" id="network-device-save">変更を保存</button><button type="button" class="secondary" id="network-device-review">最新情報を取得</button></div></form></dialog>`;
+    const roots = [host, clientsHost];
+    const node = <T extends HTMLElement = HTMLElement>(id: string) => (host.querySelector<T>(`#${id}`) ?? clientsHost.querySelector<T>(`#${id}`))!;
     const value = (id: string) => node<HTMLInputElement | HTMLSelectElement>(id).value;
-    const message = (text: string, error = false) => { node("network-notice").textContent = text; node("network-notice").classList.toggle("error", error); };
+    const message = (text: string, error = false) => { for (const id of ["network-notice", "network-clients-notice"]) { node(id).textContent = text; node(id).classList.toggle("error", error); } };
     const owner = new NetworkEdits();
     let busy = false;
     let polling: Promise<boolean> | null = null;
     let requestSerial = 0;
-    let selectedDevice: string | null = null;
+    let selectedClient: { kind: "request" | "device"; id: string } | null = null;
+    let diagnostic: { result: NetworkDiagnostics; target: string; checkedAt: number } | null = null;
     const dialog = node<HTMLDialogElement>("network-device-dialog");
     const groupsIn = (id: string) => [...node(id).querySelectorAll<HTMLInputElement>("input:checked")].map(input => input.value);
     const memberships = (id: string, selected: string[] = groupsIn(id)) => {
@@ -60,12 +81,21 @@ export function attachDeviceNetwork(host: HTMLElement, interactionActive: () => 
         ? `グループ: ${owner.snapshot?.groups.find(group => group.id === subject.id)?.label ?? subject.id}`
         : `端末: ${owner.snapshot?.devices.find(device => device.device_id === subject.id)?.label ?? subject.id}`;
     function lock(): void {
-        host.setAttribute("aria-busy", String(busy));
-        for (const control of host.querySelectorAll<HTMLButtonElement | HTMLInputElement | HTMLSelectElement>("button,input,select")) control.disabled = busy || !owner.snapshot;
+        for (const root of roots) {
+            root.setAttribute("aria-busy", String(busy));
+            for (const control of root.querySelectorAll<HTMLButtonElement | HTMLInputElement | HTMLSelectElement>("button,input,select")) control.disabled = busy || !owner.snapshot;
+        }
         node<HTMLButtonElement>("network-refresh").disabled = busy;
+        node<HTMLButtonElement>("network-clients-refresh").disabled = busy;
+        node<HTMLButtonElement>("network-device-review").disabled = busy;
         node<HTMLInputElement>("network-ip").disabled = busy || !owner.snapshot || Boolean(owner.snapshot.server.running);
         node<HTMLInputElement>("network-port").disabled = busy || !owner.snapshot || Boolean(owner.snapshot.server.running);
-        node<HTMLButtonElement>("network-device-revoked").disabled = busy || !owner.snapshot || Boolean(owner.snapshot.devices.find(device => device.device_id === selectedDevice)?.revoked);
+        node<HTMLButtonElement>("network-renew-certificate").disabled = busy || !owner.snapshot?.server.running;
+        node<HTMLButtonElement>("network-diagnose").disabled = busy || !owner.snapshot?.server.running;
+        node<HTMLButtonElement>("network-device-revoked").disabled = busy || !owner.snapshot || Boolean(owner.snapshot.devices.find(device => device.device_id === selectedClient?.id)?.revoked);
+        node<HTMLButtonElement>("network-device-save").disabled = busy || !owner.snapshot || (selectedClient?.kind === "request"
+            ? !owner.snapshot.join_requests.some(request => request.request_id === selectedClient?.id && request.status === "pending")
+            : !owner.snapshot.devices.some(device => device.device_id === selectedClient?.id));
     }
     function render(): void {
         const snapshot = owner.snapshot;
@@ -81,6 +111,22 @@ export function attachDeviceNetwork(host: HTMLElement, interactionActive: () => 
         }
         node("network-identity").textContent = `Hub: ${snapshot.hub_id} / ${snapshot.server.bind ?? "停止中"} / 更新 ${snapshot.revision}`;
         node("network-ca").textContent = `公開CA SHA-256: ${snapshot.ca_sha256}`;
+        const gatewayPort = node<HTMLInputElement>("network-gateway-port");
+        if (gatewayPort !== document.activeElement && !owner.revisions.has("network-settings-form")) gatewayPort.value = snapshot.gateway_port ? String(snapshot.gateway_port) : "";
+        node("network-gateway-bind").textContent = `稼働中のGateway: ${snapshot.server.gateway_bind ?? "停止中"}`;
+        const certificateStatus = networkCertificateStatus(snapshot.server.certificate, Date.now());
+        node("network-certificate-status").textContent = certificateStatus.label;
+        node("network-certificate-status").classList.toggle("error", certificateStatus.warning);
+        const certificate = snapshot.server.certificate;
+        node("network-certificate-times").innerHTML = certificate ? `<dt>有効期限</dt><dd>${when(Number(certificate.expires_at_ms))}</dd><dt>自動更新の開始目安</dt><dd>${when(Number(certificate.renew_after_ms))}</dd><dt>前回の更新</dt><dd>${when(Number(certificate.last_success_ms))}</dd>` : "";
+        if (diagnostic && diagnostic.target !== networkDiagnosticTarget(snapshot)) diagnostic = null;
+        const diagnosticRegion = node("network-diagnostic-result");
+        diagnosticRegion.hidden = !diagnostic;
+        if (diagnostic) {
+            const labels = { pass: "確認済み", fail: "確認できません", skipped: "未実施" };
+            const html = `<p class="footnote">確認日時: ${when(diagnostic.checkedAt)}</p><ol class="network-diagnostic-stages">${networkDiagnosticStages(diagnostic.result, diagnostic.checkedAt).map(stage => `<li><strong>${escape(stage.label)} <span class="badge ${stage.status === "pass" ? "green" : stage.status === "fail" ? "red" : "gray"}">${labels[stage.status]}</span></strong><p>${escape(stage.detail)}</p></li>`).join("")}</ol>`;
+            if (diagnosticRegion.innerHTML !== html) diagnosticRegion.innerHTML = html;
+        }
         memberships("network-invite-groups");
         const groupSelect = node<HTMLSelectElement>("network-group-id");
         if (groupSelect !== document.activeElement) {
@@ -95,14 +141,36 @@ export function attachDeviceNetwork(host: HTMLElement, interactionActive: () => 
             const html = '<option value="">この宛先の公開対象すべて</option>' + devices.flatMap(device => device.publications.map(profile => `<option value="${escape(profile.profile_id)}">${escape(device.label)}: ${escape(profile.name)}</option>`)).join("");
             if (profileSelect.innerHTML !== html) { const old = profileSelect.value; profileSelect.innerHTML = html; profileSelect.value = old; }
         }
-        const rows = networkDevices(snapshot, value("network-search"));
+        const rows = networkClients(snapshot, value("network-search"), value("network-filter") as NetworkClientFilter);
+        const pendingCount = snapshot.join_requests.filter(request => request.status === "pending").length;
+        node("network-clients-summary").textContent = `承認待ち ${pendingCount} 台 · 登録済み ${snapshot.devices.length} 台 · オンライン ${snapshot.devices.filter(device => device.online).length} 台`;
+        node("network-pending-summary").textContent = pendingCount ? `（${pendingCount} 台）` : "";
+        onSnapshot(snapshot);
         const body = node("network-device-rows");
-        if (!body.contains(document.activeElement)) body.innerHTML = rows.map(device => {
+        if (!body.contains(document.activeElement)) {
+            const openDetails = new Set([...body.querySelectorAll<HTMLDetailsElement>("details[open]")].map(details => details.dataset.deviceIdentity));
+            const html = rows.map(client => {
+            const action = networkClientAction(client, snapshot.revision);
+            const actionButton = action ? `<button type="button" class="${action.label === "許可" ? "primary" : "secondary"}" data-network-action="${escape(JSON.stringify(action))}" aria-label="${escape(client.kind === "request" ? client.request.label : client.device.label)}の${action.label}">${action.label}</button>` : "";
+            if (client.kind === "request") {
+                const request = client.request;
+                const pending = request.status === "pending";
+                return `<tr data-id="request:${escape(request.request_id)}"><td><strong>${escape(request.label)}</strong><small>申請元IP: ${escape(request.observed_ip)}</small><details data-device-identity="request:${escape(request.request_id)}"><summary>照合用ID</summary><small>申請ID</small><code>${escape(request.request_id)}</code><small>公開鍵 SHA-256</small><code>${escape(request.key_sha256)}</code></details></td>
+                    <td><span class="badge ${pending ? "amber" : "gray"}">${pending ? "承認待ち" : "申請期限切れ"}</span><small>${pending ? "PC名とIPを確認して許可してください。" : "Desktopからもう一度申請してください。"}</small></td><td><span class="badge gray">未参加</span><small>まだ利用できません。</small></td><td>未設定<small>許可後も変更できます。</small></td><td><small>申請: ${when(request.created_at_ms)}</small><small>期限: ${when(request.expires_at_ms)}</small></td><td><div class="network-row-actions">${actionButton}<button type="button" class="tiny-button" data-network-request="${escape(request.request_id)}" data-network-revision="${escape(snapshot.revision)}" aria-label="${escape(request.label)}の名前・所属を確認">名前・所属</button></div></td></tr>`;
+            }
+            const device = client.device;
             const status = networkDeviceStatus(device);
-            return `<tr><td><strong>${escape(device.label)}</strong><small>${escape(device.observed_ip ?? "IP未確認")}</small><details><summary>端末ID</summary><code>${escape(device.device_id)}</code></details></td><td><span class="badge ${status.color}">${status.label}</span><small>${escape(status.detail)}</small></td><td>${device.groups.map(id => `<span class="network-tag">${escape(snapshot.groups.find(group => group.id === id)?.label ?? id)}</span>`).join("") || "所属なし"}</td><td>${when(device.last_seen_ms)}</td><td><button type="button" class="tiny-button" data-network-edit="${escape(device.device_id)}" aria-label="${escape(device.label)}を管理">管理</button></td></tr>`;
-        }).join("");
+            const admission = networkAdmissionStatus(device);
+            return `<tr data-id="device:${escape(device.device_id)}"><td><strong>${escape(device.label)}</strong><small>観測IP: ${escape(device.observed_ip ?? "未確認")}</small><details data-device-identity="device:${escape(device.device_id)}"><summary>照合用ID</summary><small>端末ID</small><code>${escape(device.device_id)}</code><small>証明書 SHA-256</small><code>${escape(device.certificate_sha256)}</code></details></td><td><span class="badge ${admission.color}">${admission.label}</span><small>${escape(admission.detail)}</small></td><td><span class="badge ${status.color}">${status.label}</span><small>${escape(status.detail)}</small></td><td>${device.groups.map(id => `<span class="network-tag">${escape(snapshot.groups.find(group => group.id === id)?.label ?? id)}</span>`).join("") || "所属なし"}</td><td><small>最終生存確認</small>${when(device.last_seen_ms)}</td><td><div class="network-row-actions">${actionButton}<button type="button" class="tiny-button" data-network-edit="${escape(device.device_id)}" data-network-revision="${escape(snapshot.revision)}" aria-label="${escape(device.label)}を管理">名前・所属・詳細</button><button type="button" class="tiny-button" data-network-history="${escape(device.device_id)}" aria-label="${escape(device.label)}のMCP履歴を見る">履歴を見る</button></div></td></tr>`;
+            }).join("");
+            if (body.innerHTML !== html) {
+                body.innerHTML = html;
+                for (const details of body.querySelectorAll<HTMLDetailsElement>("details")) details.open = openDetails.has(details.dataset.deviceIdentity);
+            }
+        }
         node("network-devices-empty").hidden = rows.length > 0;
-        node("network-devices-empty").textContent = snapshot.devices.length ? "検索に一致する端末はありません。" : "登録端末はありません。参加コードを発行し、Desktopから参加してください。";
+        node("network-devices-empty").textContent = value("network-filter") === "pending" ? "条件に一致する承認待ちの申請はありません。"
+            : snapshot.devices.length || snapshot.join_requests.length ? "検索に一致する端末はありません。" : "まだ端末はありません。共通設定をDesktopへ渡し、Desktopから参加を申請してください。";
         node("network-group-list").innerHTML = snapshot.groups.map(group => `<li><strong>${escape(group.label)}</strong><span>${snapshot.devices.filter(device => device.groups.includes(group.id)).length} 台</span></li>`).join("");
         const rules = node("network-rule-list");
         if (!rules.contains(document.activeElement)) rules.innerHTML = snapshot.rules.map(rule => `<article class="network-rule"><div><strong>${escape(subjectLabel(rule.from))} → ${escape(subjectLabel(rule.to))}</strong><p>${rule.usage === "direct" ? "直接の依頼" : "再委任の宛先"} · <span class="${rule.effect === "deny" ? "error" : ""}">${rule.effect === "allow" ? "許可" : "拒否"}</span> · 最大${rule.max_depth}段 · ${rule.profile_id ? escape(snapshot.devices.flatMap(device => device.publications).find(profile => profile.profile_id === rule.profile_id)?.name ?? rule.profile_id) : "公開対象すべて"}</p></div><button class="secondary" data-network-delete-rule="${escape(rule.id)}" data-network-revision="${escape(snapshot.revision)}" aria-label="${escape(subjectLabel(rule.from))}から${escape(subjectLabel(rule.to))}のルールを削除">削除</button></article>`).join("") || '<p class="subtle">接続ルールはありません。端末を参加させただけでは、ほかの端末へ依頼できません。</p>';
@@ -141,18 +209,47 @@ export function attachDeviceNetwork(host: HTMLElement, interactionActive: () => 
             message(text, true); if (dialog.open) node("network-device-error").textContent = text;
         } finally { busy = false; lock(); render(); }
     }
-    for (const id of ["network-invite-form", "network-group-form", "network-rule-form", "network-device-form"]) {
+    for (const id of ["network-invite-form", "network-group-form", "network-rule-form", "network-device-form", "network-settings-form"]) {
         node(id).addEventListener("input", () => owner.touch(id));
         node(id).addEventListener("change", () => owner.touch(id));
     }
-    node("network-refresh").addEventListener("click", () => { void acquireSnapshot().then(accepted => { if (accepted) { owner.reviewLatest(); render(); message("最新の設定を取得しました。入力中の内容は保持しています。接続ルールを確認してから保存してください。"); } }); });
+    for (const id of ["network-refresh", "network-clients-refresh", "network-device-review"]) node(id).addEventListener("click", () => {
+        void acquireSnapshot().then(accepted => {
+            if (accepted) {
+                owner.reviewLatest(); render(); message("最新の設定を取得しました。入力中の内容は保持しています。内容を確認してから保存してください。");
+                if (dialog.open) node("network-device-error").textContent = node<HTMLButtonElement>("network-device-save").disabled
+                    ? "この申請または端末は現在変更できません。一覧の最新状態を確認してください。" : "最新の状態を取得しました。入力内容を確認して保存してください。";
+            }
+        });
+    });
     node("network-search").addEventListener("input", render);
+    node("network-filter").addEventListener("change", render);
     node("network-server-form").addEventListener("submit", event => {
         event.preventDefault(); const ip = value("network-ip").trim();
         const bind = `${ip.includes(":") ? `[${ip.replace(/^\[|\]$/g, "")}]` : ip}:${value("network-port").trim()}`;
         void perform("server", "hub_network_start", { bind, advertiseIp: ip });
     });
     node("network-stop").addEventListener("click", () => void perform("server", "hub_network_stop", {}));
+    node("network-settings-form").addEventListener("submit", event => {
+        event.preventDefault();
+        const gatewayPort = networkGatewayPort(value("network-gateway-port"));
+        if (gatewayPort === null) { message("ポートは1〜65535で指定するか、自動設定なら空欄にしてください。", true); return; }
+        void perform("network-settings-form", "hub_network_settings", { expectedRevision: owner.target("network-settings-form"), gatewayPort }, () => message("ポート設定を保存しました。次回のネットワーク開始から適用します。"));
+    });
+    node("network-renew-certificate").addEventListener("click", () => void perform("certificate", "hub_network_renew_certificate", {}, () => message("証明書を更新しました。新しい接続から使用します。")));
+    node("network-diagnose").addEventListener("click", () => {
+        if (busy || !owner.snapshot?.server.running) return;
+        const target = networkDiagnosticTarget(owner.snapshot);
+        busy = true; requestSerial++; lock(); message("HubとGatewayの状態を確認しています。");
+        void invoke<NetworkDiagnostics>("hub_network_diagnostics").then(result => {
+            if (!owner.snapshot || target !== networkDiagnosticTarget(owner.snapshot) || !networkDiagnosticMatches(result, owner.snapshot)) {
+                message("接続状態が変わりました。最新情報を取得し、もう一度診断してください。"); return;
+            }
+            diagnostic = { result, target, checkedAt: Date.now() };
+            message("診断結果を表示しました。別端末からの到達はDesktop側でも確認してください。");
+        }).catch(error => message(typeof error === "string" ? error : "接続状態を取得できませんでした。ネットワークの稼働状態を確認してください。", true))
+            .finally(() => { busy = false; lock(); render(); });
+    });
     const hubUrl = () => {
         const ip = value("network-ip").trim();
         return `https://${ip.includes(":") ? `[${ip.replace(/^\[|\]$/g, "")}]` : ip}:${value("network-port").trim()}`;
@@ -187,23 +284,56 @@ export function attachDeviceNetwork(host: HTMLElement, interactionActive: () => 
         } });
     });
     node("network-rule-to").addEventListener("change", render);
-    host.addEventListener("click", event => {
-        const target = (event.target as Element).closest<HTMLElement>("[data-network-edit], [data-network-delete-rule]");
+    for (const root of roots) root.addEventListener("click", event => {
+        const target = (event.target as Element).closest<HTMLElement>("[data-network-edit], [data-network-request], [data-network-action], [data-network-delete-rule]");
         if (!target || busy || !owner.snapshot) return;
+        if (target.dataset.networkAction) {
+            const action = JSON.parse(target.dataset.networkAction) as NetworkClientAction;
+            void perform("client-action", action.command, action.args, () => message(action.command === "hub_network_approve"
+                ? "端末の参加を許可しました。Desktopが登録情報を取得すると一覧へ反映されます。"
+                : action.args.stopped ? "新しい利用を停止しました。実行中のタスクの停止完了とは別です。" : "端末を再許可しました。Desktop側の受付・接続先設定も確認してください。"));
+            return;
+        }
         if (target.dataset.networkDeleteRule) { void perform("rule-delete", "hub_network_delete_rule", { expectedRevision: target.dataset.networkRevision, id: target.dataset.networkDeleteRule }); return; }
+        if (target.dataset.networkRequest) {
+            const request = owner.snapshot.join_requests.find(request => request.request_id === target.dataset.networkRequest);
+            if (!request) return;
+            selectedClient = { kind: "request", id: request.request_id };
+            owner.saved("network-device-form"); owner.revisions.set("network-device-form", target.dataset.networkRevision!);
+            node("network-device-title").textContent = "名前・所属を確認して許可";
+            node("network-device-save").textContent = "この内容で許可";
+            node("network-device-id").textContent = `申請元IP: ${request.observed_ip}\n申請ID: ${request.request_id}\n公開鍵 SHA-256: ${request.key_sha256}`;
+            node<HTMLInputElement>("network-device-label").value = request.label;
+            node<HTMLInputElement>("network-device-revoked").checked = false;
+            node("network-device-revoke-details").hidden = true;
+            memberships("network-device-groups", []); node("network-device-error").textContent = request.status === "expired" ? "申請の期限が切れています。Desktopからもう一度申請してください。" : "名前・所属の変更は任意です。";
+            lock(); dialog.showModal(); return;
+        }
         const device = owner.snapshot.devices.find(device => device.device_id === target.dataset.networkEdit);
         if (!device) return;
-        selectedDevice = device.device_id; owner.saved("network-device-form"); owner.touch("network-device-form");
+        selectedClient = { kind: "device", id: device.device_id };
+        owner.saved("network-device-form"); owner.revisions.set("network-device-form", target.dataset.networkRevision!);
+        node("network-device-title").textContent = "端末を管理";
+        node("network-device-save").textContent = "変更を保存";
         node("network-device-id").textContent = `端末ID: ${device.device_id}`;
         node<HTMLInputElement>("network-device-label").value = device.label;
         node<HTMLInputElement>("network-device-revoked").checked = device.revoked;
+        node("network-device-revoke-details").hidden = false;
+        node<HTMLDetailsElement>("network-device-revoke-details").open = false;
         memberships("network-device-groups", device.groups); node("network-device-error").textContent = ""; lock(); dialog.showModal();
     });
     node("network-device-close").addEventListener("click", () => dialog.close());
     dialog.addEventListener("cancel", event => { if (busy) event.preventDefault(); });
     node("network-device-form").addEventListener("submit", event => {
-        event.preventDefault(); if (!selectedDevice) return;
-        void perform("network-device-form", "hub_network_device", { expectedRevision: owner.target("network-device-form"), deviceId: selectedDevice,
+        event.preventDefault();
+        if (selectedClient?.kind === "request") {
+            void perform("network-device-form", "hub_network_approve", { expectedRevision: owner.target("network-device-form"), requestId: selectedClient.id,
+                label: value("network-device-label").trim(), groups: groupsIn("network-device-groups"),
+            }, () => { dialog.close(); message("端末の参加を許可しました。"); });
+            return;
+        }
+        if (!selectedClient) return;
+        void perform("network-device-form", "hub_network_device", { expectedRevision: owner.target("network-device-form"), deviceId: selectedClient.id,
             label: value("network-device-label").trim(), groups: groupsIn("network-device-groups"), revoked: node<HTMLInputElement>("network-device-revoked").checked,
         }, () => dialog.close());
     });

@@ -419,6 +419,62 @@ async fn network_model_permit_requires_exact_client_certificate_and_rechecks_rev
     })
     .await
     .unwrap();
+    let before_stop: Value = a
+        .post(format!("{hub}/v1/requests/prepare"))
+        .bearer_auth(token)
+        .json(&prepare("before-stop"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(before_stop["state"], "ready");
+    {
+        let mut owner = network.lock().unwrap();
+        let revision = owner.revision();
+        owner.set_admission(&revision, &a_id, true).unwrap();
+    }
+    let stopped = a
+        .post(format!("{hub}/v1/requests/prepare"))
+        .bearer_auth(token)
+        .json(&prepare("while-stopped"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stopped.status(), 403);
+    assert_eq!(
+        stopped.json::<Value>().await.unwrap()["error"],
+        "device_stopped"
+    );
+    {
+        let mut owner = network.lock().unwrap();
+        let revision = owner.revision();
+        owner.set_admission(&revision, &a_id, false).unwrap();
+    }
+    // This ticket was never used while stopped. Re-enabling must still not revive it.
+    let retired = a
+        .post(format!(
+            "{}/chat/completions",
+            before_stop["gateway_base_url"].as_str().unwrap()
+        ))
+        .bearer_auth(before_stop["request_token"].as_str().unwrap())
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(retired.status(), 403);
+    assert_eq!(fixture.provider.records.lock().unwrap().len(), 1);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if control.status().await.unwrap()["running"] == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     let ready: Value = a
         .post(format!("{hub}/v1/requests/prepare"))
         .bearer_auth(token)
@@ -742,4 +798,85 @@ async fn companion_clean_stop_clears_marker_but_lost_owner_needs_explicit_quiesc
     .await
     .unwrap();
     assert!(!uncertain(directory.path()));
+}
+
+#[tokio::test]
+#[cfg(feature = "tauri-desktop")]
+async fn fixed_gateway_port_conflict_is_clean_before_admission_and_can_retry_exact_port() {
+    use moyai_hub::{gateway_process::GatewayNetwork, network::DeviceNetwork};
+    let directory = tempfile::tempdir().unwrap();
+    let owner =
+        DeviceNetwork::open(&directory.path().join("network.json"), "startup-test").unwrap();
+    let ip = "127.0.0.1".parse().unwrap();
+    let (cert, key) = owner.server_certificate(ip, now_ms()).unwrap();
+    let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = occupied.local_addr().unwrap();
+    let network = || GatewayNetwork {
+        bind: address,
+        advertise_ip: ip,
+        certificate_pem: cert.clone(),
+        private_key_pem: key.clone(),
+        ca_certificate_pem: owner.ca_certificate().to_owned(),
+    };
+    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_moyai-hub"));
+    let result = GatewayProcess::start_with_network(
+        executable,
+        "http://127.0.0.1:9".into(),
+        directory.path(),
+        Some(network()),
+    )
+    .await;
+    assert!(result.is_err());
+    assert!(
+        !uncertain(directory.path()),
+        "known pre-admission bind failure must not claim a provider may be running"
+    );
+    drop(occupied);
+    let process = GatewayProcess::start_with_network(
+        executable,
+        "http://127.0.0.1:9".into(),
+        directory.path(),
+        Some(network()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        process.control.network_base_url(),
+        Some(format!("https://{address}").as_str())
+    );
+    assert!(process.stop().await);
+    assert!(!uncertain(directory.path()));
+}
+
+#[tokio::test]
+#[cfg(feature = "tauri-desktop")]
+async fn unclassified_gateway_startup_failure_preserves_uncertainty() {
+    use moyai_hub::{gateway_process::GatewayNetwork, network::DeviceNetwork};
+    let directory = tempfile::tempdir().unwrap();
+    let owner =
+        DeviceNetwork::open(&directory.path().join("network.json"), "startup-error-test").unwrap();
+    let ip = "127.0.0.1".parse().unwrap();
+    let (cert, _) = owner.server_certificate(ip, now_ms()).unwrap();
+    let result = GatewayProcess::start_with_network(
+        std::path::Path::new(env!("CARGO_BIN_EXE_moyai-hub")),
+        "http://127.0.0.1:9".into(),
+        directory.path(),
+        Some(GatewayNetwork {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            advertise_ip: ip,
+            certificate_pem: cert,
+            private_key_pem: "invalid-key".into(),
+            ca_certificate_pem: owner.ca_certificate().to_owned(),
+        }),
+    )
+    .await;
+    assert!(result.is_err());
+    assert!(uncertain(directory.path()));
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while acknowledge_quiescent(directory.path()).is_err() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
 }

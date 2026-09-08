@@ -36,6 +36,7 @@ sha2 = "0.10.9"
 time = "0.3.47"
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 ulid = { version = "1.2.1", features = ["serde"] }
+x509-parser = "0.18.1"
 
 [build-dependencies]
 tauri-build = { version = "2.5.1", optional = true }

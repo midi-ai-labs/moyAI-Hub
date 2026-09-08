@@ -45,6 +45,8 @@ pub struct Grant {
     pub global_limit: u32,
     #[serde(default)]
     pub device_certificate_sha256: Option<String>,
+    #[serde(default)]
+    pub device_admission_revision: Option<u64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -74,6 +76,20 @@ pub struct Gateway {
     hub_url: String,
     client: reqwest::Client,
     changed: Notify,
+    network_tls: Mutex<Option<GatewayTlsIdentity>>,
+}
+
+struct GatewayTlsIdentity {
+    identity: crate::network::certificate::CertificateIdentity,
+    ca_certificate_pem: String,
+    advertise_ip: std::net::IpAddr,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayTlsUpdate {
+    pub certificate_pem: String,
+    pub private_key_pem: String,
 }
 
 type ApiError = (StatusCode, Json<Value>);
@@ -113,6 +129,7 @@ impl Gateway {
             hub_url,
             client: upstream_client(UPSTREAM_INACTIVITY)?,
             changed: Notify::new(),
+            network_tls: Mutex::new(None),
         }))
     }
     pub fn router(self: Arc<Self>) -> Router {
@@ -120,6 +137,12 @@ impl Gateway {
             .route("/control/grants", post(admit))
             .route("/control/cancel", post(cancel))
             .route("/control/state", get(status))
+            .route(
+                "/control/tls",
+                get(tls_status)
+                    .post(update_tls)
+                    .layer(DefaultBodyLimit::max(48 * 1024)),
+            )
             .route("/r/{permit_id}/v1/chat/completions", post(generate))
             .layer(DefaultBodyLimit::max(REQUEST_LIMIT))
             .with_state(self)
@@ -129,6 +152,26 @@ impl Gateway {
             .route("/r/{permit_id}/v1/chat/completions", post(generate))
             .layer(DefaultBodyLimit::max(REQUEST_LIMIT))
             .with_state(self)
+    }
+    pub fn configure_network_tls(
+        &self,
+        identity: crate::network::certificate::CertificateIdentity,
+        ca_certificate_pem: String,
+        advertise_ip: std::net::IpAddr,
+    ) -> Result<(), crate::network::NetworkError> {
+        let mut current = self
+            .network_tls
+            .lock()
+            .map_err(|_| crate::network::NetworkError::Unavailable)?;
+        if current.is_some() {
+            return Err(crate::network::NetworkError::InvalidRequest);
+        }
+        *current = Some(GatewayTlsIdentity {
+            identity,
+            ca_certificate_pem,
+            advertise_ip,
+        });
+        Ok(())
     }
     pub fn status(&self) -> Value {
         let mut registry = self.registry.lock().unwrap();
@@ -358,6 +401,62 @@ async fn status(
     Ok(Json(gateway.status()))
 }
 
+async fn tls_status(
+    State(gateway): State<Arc<Gateway>>,
+    headers: HeaderMap,
+) -> Result<Json<crate::network::certificate::CertificateSnapshot>, ApiError> {
+    if !authorized(&headers, &gateway.control_token) {
+        return Err(error(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    let current = gateway
+        .network_tls
+        .lock()
+        .map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "gateway_tls_unavailable"))?;
+    let current = current
+        .as_ref()
+        .ok_or_else(|| error(StatusCode::SERVICE_UNAVAILABLE, "gateway_tls_unavailable"))?;
+    current
+        .identity
+        .snapshot()
+        .map(Json)
+        .map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "gateway_tls_unavailable"))
+}
+
+async fn update_tls(
+    State(gateway): State<Arc<Gateway>>,
+    headers: HeaderMap,
+    Json(update): Json<GatewayTlsUpdate>,
+) -> Result<Json<crate::network::certificate::CertificateSnapshot>, ApiError> {
+    if !authorized(&headers, &gateway.control_token) {
+        return Err(error(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    let current = gateway
+        .network_tls
+        .lock()
+        .map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "gateway_tls_unavailable"))?;
+    let current = current
+        .as_ref()
+        .ok_or_else(|| error(StatusCode::SERVICE_UNAVAILABLE, "gateway_tls_unavailable"))?;
+    let prepared = crate::network::certificate::PreparedIdentity::new(
+        &update.certificate_pem,
+        &update.private_key_pem,
+        &current.ca_certificate_pem,
+        current.advertise_ip,
+        false,
+        now_ms(),
+    )
+    .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid_server_identity"))?;
+    current
+        .identity
+        .install(prepared)
+        .map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "gateway_tls_unavailable"))?;
+    current
+        .identity
+        .snapshot()
+        .map(Json)
+        .map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "gateway_tls_unavailable"))
+}
+
 struct ChunkStream(mpsc::Receiver<Result<Bytes, io::Error>>);
 impl futures_core::Stream for ChunkStream {
     type Item = Result<Bytes, io::Error>;
@@ -493,7 +592,8 @@ async fn run_request(
             .client
             .post(format!("{}/_gateway/claim", gateway.hub_url))
             .bearer_auth(&gateway.control_token)
-            .json(&json!({"permit_id":permit_id,"device_certificate_sha256":grant.device_certificate_sha256}))
+            .json(&json!({"permit_id":permit_id,"device_certificate_sha256":grant.device_certificate_sha256,
+                "device_admission_revision":grant.device_admission_revision}))
             .timeout(Duration::from_secs(3))
             .send()
             .await;
@@ -631,6 +731,7 @@ mod tests {
             pool_limit: 1,
             global_limit: 1,
             device_certificate_sha256: None,
+            device_admission_revision: None,
         };
         gateway.registry.lock().unwrap().grants.insert(
             "permit".into(),

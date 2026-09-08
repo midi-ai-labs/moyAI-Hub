@@ -50,6 +50,29 @@ fn authorize_client(
     let tokens = state.client_tokens.lock().map_err(|_| failed())?;
     authorize_session(state, headers, tokens.get(id).ok_or_else(denied)?)
 }
+fn model_admission_revision(
+    state: &ApiState,
+    headers: &HeaderMap,
+    id: &str,
+) -> Result<Option<u64>, (StatusCode, Json<Value>)> {
+    let tokens = state.client_tokens.lock().map_err(|_| failed())?;
+    let token = tokens.get(id).ok_or_else(denied)?;
+    authorize_session(state, headers, token)?;
+    token
+        .device
+        .as_ref()
+        .map(|id| {
+            state
+                .network
+                .as_ref()
+                .ok_or_else(denied)?
+                .lock()
+                .map_err(|_| failed())?
+                .admission_revision(id, now_ms())
+                .map_err(crate::network::api::error)
+        })
+        .transpose()
+}
 fn authorize_gateway(
     state: &ApiState,
     headers: &HeaderMap,
@@ -176,18 +199,19 @@ pub(super) async fn prepare(
     request: Result<Json<Prepare>, axum::extract::rejection::JsonRejection>,
 ) -> ApiResult {
     let Json(request) = request.map_err(|_| invalid_request())?;
-    authorize_client(&state, &headers, &request.id)?;
+    model_admission_revision(&state, &headers, &request.id)?;
     let device_certificate_sha256 = state
         .client_tokens
         .lock()
         .map_err(|_| failed())?
         .get(&request.id)
-        .and_then(|token| {
-            token
-                .device
-                .as_ref()
-                .map(|(_, certificate)| certificate.clone())
-        });
+        .and_then(|token| token.device.as_ref())
+        .and_then(|_| {
+            headers
+                .get("x-moyai-verified-cert")
+                .and_then(|h| h.to_str().ok())
+        })
+        .map(str::to_owned);
     let gateway = state.gateway.as_ref().ok_or_else(|| {
         gateway_failure(ControlError {
             status: 503,
@@ -196,7 +220,7 @@ pub(super) async fn prepare(
     })?;
     refresh_presence(&state, &request).await?;
     let _admission = state.prepare_gate.lock().await;
-    authorize_client(&state, &headers, &request.id)?;
+    let device_admission_revision = model_admission_revision(&state, &headers, &request.id)?;
     let grant = {
         let mut core = state.core.lock().map_err(|_| failed())?;
         check_revision(&core, &request)?;
@@ -244,6 +268,7 @@ pub(super) async fn prepare(
             pool_limit: pool.max_concurrent,
             global_limit: catalog.policy.global_max_concurrent,
             device_certificate_sha256,
+            device_admission_revision,
         }
     };
     let admitted = gateway.grant(&grant).await.map_err(gateway_failure)?;
@@ -345,6 +370,8 @@ pub(super) struct Permit {
     permit_id: String,
     #[serde(default)]
     device_certificate_sha256: Option<String>,
+    #[serde(default)]
+    device_admission_revision: Option<u64>,
 }
 pub(super) async fn claim(
     State(state): State<ApiState>,
@@ -361,8 +388,17 @@ pub(super) async fn claim(
             .lock()
             .map_err(|_| failed())?;
         network
-            .authenticate(certificate, now_ms())
-            .map_err(|_| denied())?;
+            .authorize_model_permit(
+                certificate,
+                request.device_admission_revision.ok_or_else(denied)?,
+                now_ms(),
+            )
+            .map_err(|error| match error {
+                crate::network::NetworkError::Stopped => crate::network::api::error(error),
+                // Preserve the private gateway's existing opaque authentication failure.
+                // Revocation does not disclose a different credential state here.
+                _ => denied(),
+            })?;
     }
     let core = state.core.lock().map_err(|_| failed())?;
     core.validate_execution_permit(&request.permit_id, now_ms())

@@ -34,7 +34,7 @@ struct ApiState {
 }
 struct ClientToken {
     secret: String,
-    device: Option<(String, String)>,
+    device: Option<String>,
 }
 
 pub fn now_ms() -> u64 {
@@ -124,6 +124,32 @@ pub fn network_router(
         ))
 }
 
+pub fn network_router_with_diagnostics(
+    core: SharedCore,
+    network: crate::network::SharedNetwork,
+    gateway: Option<crate::gateway_process::GatewayControl>,
+    runtime: Arc<crate::network::server_runtime::NetworkServerRuntime>,
+) -> Router {
+    let diagnostics = Router::new()
+        .route("/v1/network/diagnostics", get(network_diagnostics))
+        .with_state(runtime)
+        .layer(axum::middleware::from_fn_with_state(
+            network.clone(),
+            crate::network::tls::guard,
+        ));
+    network_router(core, network, gateway).merge(diagnostics)
+}
+
+async fn network_diagnostics(
+    State(runtime): State<Arc<crate::network::server_runtime::NetworkServerRuntime>>,
+) -> Result<Json<crate::network::server_runtime::NetworkDiagnostics>, (StatusCode, Json<Value>)> {
+    runtime
+        .diagnostics()
+        .await
+        .map(Json)
+        .map_err(crate::network::api::error)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DeviceSessionRequest {}
@@ -158,7 +184,7 @@ async fn device_session(
         id.clone(),
         ClientToken {
             secret: secret.clone(),
-            device: Some((identity.device_id, identity.certificate_sha256)),
+            device: Some(identity.device_id),
         },
     );
     let models: Vec<_> = core
@@ -225,7 +251,11 @@ fn authorize_session(
     token: &ClientToken,
 ) -> Result<(), (StatusCode, Json<Value>)> {
     authorize(headers, &token.secret)?;
-    if let Some((device, certificate)) = &token.device {
+    if let Some(device) = &token.device {
+        let certificate = headers
+            .get("x-moyai-verified-cert")
+            .and_then(|h| h.to_str().ok())
+            .ok_or_else(denied)?;
         let network = state
             .network
             .as_ref()
@@ -236,10 +266,6 @@ fn authorize_session(
             .get("x-moyai-verified-device")
             .and_then(|h| h.to_str().ok())
             != Some(device.as_str())
-            || headers
-                .get("x-moyai-verified-cert")
-                .and_then(|h| h.to_str().ok())
-                != Some(certificate.as_str())
             || !network.current_certificate(device, certificate, now_ms())
         {
             return Err(denied());

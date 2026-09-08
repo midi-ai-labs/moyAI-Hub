@@ -49,6 +49,29 @@ pub fn acceptor(cert: &str, key: &str, ca: &str, enrollment: bool) -> Result<Tls
 }
 
 pub fn verify_server_chain(cert: &str, ca: &str, ip: std::net::IpAddr) -> Result<()> {
+    verify_server_names(
+        cert,
+        ca,
+        &[rustls::pki_types::ServerName::IpAddress(ip.into())],
+    )
+}
+
+pub fn verify_hub_server_chain(cert: &str, ca: &str, ip: std::net::IpAddr) -> Result<()> {
+    verify_server_names(
+        cert,
+        ca,
+        &[
+            rustls::pki_types::ServerName::IpAddress(ip.into()),
+            rustls::pki_types::ServerName::try_from("hub.moyai.invalid").expect("fixed Hub role"),
+        ],
+    )
+}
+
+fn verify_server_names(
+    cert: &str,
+    ca: &str,
+    names: &[rustls::pki_types::ServerName<'_>],
+) -> Result<()> {
     use rustls::client::danger::ServerCertVerifier;
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mut roots = rustls::RootCertStore::empty();
@@ -60,15 +83,17 @@ pub fn verify_server_chain(cert: &str, ca: &str, ip: std::net::IpAddr) -> Result
         .map_err(|_| NetworkError::Unavailable)?;
     let certificate =
         CertificateDer::from_pem_slice(cert.as_bytes()).map_err(|_| NetworkError::Unavailable)?;
-    verifier
-        .verify_server_cert(
-            &certificate,
-            &[],
-            &rustls::pki_types::ServerName::IpAddress(ip.into()),
-            &[],
-            rustls::pki_types::UnixTime::now(),
-        )
-        .map_err(|_| NetworkError::Unavailable)?;
+    for name in names {
+        verifier
+            .verify_server_cert(
+                &certificate,
+                &[],
+                name,
+                &[],
+                rustls::pki_types::UnixTime::now(),
+            )
+            .map_err(|_| NetworkError::Unavailable)?;
+    }
     Ok(())
 }
 
@@ -84,9 +109,21 @@ impl Connected<axum::serve::IncomingStream<'_, NetworkListener>> for TlsPeer {
     }
 }
 type Handshake = Pin<Box<dyn Future<Output = io::Result<(BoundedIo, TlsPeer)>> + Send>>;
+enum AcceptorSource {
+    Static(TlsAcceptor),
+    Rotating(super::certificate::CertificateIdentity),
+}
+impl AcceptorSource {
+    fn current(&self) -> Result<TlsAcceptor> {
+        match self {
+            Self::Static(acceptor) => Ok(acceptor.clone()),
+            Self::Rotating(identity) => identity.acceptor(),
+        }
+    }
+}
 pub struct NetworkListener {
     listener: TcpListener,
-    acceptor: TlsAcceptor,
+    acceptor: AcceptorSource,
     slots: Arc<Semaphore>,
     pending: FuturesUnordered<Handshake>,
     idle: Duration,
@@ -100,7 +137,7 @@ impl NetworkListener {
             .unwrap_or_default();
         Self {
             listener,
-            acceptor,
+            acceptor: AcceptorSource::Static(acceptor),
             slots: Arc::new(Semaphore::new(128)),
             pending: FuturesUnordered::new(),
             idle: Duration::from_secs(30),
@@ -109,6 +146,10 @@ impl NetworkListener {
     }
     pub fn with_idle(mut self, idle: Duration) -> Self {
         self.idle = idle;
+        self
+    }
+    pub fn with_identity(mut self, identity: super::certificate::CertificateIdentity) -> Self {
+        self.acceptor = AcceptorSource::Rotating(identity);
         self
     }
     pub fn with_authority(mut self, authority: String) -> Self {
@@ -125,7 +166,7 @@ impl axum::serve::Listener for NetworkListener {
                 done=self.pending.next(),if !self.pending.is_empty()=>{if let Some(Ok(pair))=done{return pair;}},
                 incoming=self.listener.accept()=>match incoming {
                     Ok((stream,address))=>if let Ok(slot)=self.slots.clone().try_acquire_owned() {
-                        let acceptor=self.acceptor.clone();
+                        let Ok(acceptor)=self.acceptor.current() else { continue; };
                         let idle=self.idle;
                         let authority=self.authority.clone();
                         self.pending.push(Box::pin(async move {
@@ -243,14 +284,30 @@ pub async fn guard(
     request.headers_mut().remove("x-moyai-verified-cert");
     request.extensions_mut().insert(ConnectInfo(peer.address));
     let path = request.uri().path();
-    if path != "/v1/network/enroll" && path != "/v1/network/renew" {
+    let participation = request.method() == axum::http::Method::POST
+        && matches!(
+            path,
+            "/v1/network/enroll"
+                | "/v1/network/renew"
+                | "/v1/network/join/request"
+                | "/v1/network/join/status"
+        );
+    if !participation {
         let Some(cert) = peer.certificate_sha256.clone() else {
             return fail(NetworkError::Unauthorized);
         };
         let result = network
             .lock()
             .map_err(|_| NetworkError::Unavailable)
-            .and_then(|n| n.authenticate(&cert, crate::service::now_ms()));
+            .and_then(|n| {
+                if path == "/v1/network/jobs/settled"
+                    && request.method() == axum::http::Method::POST
+                {
+                    n.authenticate_settlement(&cert, crate::service::now_ms())
+                } else {
+                    n.authenticate(&cert, crate::service::now_ms())
+                }
+            });
         let id = match result {
             Ok(id) => id,
             Err(e) => return fail(e),

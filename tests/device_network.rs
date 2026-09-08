@@ -14,6 +14,11 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+#[path = "device_network/history.rs"]
+mod history;
+#[path = "device_network/join.rs"]
+mod join;
+
 struct Fixture {
     directory: tempfile::TempDir,
     owner: DeviceNetwork,
@@ -297,7 +302,7 @@ fn control_grants_remain_available_when_execute_and_observe_quotas_are_full() {
             )
             .is_err()
     );
-    // The original execute receipt still carries the authorized job's 24h ancestry.
+    // Every bearer expires in 60 seconds; authority is reauthorized separately.
     assert!(
         f.owner
             .introspect(
@@ -307,16 +312,17 @@ fn control_grants_remain_available_when_execute_and_observe_quotas_are_full() {
                 Action::Observe,
                 later
             )
-            .is_ok()
+            .is_err()
     );
-    let mut fresh = request(&b, "one");
-    fresh.action = Action::Observe;
-    f.owner.grant(&a.receipt.device_id, fresh, later).unwrap();
-    assert!(matches!(
-        f.owner
-            .grant(&a.receipt.device_id, request(&b, "one"), later),
-        Err(NetworkError::Full)
-    ));
+    let fresh = f
+        .owner
+        .grant(
+            &a.receipt.device_id,
+            control_request(&b, "one", Action::Observe),
+            later,
+        )
+        .unwrap();
+    assert_eq!(fresh.grant_id, first.grant_id);
 }
 
 #[test]
@@ -452,21 +458,8 @@ fn control_introspection_reports_its_action_deadline_after_retirement() {
                     .is_err()
             );
         }
-        // An accepted execute receipt already permits control for 24 hours.
-        // Its execution expiry and retirement do not extend that retention.
-        let control_deadline = f.now + 86_400_000;
+        // The execute token never becomes a long-lived control credential.
         for action in [Action::Observe, Action::Cancel] {
-            let reply = f
-                .owner
-                .introspect(
-                    &b.receipt.device_id,
-                    &execute.token,
-                    &a.receipt.certificate_sha256,
-                    action,
-                    execute.expires_at_ms,
-                )
-                .unwrap();
-            assert_eq!(reply.expires_at_ms, control_deadline);
             assert!(
                 f.owner
                     .introspect(
@@ -474,7 +467,7 @@ fn control_introspection_reports_its_action_deadline_after_retirement() {
                         &execute.token,
                         &a.receipt.certificate_sha256,
                         action,
-                        control_deadline,
+                        execute.expires_at_ms
                     )
                     .is_err()
             );
@@ -517,6 +510,14 @@ fn maximum_three_onward_hops_accepts_depth_four_and_rejects_a_fifth() {
                 )
                 .is_ok()
         );
+        f.owner
+            .accept_job(
+                &devices[n + 1].receipt.device_id,
+                &grant.grant_id,
+                &format!("job-{}", n + 1),
+                f.now,
+            )
+            .unwrap();
         parent = Some(grant.grant_id);
     }
     let mut fifth = request(&devices[5], "hop-5");
@@ -711,7 +712,7 @@ fn audience_actor_publication_and_permission_revocation_do_not_resurrect_old_gra
     assert!(
         f.owner
             .grant(&a.receipt.device_id, request(&b, "two"), f.now)
-            .is_ok()
+            .is_err()
     );
 }
 
@@ -737,6 +738,14 @@ fn delegated_permission_is_distinct_from_direct_access_and_checks_ancestors() {
     let parent = f
         .owner
         .grant(&a.receipt.device_id, request(&b, "parent"), f.now)
+        .unwrap();
+    f.owner
+        .accept_job(
+            &b.receipt.device_id,
+            &parent.grant_id,
+            "B-canonical-job",
+            f.now,
+        )
         .unwrap();
     let (_, newcsr) = csr();
     f.owner
@@ -960,6 +969,9 @@ fn redelegation_cycle_depth_origin_and_profile_scope_are_denied() {
         .owner
         .grant(&a.receipt.device_id, request(&b, "ab"), f.now)
         .unwrap();
+    f.owner
+        .accept_job(&b.receipt.device_id, &parent.grant_id, "job-b", f.now)
+        .unwrap();
     let mut child = request(&c, "bc");
     child.parent_grant_id = Some(parent.grant_id.clone());
     child.parent_job_id = Some("job-b".into());
@@ -969,6 +981,9 @@ fn redelegation_cycle_depth_origin_and_profile_scope_are_denied() {
     child.parent_grant_id = Some(parent.grant_id);
     child.parent_job_id = Some("job-b".into());
     let child = f.owner.grant(&b.receipt.device_id, child, f.now).unwrap();
+    f.owner
+        .accept_job(&c.receipt.device_id, &child.grant_id, "job-c", f.now)
+        .unwrap();
     for target in [&d, &a] {
         let mut onward = request(target, "onward");
         onward.parent_grant_id = Some(child.grant_id.clone());
@@ -1042,9 +1057,21 @@ fn group_allow_with_device_deny_exception_and_root_budget_retention() {
     ));
     f.now += 86_400_001;
     f.owner.seen(&b.receipt.device_id, ip(), f.now).unwrap();
+    assert!(matches!(
+        f.owner
+            .grant(&a.receipt.device_id, request(&b, "after-expiry"), f.now),
+        Err(NetworkError::Full)
+    ));
+    for n in 0..128 {
+        f.owner
+            .cancel_lineage(&a.receipt.device_id, &format!("root-{n}"), f.now)
+            .unwrap();
+    }
+    f.now += 86_400_001;
+    f.owner.seen(&b.receipt.device_id, ip(), f.now).unwrap();
     assert!(
         f.owner
-            .grant(&a.receipt.device_id, request(&b, "after-expiry"), f.now)
+            .grant(&a.receipt.device_id, request(&b, "after-settlement"), f.now)
             .is_ok()
     );
     f.owner
@@ -1214,6 +1241,38 @@ async fn actual_tls_enrollment_model_bridge_spoofing_and_revocation() {
             .status(),
         401
     );
+    let (renew_key, renew_csr) = csr();
+    let renewed = network
+        .lock()
+        .unwrap()
+        .renew(&a.receipt.device_id, &renew_csr, ip(), service::now_ms())
+        .unwrap();
+    let renewed_device = Device {
+        receipt: renewed,
+        key: renew_key,
+        csr: renew_csr,
+    };
+    let renewed_client = http(&ca, Some(&renewed_device));
+    assert_eq!(
+        client
+            .get(format!("{endpoint}/v1/catalog"))
+            .bearer_auth(session["client_token"].as_str().unwrap())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    assert_eq!(
+        renewed_client
+            .get(format!("{endpoint}/v1/catalog"))
+            .bearer_auth(session["client_token"].as_str().unwrap())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
     {
         let mut owner = network.lock().unwrap();
         let revision = owner.revision();
@@ -1228,7 +1287,7 @@ async fn actual_tls_enrollment_model_bridge_spoofing_and_revocation() {
             .unwrap();
     }
     assert_eq!(
-        client
+        renewed_client
             .get(format!("{endpoint}/v1/catalog"))
             .bearer_auth(session["client_token"].as_str().unwrap())
             .send()
@@ -1239,4 +1298,865 @@ async fn actual_tls_enrollment_model_bridge_spoofing_and_revocation() {
     );
     task.abort();
     let _ = task.await;
+}
+
+#[test]
+fn exact_intent_reissue_keeps_durable_authority_identity() {
+    let mut f = Fixture::new();
+    let a = f.device("a");
+    let b = f.device("b");
+    f.publish(&b, true);
+    f.allow(&a, &b, Usage::Direct);
+    let first = f
+        .owner
+        .grant(&a.receipt.device_id, request(&b, "same"), f.now)
+        .unwrap();
+    let retry = f
+        .owner
+        .grant(&a.receipt.device_id, request(&b, "same"), f.now + 1)
+        .unwrap();
+    assert_eq!(first.grant_id, retry.grant_id);
+    assert_ne!(first.token, retry.token);
+}
+
+#[test]
+fn accepted_authority_survives_restart_long_job_renewal_and_exact_redelegation() {
+    let mut f = Fixture::new();
+    let a = f.device("A");
+    let b = f.device("B");
+    let c = f.device("C");
+    f.publish(&b, true);
+    f.publish(&c, true);
+    f.allow(&a, &b, Usage::Direct);
+    f.allow(&b, &c, Usage::Direct);
+    f.allow(&a, &c, Usage::Delegated);
+    let first = f
+        .owner
+        .grant(&a.receipt.device_id, request(&b, "parent"), f.now)
+        .unwrap();
+    assert!(
+        f.owner
+            .accept_job(&a.receipt.device_id, &first.grant_id, "job-b", f.now)
+            .is_err()
+    );
+    f.owner
+        .accept_job(&b.receipt.device_id, &first.grant_id, "job-b", f.now)
+        .unwrap();
+    f.owner
+        .accept_job(&b.receipt.device_id, &first.grant_id, "job-b", f.now)
+        .unwrap();
+    assert!(
+        f.owner
+            .accept_job(
+                &b.receipt.device_id,
+                &first.grant_id,
+                "different-job",
+                f.now
+            )
+            .is_err()
+    );
+    f.owner = DeviceNetwork::open(&f.directory.path().join("network.json"), "hub-test").unwrap();
+    f.now += 2 * 86_400_000;
+    f.publish(&b, true);
+    f.publish(&c, true);
+    assert!(
+        f.owner
+            .introspect(
+                &b.receipt.device_id,
+                &first.token,
+                &a.receipt.certificate_sha256,
+                Action::Cancel,
+                f.now
+            )
+            .is_err()
+    );
+    let (_, new_csr) = csr();
+    let renewed = f
+        .owner
+        .renew(&a.receipt.device_id, &new_csr, ip(), f.now)
+        .unwrap();
+    let control = f
+        .owner
+        .grant(
+            &a.receipt.device_id,
+            control_request(&b, "parent", Action::Cancel),
+            f.now,
+        )
+        .unwrap();
+    assert_eq!(control.grant_id, first.grant_id);
+    assert!(
+        f.owner
+            .introspect(
+                &b.receipt.device_id,
+                &control.token,
+                &renewed.certificate_sha256,
+                Action::Cancel,
+                f.now
+            )
+            .is_ok()
+    );
+    let mut child = request(&c, "child");
+    child.parent_grant_id = Some(first.grant_id.clone());
+    child.parent_job_id = Some("wrong".into());
+    assert!(f.owner.grant(&b.receipt.device_id, child, f.now).is_err());
+    let mut child = request(&c, "child");
+    child.parent_grant_id = Some(first.grant_id.clone());
+    child.parent_job_id = Some("job-b".into());
+    let child = f.owner.grant(&b.receipt.device_id, child, f.now).unwrap();
+    f.owner
+        .accept_job(&c.receipt.device_id, &child.grant_id, "job-c", f.now)
+        .unwrap();
+    assert_eq!(child.claims.origin_device_id, a.receipt.device_id);
+    f.owner
+        .cancel_lineage(&a.receipt.device_id, "root-task", f.now)
+        .unwrap();
+    f.owner = DeviceNetwork::open(&f.directory.path().join("network.json"), "hub-test").unwrap();
+    f.publish(&b, true);
+    f.publish(&c, true);
+    assert_eq!(
+        f.owner
+            .self_projection(&c.receipt.device_id, f.now)
+            .unwrap()["cancelled_lineages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        f.owner
+            .grant(&a.receipt.device_id, request(&b, "new-after-cancel"), f.now)
+            .is_err()
+    );
+    f.owner
+        .grant(
+            &a.receipt.device_id,
+            control_request(&b, "parent", Action::Cancel),
+            f.now,
+        )
+        .unwrap();
+}
+
+#[test]
+fn ambiguous_intent_requires_receiver_ack_and_terminal_retirement_never_reexecutes() {
+    let mut f = Fixture::new();
+    let a = f.device("A");
+    let b = f.device("B");
+    f.publish(&b, true);
+    f.allow(&a, &b, Usage::Direct);
+    let first = f
+        .owner
+        .grant(&a.receipt.device_id, request(&b, "one"), f.now)
+        .unwrap();
+    let admin_revision = f.owner.revision();
+    f.owner = DeviceNetwork::open(&f.directory.path().join("network.json"), "hub-test").unwrap();
+    f.publish(&b, true);
+    assert!(matches!(
+        f.owner
+            .grant(&a.receipt.device_id, request(&b, "one"), f.now),
+        Err(NetworkError::RecoveryRequired)
+    ));
+    f.owner
+        .grant(
+            &a.receipt.device_id,
+            control_request(&b, "one", Action::Observe),
+            f.now,
+        )
+        .unwrap();
+    f.owner
+        .accept_job(&b.receipt.device_id, &first.grant_id, "canonical", f.now)
+        .unwrap();
+    f.owner
+        .settle_job(
+            &b.receipt.device_id,
+            &first.grant_id,
+            "canonical",
+            network::Terminal::Completed,
+            f.now,
+        )
+        .unwrap();
+    assert!(
+        f.owner
+            .settle_job(
+                &b.receipt.device_id,
+                &first.grant_id,
+                "canonical",
+                network::Terminal::Failed,
+                f.now
+            )
+            .is_err()
+    );
+    assert!(matches!(
+        f.owner
+            .grant(&a.receipt.device_id, request(&b, "one"), f.now),
+        Err(NetworkError::AuthorityRetired)
+    ));
+    assert_eq!(f.owner.revision(), admin_revision);
+    f.now += 86_400_001;
+    f.publish(&b, true);
+    let mut fresh = request(&b, "new-root");
+    fresh.root_task_id = "different-root".into();
+    f.owner.grant(&a.receipt.device_id, fresh, f.now).unwrap();
+    assert!(matches!(
+        f.owner.grant(
+            &a.receipt.device_id,
+            control_request(&b, "one", Action::Observe),
+            f.now
+        ),
+        Err(NetworkError::AuthorityRetired)
+    ));
+    assert!(matches!(
+        f.owner
+            .grant(&a.receipt.device_id, request(&b, "another-key"), f.now),
+        Err(NetworkError::AuthorityRetired)
+    ));
+}
+
+#[test]
+fn inspect_is_ephemeral_read_only_and_does_not_consume_job_authority() {
+    let mut f = Fixture::new();
+    let a = f.device("A");
+    let b = f.device("B");
+    f.publish(&b, true);
+    f.allow(&a, &b, Usage::Direct);
+    let path = f.directory.path().join("network.json");
+    let before = std::fs::read(&path).unwrap();
+    let receipt = f
+        .owner
+        .inspect(
+            &a.receipt.device_id,
+            network::InspectRequest {
+                audience_device_id: b.receipt.device_id.clone(),
+                profile_id: "agent".into(),
+                parent_grant_id: None,
+                parent_job_id: None,
+            },
+            f.now,
+        )
+        .unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(
+        f.owner
+            .introspect(
+                &b.receipt.device_id,
+                &receipt.token,
+                &a.receipt.certificate_sha256,
+                Action::Inspect,
+                f.now
+            )
+            .is_ok()
+    );
+    for action in [Action::Execute, Action::Observe, Action::Cancel] {
+        assert!(
+            f.owner
+                .introspect(
+                    &b.receipt.device_id,
+                    &receipt.token,
+                    &a.receipt.certificate_sha256,
+                    action,
+                    f.now
+                )
+                .is_err()
+        );
+    }
+    assert!(
+        f.owner
+            .accept_job(&b.receipt.device_id, &receipt.grant_id, "not-a-job", f.now)
+            .is_err()
+    );
+    f.publish(&b, false);
+    f.publish(&b, true);
+    assert!(
+        f.owner
+            .introspect(
+                &b.receipt.device_id,
+                &receipt.token,
+                &a.receipt.certificate_sha256,
+                Action::Inspect,
+                f.now
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn schema_one_forward_load_preserves_identity_without_implicit_write() {
+    let mut f = Fixture::new();
+    let a = f.device("A");
+    let path = f.directory.path().join("network.json");
+    let mut old: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    old["schema_version"] = json!(1);
+    old.as_object_mut().unwrap().remove("authority");
+    old.as_object_mut().unwrap().remove("gateway_port");
+    old.as_object_mut().unwrap().remove("join_requests");
+    for device in old["devices"].as_object_mut().unwrap().values_mut() {
+        for field in ["stopped", "admission_revision", "join_approval"] {
+            device.as_object_mut().unwrap().remove(field);
+        }
+    }
+    let bytes = serde_json::to_vec(&old).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    let mut owner = DeviceNetwork::open(&path, "hub-test").unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert!(owner.current_certificate(&a.receipt.device_id, &a.receipt.certificate_sha256, f.now));
+    owner.set_gateway_port(&owner.revision(), 9550).unwrap();
+    let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(saved["schema_version"], 3);
+    assert_eq!(saved["gateway_port"], 9550);
+    let mut invalid = saved;
+    invalid["authority"]["assume_all_accepted"] = json!(true);
+    let bytes = serde_json::to_vec(&invalid).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    assert!(DeviceNetwork::open(&path, "hub-test").is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}
+
+#[tokio::test]
+async fn job_ack_http_requires_exact_audience_and_inspect_cannot_admit() {
+    let mut f = Fixture::new();
+    let a = f.device("A");
+    let b = f.device("B");
+    f.publish(&b, true);
+    f.allow(&a, &b, Usage::Direct);
+    let ca = f.owner.ca_certificate().to_string();
+    let (cert, key) = f.owner.server_certificate(ip(), f.now).unwrap();
+    let network = Arc::new(Mutex::new(f.owner));
+    let core = Arc::new(Mutex::new(
+        HubCore::new(CatalogStore::empty("test")).unwrap(),
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let listener = network::tls::NetworkListener::new(
+        listener,
+        network::tls::acceptor(&cert, &key, &ca, true).unwrap(),
+    );
+    let task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            service::network_router(core, network, None)
+                .into_make_service_with_connect_info::<network::tls::TlsPeer>(),
+        )
+        .await
+        .unwrap();
+    });
+    let endpoint = format!("https://{address}");
+    let client = http(&ca, Some(&a));
+    let receiver = http(&ca, Some(&b));
+    let grant: Value = client.post(format!("{endpoint}/v1/network/grants")).json(&json!({"audience_device_id":b.receipt.device_id,"profile_id":"agent","root_task_id":"http-root","request_key":"one","parent_grant_id":null,"parent_job_id":null})).send().await.unwrap().json().await.unwrap();
+    let accepted = json!({"grant_id":grant["grant_id"],"job_id":"job"});
+    assert_eq!(
+        client
+            .post(format!("{endpoint}/v1/network/jobs/accepted"))
+            .json(&accepted)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            receiver
+                .post(format!("{endpoint}/v1/network/jobs/accepted"))
+                .json(&accepted)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+    }
+    assert_eq!(
+        receiver
+            .post(format!("{endpoint}/v1/network/jobs/accepted"))
+            .json(&json!({"grant_id":grant["grant_id"],"job_id":"other"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    let settled = json!({"grant_id":grant["grant_id"],"job_id":"job","state":"completed"});
+    assert_eq!(
+        client
+            .post(format!("{endpoint}/v1/network/jobs/settled"))
+            .json(&settled)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    assert_eq!(
+        receiver
+            .post(format!("{endpoint}/v1/network/jobs/settled"))
+            .json(&settled)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let inspected: Value = client
+        .post(format!("{endpoint}/v1/network/inspect"))
+        .json(&json!({"audience_device_id":b.receipt.device_id,"profile_id":"agent"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        receiver
+            .post(format!("{endpoint}/v1/network/jobs/accepted"))
+            .json(&json!({"grant_id":inspected["grant_id"],"job_id":"no-execution"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        409
+    );
+    task.abort();
+    let _ = task.await;
+}
+
+#[test]
+fn terminal_root_collection_keeps_active_descendants_and_retirement_barrier() {
+    let mut f = Fixture::new();
+    let a = f.device("A");
+    let b = f.device("B");
+    let c = f.device("C");
+    f.publish(&b, true);
+    f.publish(&c, true);
+    f.allow(&a, &b, Usage::Direct);
+    f.allow(&b, &c, Usage::Direct);
+    f.allow(&a, &c, Usage::Delegated);
+    let root = |n| ulid::Ulid::from(n as u128).to_string();
+    let mut older = request(&b, "older-active");
+    older.root_task_id = root(1);
+    let older = f.owner.grant(&a.receipt.device_id, older, f.now).unwrap();
+    f.owner
+        .accept_job(&b.receipt.device_id, &older.grant_id, "older-job", f.now)
+        .unwrap();
+    let mut parent = request(&b, "parent");
+    parent.root_task_id = root(2);
+    let parent = f.owner.grant(&a.receipt.device_id, parent, f.now).unwrap();
+    f.owner
+        .accept_job(&b.receipt.device_id, &parent.grant_id, "parent-job", f.now)
+        .unwrap();
+    let mut child = request(&c, "child");
+    child.root_task_id = root(2);
+    child.parent_grant_id = Some(parent.grant_id.clone());
+    child.parent_job_id = Some("parent-job".into());
+    let child = f.owner.grant(&b.receipt.device_id, child, f.now).unwrap();
+    f.owner
+        .accept_job(&c.receipt.device_id, &child.grant_id, "child-job", f.now)
+        .unwrap();
+    f.owner
+        .settle_job(
+            &b.receipt.device_id,
+            &parent.grant_id,
+            "parent-job",
+            network::Terminal::Completed,
+            f.now,
+        )
+        .unwrap();
+    f.now += 86_400_001;
+    f.publish(&b, true);
+    f.publish(&c, true);
+    let mut fresh = request(&b, "fresh");
+    fresh.root_task_id = root(3);
+    f.owner.grant(&a.receipt.device_id, fresh, f.now).unwrap();
+    // A completed parent remains addressable while any descendant is active.
+    let mut query = control_request(&b, "parent", Action::Observe);
+    query.root_task_id = root(2);
+    assert_eq!(
+        f.owner
+            .grant(&a.receipt.device_id, query, f.now)
+            .unwrap()
+            .grant_id,
+        parent.grant_id
+    );
+    f.owner
+        .settle_job(
+            &c.receipt.device_id,
+            &child.grant_id,
+            "child-job",
+            network::Terminal::Completed,
+            f.now,
+        )
+        .unwrap();
+    f.now += 86_400_001;
+    f.publish(&b, true);
+    let mut fresh = request(&b, "fresh");
+    fresh.root_task_id = root(4);
+    f.owner.grant(&a.receipt.device_id, fresh, f.now).unwrap();
+    let mut old_active = control_request(&b, "older-active", Action::Cancel);
+    old_active.root_task_id = root(1);
+    assert_eq!(
+        f.owner
+            .grant(&a.receipt.device_id, old_active, f.now)
+            .unwrap()
+            .grant_id,
+        older.grant_id
+    );
+    for retired in [0, 2] {
+        let mut replay = request(&b, "even-a-new-key");
+        replay.root_task_id = root(retired);
+        assert!(matches!(
+            f.owner.grant(&a.receipt.device_id, replay, f.now),
+            Err(NetworkError::AuthorityRetired)
+        ));
+    }
+    let reopened =
+        DeviceNetwork::open(&f.directory.path().join("network.json"), "hub-test").unwrap();
+    assert_eq!(reopened.revision(), f.owner.revision());
+}
+
+#[test]
+fn persisted_authority_rejects_rebound_origin_without_rewrite_or_token_persistence() {
+    let mut f = Fixture::new();
+    let a = f.device("A");
+    let b = f.device("B");
+    f.publish(&b, true);
+    f.allow(&a, &b, Usage::Direct);
+    let grant = f
+        .owner
+        .grant(&a.receipt.device_id, request(&b, "one"), f.now)
+        .unwrap();
+    let path = f.directory.path().join("network.json");
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(
+        !String::from_utf8(bytes.clone())
+            .unwrap()
+            .contains(&grant.token)
+    );
+    let mut state: Value = serde_json::from_slice(&bytes).unwrap();
+    state["authority"]["authorities"][&grant.grant_id]["claims"]["origin_device_id"] =
+        json!(b.receipt.device_id);
+    let invalid = serde_json::to_vec(&state).unwrap();
+    std::fs::write(&path, &invalid).unwrap();
+    assert!(DeviceNetwork::open(&path, "hub-test").is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), invalid);
+}
+
+#[tokio::test]
+async fn revoked_current_receiver_can_only_report_exact_accepted_terminal_metadata() {
+    let mut f = Fixture::new();
+    let a = f.device("A");
+    let b = f.device("B");
+    f.publish(&b, true);
+    f.allow(&a, &b, Usage::Direct);
+    let grant = f
+        .owner
+        .grant(&a.receipt.device_id, request(&b, "one"), f.now)
+        .unwrap();
+    f.owner
+        .accept_job(&b.receipt.device_id, &grant.grant_id, "job", f.now)
+        .unwrap();
+    let (new_key, new_csr) = csr();
+    let new_receipt = f
+        .owner
+        .renew(&b.receipt.device_id, &new_csr, ip(), f.now)
+        .unwrap();
+    let current_b = Device {
+        receipt: new_receipt,
+        key: new_key,
+        csr: new_csr,
+    };
+    let ca = f.owner.ca_certificate().to_owned();
+    let (cert, key) = f.owner.server_certificate(ip(), f.now).unwrap();
+    f.owner
+        .set_device(
+            &f.owner.revision(),
+            &b.receipt.device_id,
+            "B".into(),
+            BTreeSet::new(),
+            true,
+        )
+        .unwrap();
+    let network = Arc::new(Mutex::new(f.owner));
+    let core = Arc::new(Mutex::new(
+        HubCore::new(CatalogStore::empty("test")).unwrap(),
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("https://{}", listener.local_addr().unwrap());
+    let listener = network::tls::NetworkListener::new(
+        listener,
+        network::tls::acceptor(&cert, &key, &ca, true).unwrap(),
+    );
+    let task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            service::network_router(core, network, None)
+                .into_make_service_with_connect_info::<network::tls::TlsPeer>(),
+        )
+        .await
+        .unwrap();
+    });
+    let receiver = http(&ca, Some(&current_b));
+    let body = json!({"grant_id":grant.grant_id,"job_id":"job","state":"completed"});
+    assert_eq!(
+        http(&ca, Some(&b))
+            .post(format!("{endpoint}/v1/network/jobs/settled"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    assert_eq!(
+        receiver
+            .post(format!("{endpoint}/v1/network/jobs/settled"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        receiver
+            .post(format!("{endpoint}/v1/network/jobs/settled"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    for bad in [
+        json!({"grant_id":grant.grant_id,"job_id":"another","state":"completed"}),
+        json!({"grant_id":grant.grant_id,"job_id":"job","state":"failed"}),
+        json!({"grant_id":"unknown","job_id":"job","state":"completed"}),
+    ] {
+        assert!(
+            !receiver
+                .post(format!("{endpoint}/v1/network/jobs/settled"))
+                .json(&bad)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .is_success()
+        );
+    }
+    assert_eq!(
+        http(&ca, Some(&a))
+            .post(format!("{endpoint}/v1/network/jobs/settled"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    for route in [
+        "jobs/accepted",
+        "grants",
+        "inspect",
+        "model-session",
+        "publish",
+        "presence",
+    ] {
+        assert_eq!(
+            receiver
+                .post(format!("{endpoint}/v1/network/{route}"))
+                .json(&json!({"grant_id":grant.grant_id,"job_id":"job","csr_pem":b.csr}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403,
+            "{route}"
+        );
+    }
+    assert_eq!(
+        receiver
+            .post(format!("{endpoint}/v1/network/renew"))
+            .json(&json!({"csr_pem":b.csr}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    assert_eq!(
+        receiver
+            .get(format!("{endpoint}/v1/network/self"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    task.abort();
+    let _ = task.await;
+}
+
+#[test]
+fn delegated_inspection_preserves_origin_parent_scope_without_creating_job_intent() {
+    let mut f = Fixture::new();
+    let a = f.device("A");
+    let b = f.device("B");
+    let c = f.device("C");
+    f.publish(&b, true);
+    f.publish(&c, true);
+    f.allow(&a, &b, Usage::Direct);
+    f.allow(&b, &c, Usage::Direct);
+    let delegated = f.allow(&a, &c, Usage::Delegated);
+    let parent = f
+        .owner
+        .grant(&a.receipt.device_id, request(&b, "parent"), f.now)
+        .unwrap();
+    let inspect = |job: &str| network::InspectRequest {
+        audience_device_id: c.receipt.device_id.clone(),
+        profile_id: "agent".into(),
+        parent_grant_id: Some(parent.grant_id.clone()),
+        parent_job_id: Some(job.into()),
+    };
+    assert!(
+        f.owner
+            .inspect(&b.receipt.device_id, inspect("job"), f.now)
+            .is_err()
+    );
+    f.owner
+        .accept_job(&b.receipt.device_id, &parent.grant_id, "job", f.now)
+        .unwrap();
+    assert!(
+        f.owner
+            .inspect(&b.receipt.device_id, inspect("wrong-job"), f.now)
+            .is_err()
+    );
+    let before = std::fs::read(f.directory.path().join("network.json")).unwrap();
+    let discovery = f
+        .owner
+        .inspect(&b.receipt.device_id, inspect("job"), f.now)
+        .unwrap();
+    assert_eq!(
+        std::fs::read(f.directory.path().join("network.json")).unwrap(),
+        before
+    );
+    assert_eq!(discovery.claims.origin_device_id, a.receipt.device_id);
+    assert_eq!(
+        discovery.claims.device_path,
+        vec![
+            a.receipt.device_id.clone(),
+            b.receipt.device_id.clone(),
+            c.receipt.device_id.clone()
+        ]
+    );
+    assert!(
+        f.owner
+            .introspect(
+                &c.receipt.device_id,
+                &discovery.token,
+                &b.receipt.certificate_sha256,
+                Action::Inspect,
+                f.now
+            )
+            .is_ok()
+    );
+    for action in [Action::Execute, Action::Observe, Action::Cancel] {
+        assert!(
+            f.owner
+                .introspect(
+                    &c.receipt.device_id,
+                    &discovery.token,
+                    &b.receipt.certificate_sha256,
+                    action,
+                    f.now
+                )
+                .is_err()
+        );
+    }
+    // A has delegated access to C through B; A still cannot inspect C directly.
+    assert!(
+        f.owner
+            .inspect(
+                &a.receipt.device_id,
+                network::InspectRequest {
+                    audience_device_id: c.receipt.device_id.clone(),
+                    profile_id: "agent".into(),
+                    parent_grant_id: None,
+                    parent_job_id: None
+                },
+                f.now
+            )
+            .is_err()
+    );
+    f.owner
+        .delete_rule(&f.owner.revision(), &delegated)
+        .unwrap();
+    assert!(
+        f.owner
+            .introspect(
+                &c.receipt.device_id,
+                &discovery.token,
+                &b.receipt.certificate_sha256,
+                Action::Inspect,
+                f.now
+            )
+            .is_err()
+    );
+    assert!(
+        f.owner
+            .inspect(&b.receipt.device_id, inspect("job"), f.now)
+            .is_err()
+    );
+}
+
+#[test]
+fn accepted_job_id_cannot_rebind_to_another_authority_for_the_same_receiver() {
+    let mut f = Fixture::new();
+    let a = f.device("A");
+    let b = f.device("B");
+    f.publish(&b, true);
+    f.allow(&a, &b, Usage::Direct);
+    let first = f
+        .owner
+        .grant(&a.receipt.device_id, request(&b, "one"), f.now)
+        .unwrap();
+    let mut second = request(&b, "two");
+    second.root_task_id = "another-root".into();
+    let second = f.owner.grant(&a.receipt.device_id, second, f.now).unwrap();
+    f.owner
+        .accept_job(
+            &b.receipt.device_id,
+            &first.grant_id,
+            "canonical-job",
+            f.now,
+        )
+        .unwrap();
+    let before = std::fs::read(f.directory.path().join("network.json")).unwrap();
+    assert!(
+        f.owner
+            .accept_job(
+                &b.receipt.device_id,
+                &second.grant_id,
+                "canonical-job",
+                f.now
+            )
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read(f.directory.path().join("network.json")).unwrap(),
+        before
+    );
+    f.owner
+        .accept_job(
+            &b.receipt.device_id,
+            &first.grant_id,
+            "canonical-job",
+            f.now,
+        )
+        .unwrap();
+    f.owner
+        .accept_job(
+            &b.receipt.device_id,
+            &second.grant_id,
+            "another-canonical-job",
+            f.now,
+        )
+        .unwrap();
 }

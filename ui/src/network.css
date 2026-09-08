@@ -3,8 +3,8 @@
 .network-grid > .network-card { margin-top: 0; }
 .network-card h3 { margin: 0 0 15px; font-size: 16px; }
 .network-card form, #network-device-form { display: grid; gap: 14px; }
-.network-card label { display: grid; gap: 7px; font-size: 13px; }
-.network-card input, .network-card select, #network-device-form input { width: 100%; min-width: 0; padding: 10px 12px; border: 1px solid #cbd5e2; border-radius: 8px; background: #fff; color: #26384c; font: inherit; }
+.network-card label, .network-client-toolbar label { display: grid; gap: 7px; font-size: 13px; }
+.network-card input, .network-card select, #network-device-form input, .network-client-toolbar input, .network-client-toolbar select { width: 100%; min-width: 0; padding: 10px 12px; border: 1px solid #cbd5e2; border-radius: 8px; background: #fff; color: #26384c; font: inherit; }
 .network-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .network-actions { display: flex; gap: 9px; flex-wrap: wrap; margin-top: 14px; }
 .network-card fieldset, #network-device-form fieldset { border: 1px solid var(--line); border-radius: 8px; padding: 12px; min-width: 0; }
@@ -16,10 +16,27 @@
 .network-mono { font: 12px/1.7 Consolas, monospace; overflow-wrap: anywhere; color: var(--muted); }
 .network-card details { margin-top: 12px; }
 .network-card summary { cursor: pointer; font-size: 13px; padding: 6px 0; }
-.network-table { min-width: 720px; }
+.network-certificate-times { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 7px 12px; font-size: 12px; line-height: 1.7; }
+.network-certificate-times dt { color: var(--muted); }
+.network-certificate-times dd { margin: 0; overflow-wrap: anywhere; }
+.network-diagnostic-stages { list-style: none; padding: 0; margin: 12px 0; }
+.network-diagnostic-stages li { padding: 12px 0; border-bottom: 1px solid var(--line); }
+.network-diagnostic-stages strong { font-size: 13px; line-height: 1.8; }
+.network-diagnostic-stages p { color: var(--muted); font-size: 13px; line-height: 1.8; margin: 6px 0 0; overflow-wrap: anywhere; }
+.network-table { min-width: 850px; }
 .network-table td { max-width: 270px; vertical-align: top; }
 .network-table small { display: block; margin-top: 7px; line-height: 1.65; }
-.network-table code { overflow-wrap: anywhere; font-size: 11px; }
+.network-table code { display: block; max-width: 220px; overflow-wrap: anywhere; font-size: 11px; }
+.network-table strong { overflow-wrap: anywhere; }
+.network-table details { margin-top: 10px; }
+.network-table summary { padding: 4px 0; cursor: pointer; color: var(--muted); font-size: 12px; }
+.network-row-actions { display: grid; gap: 9px; min-width: 110px; }
+.network-row-actions button { font-size: 13px; white-space: normal; }
+.network-client-toolbar { display: flex; flex-wrap: wrap; align-items: end; gap: 14px; margin: 20px 0 12px; }
+.network-client-toolbar .network-search { flex: 1 1 240px; }
+.network-client-toolbar button { min-height: 40px; }
+.network-pending-count { display: block; margin-top: 5px; color: #dca74c; font-size: 11px; }
+.network-legacy-invite .network-card { max-width: 600px; }
 .network-search { max-width: 320px; }
 .network-tag { display: inline-block; padding: 4px 8px; margin: 3px; border-radius: 6px; background: #edf2fa; font-size: 12px; }
 .network-group-list { list-style: none; padding: 0; }
@@ -30,4 +47,7 @@
 #network-invite-receipt { padding: 15px; margin-top: 17px; background: #f0f5ff; border: 1px solid #c9d9fa; border-radius: 10px; }
 #network-invite-code { letter-spacing: .12em; font: 18px Consolas, monospace; }
 #network-device-dialog { width: min(560px, calc(100vw - 40px)); }
+#network-device-revoke-details { border-top: 1px solid var(--line); padding-top: 12px; }
+#network-device-revoke-details summary { cursor: pointer; font-size: 13px; margin-bottom: 12px; }
+#network-device-id { white-space: pre-line; }
 @media (max-width: 1050px) { .network-grid { grid-template-columns: minmax(0, 1fr); } }

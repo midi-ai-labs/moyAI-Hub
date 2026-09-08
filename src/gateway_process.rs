@@ -1,5 +1,6 @@
 //! Process ownership and metadata-only companion control. Credentials travel through stdin.
-use crate::gateway::{CancelScope, Gateway, Grant};
+use crate::gateway::{CancelScope, Gateway, GatewayTlsUpdate, Grant};
+use crate::network::certificate::{CertificateIdentity, CertificateSnapshot, PreparedIdentity};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -34,6 +35,19 @@ pub struct GatewayNetwork {
     pub certificate_pem: String,
     pub private_key_pem: String,
     pub ca_certificate_pem: String,
+}
+
+// Only this pre-admission outcome authorizes clearing a failed-start marker.
+// Unknown replies, nonzero exit and missing exit confirmation remain uncertain.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StartupFailure {
+    startup_error: StartupError,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum StartupError {
+    NetworkBindFailed,
 }
 
 #[derive(Clone)]
@@ -163,6 +177,23 @@ impl GatewayControl {
     pub async fn status(&self) -> Result<Value, ControlError> {
         self.request::<Value>("/control/state", None).await
     }
+    pub async fn certificate(&self) -> Result<CertificateSnapshot, ControlError> {
+        let value = self.request::<Value>("/control/tls", None).await?;
+        serde_json::from_value(value).map_err(|_| ControlError {
+            status: 503,
+            code: "invalid_gateway_certificate".into(),
+        })
+    }
+    pub async fn install_certificate(
+        &self,
+        update: &GatewayTlsUpdate,
+    ) -> Result<CertificateSnapshot, ControlError> {
+        let value = self.request("/control/tls", Some(update)).await?;
+        serde_json::from_value(value).map_err(|_| ControlError {
+            status: 503,
+            code: "invalid_gateway_certificate".into(),
+        })
+    }
 }
 
 pub struct GatewayProcess {
@@ -246,6 +277,21 @@ impl GatewayProcess {
             .map_err(|_| "Gateway の起動を確認できません。")?;
         let value: Value =
             serde_json::from_str(&ready).map_err(|_| "Gateway の起動応答が無効です。")?;
+        if let Ok(failure) = serde_json::from_value::<StartupFailure>(value.clone()) {
+            drop(stdin);
+            if !matches!(tokio::time::timeout(Duration::from_secs(2), child.wait()).await, Ok(Ok(status)) if status.success())
+            {
+                return Err(
+                    "Gateway の起動は失敗しましたが、終了を確認できません。実行保留を維持します。"
+                        .into(),
+                );
+            }
+            std::fs::remove_file(directory.join(MARKER))
+                .map_err(|_| "Gateway は終了しましたが、実行記録を解除できません。")?;
+            return Err(match failure.startup_error {
+                StartupError::NetworkBindFailed => "Gateway の待受を開始できません。指定した IP とポートの使用状況を確認してください。".into(),
+            });
+        }
         let base = value
             .get("base_url")
             .and_then(Value::as_str)
@@ -327,10 +373,22 @@ pub async fn run_companion() -> Result<(), io::Error> {
         .map_err(|_| io::Error::other("gateway client unavailable"))?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let base_url = format!("http://{}/", listener.local_addr()?);
-    let router = gateway.clone().router();
-    let server = tokio::spawn(async move { axum::serve(listener, router).await });
-    let (network_server, network_base_url) = if let Some(network) = init.network {
-        let listener = tokio::net::TcpListener::bind(network.bind).await?;
+    // Bind and validate every listener before starting either admission loop.
+    let (network_listener, network_base_url) = if let Some(network) = init.network {
+        let listener = match tokio::net::TcpListener::bind(network.bind).await {
+            Ok(listener) => listener,
+            Err(_) => {
+                let reply = StartupFailure {
+                    startup_error: StartupError::NetworkBindFailed,
+                };
+                let mut bytes = serde_json::to_vec(&reply).map_err(io::Error::other)?;
+                bytes.push(b'\n');
+                let mut stdout = tokio::io::stdout();
+                stdout.write_all(&bytes).await?;
+                stdout.flush().await?;
+                return Ok(());
+            }
+        };
         let public = std::net::SocketAddr::new(network.advertise_ip, listener.local_addr()?.port());
         let acceptor = crate::network::tls::acceptor(
             &network.certificate_pem,
@@ -339,21 +397,44 @@ pub async fn run_companion() -> Result<(), io::Error> {
             false,
         )
         .map_err(|_| io::Error::other("gateway TLS unavailable"))?;
+        let identity = CertificateIdentity::new(
+            PreparedIdentity::new(
+                &network.certificate_pem,
+                &network.private_key_pem,
+                &network.ca_certificate_pem,
+                network.advertise_ip,
+                false,
+                crate::service::now_ms(),
+            )
+            .map_err(|_| io::Error::other("gateway TLS identity unavailable"))?,
+        );
+        gateway
+            .configure_network_tls(
+                identity.clone(),
+                network.ca_certificate_pem,
+                network.advertise_ip,
+            )
+            .map_err(|_| io::Error::other("gateway TLS identity unavailable"))?;
         let listener = crate::network::tls::NetworkListener::new(listener, acceptor)
+            .with_identity(identity)
             .with_idle(Duration::from_secs(305))
             .with_authority(public.to_string());
+        (Some(listener), Some(format!("https://{public}")))
+    } else {
+        (None, None)
+    };
+    let router = gateway.clone().router();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await });
+    let network_server = network_listener.map(|listener| {
         let router = gateway.clone().network_router();
-        let task = tokio::spawn(async move {
+        tokio::spawn(async move {
             axum::serve(
                 listener,
                 router.into_make_service_with_connect_info::<crate::network::tls::TlsPeer>(),
             )
             .await
-        });
-        (Some(task), Some(format!("https://{public}")))
-    } else {
-        (None, None)
-    };
+        })
+    });
     let mut stdout = tokio::io::stdout();
     stdout
         .write_all(

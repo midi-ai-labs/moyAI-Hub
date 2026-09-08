@@ -1,0 +1,16 @@
+.history-toolbar { display: grid; grid-template-columns: minmax(200px, 1fr) minmax(250px, 1fr) auto; gap: 16px; align-items: end; margin: 20px 0 12px; }
+.history-toolbar label { display: grid; gap: 8px; }
+.history-toolbar select { width: 100%; }
+.history-table { min-width: 820px; }
+.history-table td { vertical-align: top; max-width: 360px; overflow-wrap: anywhere; }
+.history-table td:first-child { min-width: 240px; }
+.history-table td strong, .history-table td small { display: block; }
+.history-table td small { margin-top: 6px; }
+.history-pagination { display: flex; gap: 16px; align-items: center; justify-content: flex-end; margin-top: 16px; }
+.history-pagination span { color: var(--muted); }
+.history-detail { border: 1px solid var(--line); border-radius: 14px; padding: 20px; margin-top: 24px; }
+.history-detail .section-title { gap: 16px; }
+.history-detail h3 { overflow-wrap: anywhere; }
+.history-detail pre { max-height: 580px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.7 "Cascadia Code", "Yu Gothic UI", monospace; padding: 18px; background: #0d1522; border-radius: 10px; color: #dbe6f4; user-select: text; }
+.history-warning { border-left: 3px solid #dda649; padding: 10px 14px; background: #dda64915; }
+@media (max-width: 1150px) { .history-toolbar { grid-template-columns: 1fr 1fr; } .history-toolbar button { grid-column: 2; justify-self: end; } }
