@@ -95,6 +95,112 @@ fn review_body(client: &Value, context: &str) -> Value {
 }
 
 #[tokio::test]
+async fn authenticated_heartbeat_renews_only_its_exact_live_turn_and_accepts_legacy_clients() {
+    use moyai_hub::{
+        catalog::{CapacityPool, Deployment},
+        protocol::{Availability, RouteDecision},
+    };
+    let server = Server::new().await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    {
+        let mut core = server.core.lock().unwrap();
+        let mut catalog = core.catalog_store().catalog.clone();
+        catalog.deployments.push(Deployment {
+            id: "host".into(),
+            logical_model_id: "model-a".into(),
+            capacity_pool_id: "pool".into(),
+            label: "Host".into(),
+            endpoint: "http://127.0.0.1:1234/v1".into(),
+            provider_model: "model-a".into(),
+            provider_profile: "openai_compatible_chat".into(),
+            enabled: true,
+        });
+        catalog.capacity_pools.push(CapacityPool {
+            id: "pool".into(),
+            label: "Pool".into(),
+            max_concurrent: 1,
+        });
+        catalog.policy.lease_ttl_ms = 5000;
+        core.replace_catalog(catalog, now).unwrap();
+        core.observe_deployment("host", Availability::Ready, now)
+            .unwrap();
+    }
+    let a = server.register("A").await;
+    let b = server.register("B").await;
+    let token = a["client_token"].as_str().unwrap();
+    let id = a["id"].as_str().unwrap();
+    assert_eq!(
+        server
+            .post("/v1/clients/review", token, &review_body(&a, "main"))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let RouteDecision::Assigned { lease: original } = server
+        .core
+        .lock()
+        .unwrap()
+        .begin_turn(id, "main", "turn", now - 4000)
+        .unwrap()
+    else {
+        panic!("expected route")
+    };
+    assert_eq!(server.post("/v1/clients/heartbeat", token, &json!({"id":b["id"],"activity":"running","active_turns":[{"context":"main","turn_id":"turn"}]})).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        server
+            .post(
+                "/v1/clients/heartbeat",
+                token,
+                &json!({"id":id,"activity":"waiting"})
+            )
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        server
+            .core
+            .lock()
+            .unwrap()
+            .begin_turn(id, "main", "turn", now)
+            .unwrap(),
+        RouteDecision::Assigned {
+            lease: original.clone()
+        }
+    );
+    assert_eq!(server.post("/v1/clients/heartbeat", token, &json!({"id":id,"activity":"waiting","active_turns":[{"context":"main","turn_id":"turn"}]})).await.0, StatusCode::OK);
+    let RouteDecision::Assigned { lease: renewed } = server
+        .core
+        .lock()
+        .unwrap()
+        .begin_turn(id, "main", "turn", now + 1001)
+        .unwrap()
+    else {
+        panic!("expected renewed route")
+    };
+    assert_eq!(renewed.id, original.id);
+    assert!(renewed.expires_at_ms > original.expires_at_ms);
+    server
+        .core
+        .lock()
+        .unwrap()
+        .finish_turn(id, "main", "turn")
+        .unwrap();
+    assert_eq!(server.post("/v1/clients/heartbeat", token, &json!({"id":id,"activity":"waiting","active_turns":[{"context":"main","turn_id":"turn"}]})).await.0, StatusCode::OK);
+    assert_eq!(
+        server
+            .core
+            .lock()
+            .unwrap()
+            .begin_turn(id, "main", "turn", now + 1001),
+        Err(moyai_hub::protocol::HubError::TurnClosed)
+    );
+}
+
+#[tokio::test]
 async fn registration_binds_hub_and_client_token_reads_catalog_but_only_own_reviews() {
     let server = Server::new().await;
     let a = server.register("Desktop A").await;
@@ -104,6 +210,7 @@ async fn registration_binds_hub_and_client_token_reads_catalog_but_only_own_revi
         server.core.lock().unwrap().catalog_store().hub_id
     );
     assert_eq!(a["revision"], "2");
+    assert_eq!(a["supports_turn_heartbeat"], true);
     let token = a["client_token"].as_str().unwrap();
     let catalog: Value = Client::new()
         .get(format!("{}/v1/catalog", server.base))

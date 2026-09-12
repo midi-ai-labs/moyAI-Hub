@@ -1,10 +1,12 @@
-import { invoke } from "@tauri-apps/api/core";
-import { availability, capabilityLabel, changeSummary, DiscoveryOwner, gatewayStatus, loadCounts, reviewStatus } from "./state.ts";
+import { invoke, reconnect } from "./management.ts";
+import { capabilityLabel, changeSummary, deploymentStatus, DiscoveryOwner, gatewayStatus, modelCounts, reviewStatus } from "./state.ts";
 import type { Discovery, DeploymentRow, Snapshot } from "./state.ts";
 import { reconcileModelRows } from "./model_rows.ts";
 import { attachDeviceNetwork } from "./network.ts";
 import { attachHistory } from "./history.ts";
+import { attachWebManagement } from "./web_admin.ts";
 import "./history.css";
+import "./web_admin.css";
 import "./style.css";
 function el<T extends HTMLElement = HTMLElement>(id: string): T {
     const node = document.getElementById(id);
@@ -111,9 +113,9 @@ function render(next: Snapshot) {
     setText("metric-models", models.length);
     setText("nav-model-count", models.length);
     setText("metric-hosts", `${next.deployments.length} 件の登録先`);
-    const loaded = loadCounts(next.deployments);
-    setText("metric-ready", loaded.ready);
-    setText("metric-unknown", loaded.unknown);
+    const confirmed = modelCounts(next.deployments);
+    setText("metric-present", confirmed.present);
+    setText("metric-unconfirmed", confirmed.unconfirmed);
     setText("metric-revision", next.store.revision);
     setText("header-status", next.server.running ? "モデル接続は稼働中" : "モデル接続は停止中");
     el("header-dot").className = `dot ${next.server.running ? "green" : "gray"}`;
@@ -130,14 +132,12 @@ function render(next: Snapshot) {
     setText("gateway-status", execution.label);
     setText("gateway-detail", execution.detail);
     el("gateway-summary").classList.toggle("attention", execution.attention);
-    el("gateway-recovery").hidden = !gateway?.uncertain || next.server.running;
-    button("acknowledge-gateway").disabled = next.server.running || !input("provider-quiescent").checked;
     setText("hub-identity", `Hub ${next.store.hub_id}`);
     options("logical-model", models, "新しいモデルとして登録");
     options("capacity-pool", pools, "このホストに新しいグループを作成");
     reconcileModelRows(el<HTMLTableSectionElement>("model-rows"), next.deployments.map(row => {
         const d = row.deployment;
-        const state = availability[row.availability];
+        const state = deploymentStatus(row);
         const logical = models.find(model => model.id === d.logical_model_id);
         const pool = pools.find(pool => pool.id === d.capacity_pool_id);
         return `<tr data-id="${escape(d.id)}"><td><strong>${escape(d.label)}</strong><small>${escape(d.provider_model)}<br/>${escape(d.endpoint)}</small></td><td><span class="badge ${state.color}"><i class="dot ${state.color}"></i>${state.label}</span><small class="status-reason">${state.reason}</small></td><td>${escape(logical?.capabilities.map(capabilityLabel).join(", ") || "未確認")}<small>${escape(logical?.label)}</small></td><td>${escape(pool?.max_concurrent ?? "—")} 枠<small>${escape(pool?.label)}</small></td><td>${time(row.last_observed_ms)}</td><td><button class="tiny-button" data-edit="${escape(d.id)}" aria-label="${escape(d.label)} を編集">編集</button></td></tr>`;
@@ -164,13 +164,16 @@ async function poll() {
     pollInFlight = true;
     try {
         await deviceNetwork.refresh();
+        await webManagement.refresh();
         const next = await invoke<Snapshot>("hub_snapshot");
+        setText("management-status", "Hub本体に接続中");
         if (interactionActive())
             pending = next;
         else
             render(next);
     }
     catch (error) {
+        setText("management-status", "Hub本体の応答を確認できません");
         notify(errorText(error), true);
     }
     finally {
@@ -333,7 +336,7 @@ el<HTMLFormElement>("server-form").addEventListener("submit", async (event) => {
         });
         input("token").value = "";
         input("token").type = "password";
-        notify("Hub サーバーを開始しました。Gateway の実行状態を確認してください。");
+        notify("Hub サーバーを開始しました。");
         await poll();
     }
     catch (error) {
@@ -343,16 +346,9 @@ el<HTMLFormElement>("server-form").addEventListener("submit", async (event) => {
         button("start-server").disabled = false;
     }
 });
-input("provider-quiescent").addEventListener("change", () => {
-    button("acknowledge-gateway").disabled = !input("provider-quiescent").checked || Boolean(snapshot?.server.running);
-});
-button("acknowledge-gateway").addEventListener("click", async () => {
-    button("acknowledge-gateway").disabled = true;
-    try { await invoke("hub_acknowledge_gateway", { providerQuiescent: input("provider-quiescent").checked }); input("provider-quiescent").checked = false; await poll(); }
-    catch (error) { notify(errorText(error), true); }
-});
 button("stop-server").addEventListener("click", async () => {
     button("stop-server").disabled = true;
+    notify("Hub の受付とモデル中継を停止しています…");
     try {
         await invoke("hub_stop");
         notify("サーバーを停止しました。接続トークンと端末登録は失効しています。");
@@ -360,6 +356,7 @@ button("stop-server").addEventListener("click", async () => {
     }
     catch (error) {
         notify(errorText(error), true);
+        await poll();
     }
     finally {
         button("stop-server").disabled = false;
@@ -432,6 +429,7 @@ button("remove-model").addEventListener("click", () => {
     }
 });
 const history = attachHistory(el("mcp-history"));
+const webManagement = attachWebManagement();
 document.addEventListener("click", event => {
     const target = (event.target as HTMLElement).closest<HTMLButtonElement>("button[data-network-history]");
     if (target && !target.disabled) history.showDevice(target.dataset.networkHistory!);
@@ -444,6 +442,20 @@ const deviceNetwork = attachDeviceNetwork(el("device-network"), el("network-clie
     setText("nav-client-count", network.devices.length + pendingCount);
     setText("nav-pending-count", `承認待ち ${pendingCount}`);
     el("nav-pending-count").hidden = pendingCount === 0;
+});
+button("management-reconnect").addEventListener("click", async () => {
+    button("management-reconnect").disabled = true;
+    setText("management-status", "Hub本体に再接続しています…");
+    try {
+        await reconnect();
+        notify("Hub本体に再接続しました。直前の操作は自動で再実行されません。");
+        await poll();
+    } catch (error) {
+        setText("management-status", "Hub本体の応答を確認できません");
+        notify(errorText(error), true);
+    } finally {
+        button("management-reconnect").disabled = false;
+    }
 });
 void poll();
 setInterval(() => void poll(), 2000);

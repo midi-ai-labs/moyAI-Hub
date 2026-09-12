@@ -1,5 +1,5 @@
-use fs2::FileExt;
-use moyai_hub::{
+//! Server-owned management state and operations shared by Web management and CLI control.
+use crate::{
     catalog::{CapacityPool, Catalog, CatalogStore, Deployment, LogicalModel},
     core::HubCore,
     discovery::{self, Discovery},
@@ -7,6 +7,7 @@ use moyai_hub::{
     protocol::Availability,
     service::{self, SharedCore, now_ms},
 };
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -20,8 +21,17 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
-use tauri::{Manager, State};
 mod network_admin;
+mod network_hosting;
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// Keep the real state owner contended while testing an external command's lifetime.
+    /// The opaque guard exposes neither the private network field nor mutable state.
+    pub(crate) fn hold_network(admin: &super::Admin) -> impl Drop + '_ {
+        admin.network.lock().expect("test network owner poisoned")
+    }
+}
 
 struct Server {
     bind: String,
@@ -35,7 +45,9 @@ struct Evidence {
     discovery: Discovery,
     observed_at_ms: u64,
 }
-struct Admin {
+pub struct Admin {
+    pub(crate) web_access: crate::web_admin::WebAccess,
+    pub(crate) web_server: tokio::sync::Mutex<crate::web_admin::server::Manager>,
     core: SharedCore,
     path: PathBuf,
     _lock: File,
@@ -43,8 +55,223 @@ struct Admin {
     evidence: Mutex<Option<Evidence>>,
     discovery_generation: AtomicU64,
     refresh_running: std::sync::atomic::AtomicBool,
-    network: moyai_hub::network::SharedNetwork,
+    network: crate::network::SharedNetwork,
     network_server: tokio::sync::Mutex<Option<network_admin::NetworkServer>>,
+    network_hosting: Mutex<network_hosting::Store>,
+}
+
+impl Admin {
+    /// Open the one authoritative catalog and device network for this server.
+    /// The service keeps the directory lock for the server's lifetime.
+    pub fn open(path: PathBuf) -> Result<Arc<Self>, String> {
+        let directory = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .ok_or("カタログの保存先を確認してください。")?;
+        std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(directory.join("hub.lock"))
+            .map_err(|error| error.to_string())?;
+        lock.try_lock_exclusive()
+            .map_err(|_| "このデータフォルダーの moyAI Hub は起動済みです。")?;
+        let mut store = if path.exists() {
+            if std::fs::metadata(&path)
+                .map_err(|error| error.to_string())?
+                .len()
+                > 4 * 1024 * 1024
+            {
+                return Err("カタログがサイズ上限を超えています。".into());
+            }
+            serde_json::from_slice::<CatalogStore>(
+                &std::fs::read(&path).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?
+        } else {
+            CatalogStore::empty(env!("CARGO_PKG_VERSION"))
+        };
+        store
+            .reconcile_software(env!("CARGO_PKG_VERSION"), now_ms())
+            .map_err(|error| error.to_string())?;
+        save(&path, &store)?;
+        let network = crate::network::DeviceNetwork::open(
+            &directory.join("device-network.json"),
+            &store.hub_id,
+        )
+        .map_err(|error| error.to_string())?;
+        let web_server =
+            crate::web_admin::server::Manager::open(directory.join("web-management.json"));
+        let network_hosting = network_hosting::Store::open(directory.join("network-hosting.json"));
+        Ok(Arc::new(Self {
+            web_access: Default::default(),
+            web_server: tokio::sync::Mutex::new(web_server),
+            core: Arc::new(Mutex::new(
+                HubCore::new(store).map_err(|error| error.to_string())?,
+            )),
+            path,
+            _lock: lock,
+            server: tokio::sync::Mutex::new(None),
+            evidence: Mutex::new(None),
+            discovery_generation: AtomicU64::new(0),
+            refresh_running: std::sync::atomic::AtomicBool::new(false),
+            network: Arc::new(Mutex::new(network)),
+            network_server: tokio::sync::Mutex::new(None),
+            network_hosting: Mutex::new(network_hosting),
+        }))
+    }
+
+    /// Dispatch server management commands with camelCase top-level arguments
+    /// and typed nested request payloads. Browser downloads are handled by the
+    /// frontend after retrieving export data through these commands.
+    pub async fn dispatch(self: &Arc<Self>, command: &str, args: Value) -> Result<Value, String> {
+        if !args.is_object() {
+            return Err("操作の引数を確認してください。".into());
+        }
+        match command {
+            "hub_web_status" | "hub_web_enable" | "hub_web_disable" => {
+                crate::web_admin::server::controls(self, command, args).await
+            }
+            "hub_snapshot" => hub_snapshot(self).await,
+            "hub_discover" => output(
+                hub_discover(
+                    self,
+                    argument(&args, "endpoint")?,
+                    argument(&args, "providerProfile")?,
+                )
+                .await?,
+            ),
+            "hub_refresh" => output(hub_refresh(self).await?),
+            "hub_start" => output(
+                hub_start(
+                    self,
+                    argument(&args, "bind")?,
+                    argument(&args, "token")?,
+                    argument(&args, "enableGateway")?,
+                )
+                .await?,
+            ),
+            "hub_stop" => output(hub_stop(self).await?),
+            "hub_network_snapshot" => network_admin::hub_network_snapshot(self).await,
+            "hub_network_renew_certificate" => {
+                output(network_admin::hub_network_renew_certificate(self).await?)
+            }
+            "hub_network_diagnostics" => {
+                output(network_admin::hub_network_diagnostics(self).await?)
+            }
+            "hub_network_start" => output(
+                network_admin::hub_network_start(
+                    self,
+                    argument(&args, "bind")?,
+                    argument(&args, "advertiseIp")?,
+                )
+                .await?,
+            ),
+            "hub_network_start_saved" => {
+                network_admin::hub_network_start_saved(self).await?;
+                network_admin::hub_network_snapshot(self).await
+            }
+            "hub_network_stop" => output(network_admin::hub_network_stop(self).await?),
+            _ => {
+                let admin = Arc::clone(self);
+                let command = command.to_owned();
+                // Keep disk flush, key signing and contended synchronous work
+                // off the async executor so other server requests can progress.
+                tokio::task::spawn_blocking(move || admin.dispatch_sync(&command, &args))
+                    .await
+                    .map_err(|_| "管理操作を完了できませんでした。".to_string())?
+            }
+        }
+    }
+
+    fn dispatch_sync(&self, command: &str, args: &Value) -> Result<Value, String> {
+        use network_admin::*;
+        match command {
+            "hub_register" => output(hub_register(self, argument(args, "request")?)?),
+            "hub_edit" => output(hub_edit(self, argument(args, "request")?)?),
+            "hub_history_request" => output(hub_history_request(
+                self,
+                argument(args, "deviceId")?,
+                argument(args, "direction")?,
+                argument(args, "offset")?,
+                argument(args, "anchor")?,
+                argument(args, "id")?,
+            )?),
+            "hub_history_result" => output(hub_history_result(self, argument(args, "requestId")?)?),
+            "hub_network_settings" => output(hub_network_settings(
+                self,
+                argument(args, "expectedRevision")?,
+                argument(args, "gatewayPort")?,
+            )?),
+            "hub_network_invite" => hub_network_invite(
+                self,
+                argument(args, "expectedRevision")?,
+                argument(args, "label")?,
+                argument(args, "groups")?,
+            ),
+            "hub_network_approve" => output(hub_network_approve(
+                self,
+                argument(args, "expectedRevision")?,
+                argument(args, "requestId")?,
+                argument(args, "label")?,
+                argument(args, "groups")?,
+            )?),
+            "hub_network_admission" => output(hub_network_admission(
+                self,
+                argument(args, "expectedRevision")?,
+                argument(args, "deviceId")?,
+                argument(args, "stopped")?,
+            )?),
+            "hub_network_group" => output(hub_network_group(
+                self,
+                argument(args, "expectedRevision")?,
+                argument(args, "id")?,
+                argument(args, "label")?,
+            )?),
+            "hub_network_device" => output(hub_network_device(
+                self,
+                argument(args, "expectedRevision")?,
+                argument(args, "deviceId")?,
+                argument(args, "label")?,
+                argument(args, "groups")?,
+                argument(args, "revoked")?,
+            )?),
+            "hub_network_rule" => output(hub_network_rule(
+                self,
+                argument(args, "expectedRevision")?,
+                argument(args, "rule")?,
+            )?),
+            "hub_network_delete_device" => output(hub_network_delete_device(
+                self,
+                argument(args, "expectedRevision")?,
+                argument(args, "deviceId")?,
+            )?),
+            "hub_network_delete_rule" => output(hub_network_delete_rule(
+                self,
+                argument(args, "expectedRevision")?,
+                argument(args, "id")?,
+            )?),
+            "hub_network_export" => hub_network_export(self, argument(args, "hubUrl")?),
+            _ => Err("この管理操作には対応していません。".into()),
+        }
+    }
+
+    /// Explicit server shutdown, independent of browser connections.
+    pub async fn shutdown(&self) -> Result<(), String> {
+        crate::web_admin::server::shutdown(self).await;
+        hub_stop(self).await
+    }
+}
+
+fn argument<T: serde::de::DeserializeOwned>(args: &Value, name: &str) -> Result<T, String> {
+    serde_json::from_value(args.get(name).cloned().unwrap_or(Value::Null))
+        .map_err(|_| format!("操作の引数 {name} を確認してください。"))
+}
+
+fn output<T: Serialize>(value: T) -> Result<Value, String> {
+    serde_json::to_value(value).map_err(|_| "管理操作の結果を取得できません。".into())
 }
 
 fn save(path: &Path, store: &CatalogStore) -> Result<(), String> {
@@ -119,25 +346,15 @@ fn snapshot_value(core: &HubCore) -> Value {
     json!({"store":store,"deployments":core.deployment_rows(now_ms()),"clients":clients})
 }
 
-#[tauri::command]
-async fn hub_snapshot(admin: State<'_, Admin>) -> Result<Value, String> {
+async fn hub_snapshot(admin: &Admin) -> Result<Value, String> {
     let server = admin.server.lock().await;
     let gateway = if let Some(gateway) = server.as_ref().and_then(|server| server.gateway.as_ref())
     {
         match gateway.control.status().await {
             Ok(mut status) => {
                 status["enabled"] = json!(true);
-                status["ready"] = json!(
-                    status["accepting"] == true
-                        && status["quarantined_pools"]
-                            .as_array()
-                            .is_some_and(Vec::is_empty)
-                );
-                status["uncertain"] = json!(
-                    !status["quarantined_pools"]
-                        .as_array()
-                        .is_some_and(Vec::is_empty)
-                );
+                status["ready"] = json!(status["accepting"] == true);
+                status["uncertain"] = json!(false);
                 status
             }
             Err(_) => {
@@ -145,7 +362,8 @@ async fn hub_snapshot(admin: State<'_, Admin>) -> Result<Value, String> {
             }
         }
     } else {
-        json!({"enabled":false,"ready":false,"uncertain":gateway_process::uncertain(admin.path.parent().ok_or("保存先がありません。")?),"reserved":0,"running":0,"responding":0,"draining":0,"quarantined_pools":[],"scope":"gateway_requests_only"})
+        let directory = admin.path.parent().ok_or("保存先がありません。")?;
+        json!({"enabled":false,"ready":false,"uncertain":false,"stopping":gateway_process::execution_running(directory),"reserved":0,"running":0,"responding":0,"draining":0,"quarantined_pools":[],"scope":"gateway_requests_only"})
     };
     let core = admin.core.lock().map_err(|_| "カタログを開けません。")?;
     let mut value = snapshot_value(&core);
@@ -154,9 +372,8 @@ async fn hub_snapshot(admin: State<'_, Admin>) -> Result<Value, String> {
     Ok(value)
 }
 
-#[tauri::command]
 async fn hub_discover(
-    admin: State<'_, Admin>,
+    admin: &Admin,
     endpoint: String,
     provider_profile: String,
 ) -> Result<Evidence, String> {
@@ -196,8 +413,7 @@ struct Register {
     #[serde(default)]
     allow_tools: bool,
 }
-#[tauri::command]
-fn hub_register(admin: State<'_, Admin>, request: Register) -> Result<(), String> {
+fn hub_register(admin: &Admin, request: Register) -> Result<(), String> {
     let evidence = admin
         .evidence
         .lock()
@@ -225,7 +441,7 @@ fn hub_register(admin: State<'_, Admin>, request: Register) -> Result<(), String
         model.capabilities.insert("tools".into());
     }
     let deployment_id = ulid::Ulid::new().to_string();
-    edit_catalog(&admin, parse_revision(&request.revision)?, |catalog| {
+    edit_catalog(admin, parse_revision(&request.revision)?, |catalog| {
         if catalog.deployments.iter().any(|row| {
             row.endpoint == evidence.discovery.endpoint
                 && row.provider_model == model.id
@@ -299,9 +515,8 @@ struct Edit {
     enabled: bool,
     remove: bool,
 }
-#[tauri::command]
-fn hub_edit(admin: State<'_, Admin>, request: Edit) -> Result<(), String> {
-    edit_catalog(&admin, parse_revision(&request.revision)?, |catalog| {
+fn hub_edit(admin: &Admin, request: Edit) -> Result<(), String> {
+    edit_catalog(admin, parse_revision(&request.revision)?, |catalog| {
         let row = catalog
             .deployments
             .iter()
@@ -345,8 +560,7 @@ fn hub_edit(admin: State<'_, Admin>, request: Edit) -> Result<(), String> {
     })
 }
 
-#[tauri::command]
-async fn hub_refresh(admin: State<'_, Admin>) -> Result<(), String> {
+async fn hub_refresh(admin: &Admin) -> Result<(), String> {
     use std::sync::atomic::AtomicBool;
     struct Reset<'a>(&'a AtomicBool);
     impl Drop for Reset<'_> {
@@ -422,9 +636,8 @@ async fn hub_refresh(admin: State<'_, Admin>) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
 async fn hub_start(
-    admin: State<'_, Admin>,
+    admin: &Admin,
     bind: String,
     token: String,
     enable_gateway: Option<bool>,
@@ -518,19 +731,90 @@ mod tests {
             assert!(parse_revision(input).is_err());
         }
     }
+
+    #[tokio::test]
+    async fn headless_dispatch_preserves_revision_arguments_and_persisted_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("catalog.json");
+        let admin = Admin::open(path.clone()).unwrap();
+        let catalog = admin.dispatch("hub_snapshot", json!({})).await.unwrap();
+        assert!(catalog["store"]["revision"].is_string());
+        assert_eq!(catalog["server"]["running"], false);
+        let network = admin
+            .dispatch("hub_network_snapshot", json!({}))
+            .await
+            .unwrap();
+        let revision = network["revision"].clone();
+        assert_eq!(
+            admin
+                .dispatch(
+                    "hub_network_group",
+                    json!({"expectedRevision": revision, "label": "開発端末"}),
+                )
+                .await
+                .unwrap(),
+            Value::Null,
+        );
+        let changed = admin
+            .dispatch("hub_network_snapshot", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(changed["groups"].as_array().unwrap().len(), 1);
+        assert_eq!(changed["groups"][0]["label"], "開発端末");
+        assert_ne!(changed["revision"], revision);
+        assert!(
+            admin
+                .dispatch(
+                    "hub_network_group",
+                    json!({"expectedRevision": revision, "label": "古い操作"}),
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            admin
+                .dispatch(
+                    "hub_network_settings",
+                    json!({"expectedRevision": changed["revision"], "gatewayPort": "invalid"}),
+                )
+                .await
+                .is_err()
+        );
+        assert!(admin.dispatch("unknown_command", json!({})).await.is_err());
+        assert!(admin.dispatch("hub_snapshot", Value::Null).await.is_err());
+        admin.shutdown().await.unwrap();
+        drop(admin);
+        let reopened = Admin::open(path).unwrap();
+        let restored = reopened
+            .dispatch("hub_network_snapshot", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(restored["groups"], changed["groups"]);
+        assert_eq!(restored["revision"], changed["revision"]);
+    }
+
+    #[test]
+    fn catalog_owner_lock_is_retained_until_admin_is_dropped() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("catalog.json");
+        let admin = Admin::open(path.clone()).unwrap();
+        assert!(Admin::open(path.clone()).is_err());
+        drop(admin);
+        assert!(Admin::open(path).is_ok());
+    }
 }
 
-#[tauri::command]
-async fn hub_stop(admin: State<'_, Admin>) -> Result<(), String> {
-    network_admin::stop_network(&admin).await?;
-    stop_server(&admin).await
+async fn hub_stop(admin: &Admin) -> Result<(), String> {
+    network_admin::stop_network(admin).await?;
+    stop_server(admin).await
 }
 
 async fn stop_server(admin: &Admin) -> Result<(), String> {
     let mut server = admin.server.lock().await;
+    let mut confirmed = true;
     if let Some(mut current) = server.take() {
         if let Some(gateway) = current.gateway.take() {
-            let _ = gateway.stop().await;
+            confirmed = gateway.stop().await;
         }
         let _ = current.stop.send(());
         if tokio::time::timeout(std::time::Duration::from_secs(2), &mut current.task)
@@ -547,110 +831,9 @@ async fn stop_server(admin: &Admin) -> Result<(), String> {
     for row in core.client_rows(now_ms()) {
         let _ = core.remove_client(&row.id);
     }
-    Ok(())
-}
-
-#[tauri::command]
-async fn hub_acknowledge_gateway(
-    admin: State<'_, Admin>,
-    provider_quiescent: bool,
-) -> Result<(), String> {
-    if !provider_quiescent {
-        return Err("provider の実行が終了していることを確認してください。".into());
+    if confirmed {
+        Ok(())
+    } else {
+        Err("新しい受付を停止しましたが、Hub の中継プロセスを終了できませんでした。Hub を再起動してください。モデル提供側の稼働状態とは別の問題です。".into())
     }
-    let server = admin.server.lock().await;
-    if server.is_some() {
-        return Err("Hub サーバーを停止してから確認してください。".into());
-    }
-    gateway_process::acknowledge_quiescent(admin.path.parent().ok_or("保存先がありません。")?)
-}
-
-pub fn run() {
-    tauri::Builder::default()
-        .setup(|app| {
-            let directory = std::env::var_os("MOYAI_HUB_DATA_DIR")
-                .map(PathBuf::from)
-                .unwrap_or(app.path().app_data_dir()?);
-            std::fs::create_dir_all(&directory)?;
-            let lock = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(directory.join("hub.lock"))?;
-            lock.try_lock_exclusive().map_err(|_| {
-                std::io::Error::other("このデータフォルダーの moyAI Hub は起動済みです。")
-            })?;
-            let path = directory.join("catalog.json");
-            let mut store = if path.exists() {
-                let metadata = std::fs::metadata(&path)?;
-                if metadata.len() > 4 * 1024 * 1024 {
-                    return Err("カタログがサイズ上限を超えています。".into());
-                }
-                serde_json::from_slice::<CatalogStore>(&std::fs::read(&path)?)?
-            } else {
-                CatalogStore::empty(env!("CARGO_PKG_VERSION"))
-            };
-            store.reconcile_software(env!("CARGO_PKG_VERSION"), now_ms())?;
-            save(&path, &store).map_err(std::io::Error::other)?;
-            let network = moyai_hub::network::DeviceNetwork::open(
-                &directory.join("device-network.json"),
-                &store.hub_id,
-            )?;
-            app.manage(Admin {
-                core: Arc::new(Mutex::new(HubCore::new(store)?)),
-                path,
-                _lock: lock,
-                server: tokio::sync::Mutex::new(None),
-                evidence: Mutex::new(None),
-                discovery_generation: AtomicU64::new(0),
-                refresh_running: std::sync::atomic::AtomicBool::new(false),
-                network: Arc::new(Mutex::new(network)),
-                network_server: tokio::sync::Mutex::new(None),
-            });
-            Ok(())
-        })
-        .invoke_handler(tauri::generate_handler![
-            hub_snapshot,
-            hub_discover,
-            hub_register,
-            hub_edit,
-            hub_refresh,
-            hub_start,
-            hub_stop,
-            hub_acknowledge_gateway,
-            network_admin::hub_network_snapshot,
-            network_admin::hub_history_request,
-            network_admin::hub_history_result,
-            network_admin::hub_history_export,
-            network_admin::hub_network_invite,
-            network_admin::hub_network_approve,
-            network_admin::hub_network_admission,
-            network_admin::hub_network_group,
-            network_admin::hub_network_device,
-            network_admin::hub_network_rule,
-            network_admin::hub_network_delete_rule,
-            network_admin::hub_network_start,
-            network_admin::hub_network_settings,
-            network_admin::hub_network_renew_certificate,
-            network_admin::hub_network_diagnostics,
-            network_admin::hub_network_stop,
-            network_admin::hub_network_export,
-            network_admin::hub_network_save_config
-        ])
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let app = window.app_handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    // A normal window close follows the same bounded gateway drain as
-                    // the Stop command. Only confirmed child settlement clears its marker.
-                    let _ = network_admin::stop_network(&app.state::<Admin>()).await;
-                    let _ = stop_server(&app.state::<Admin>()).await;
-                    app.exit(0);
-                });
-            }
-        })
-        .run(tauri::generate_context!())
-        .expect("moyAI Hub を起動できませんでした。");
 }

@@ -86,6 +86,7 @@ fn generic_listing_presence_allows_attempt_without_claiming_load_readiness() {
     let mut hub = fixture();
     hub.observe_deployment("host-a", Availability::Unknown, 10)
         .unwrap();
+    assert!(!hub.deployment_rows(11)[0].model_present);
     assert!(matches!(
         hub.begin_turn("client-a", "main", "unknown", 11).unwrap(),
         RouteDecision::Waiting {
@@ -100,6 +101,7 @@ fn generic_listing_presence_allows_attempt_without_claiming_load_readiness() {
         hub.deployment_rows(13)[0].availability,
         Availability::Unknown
     );
+    assert!(hub.deployment_rows(13)[0].model_present);
     assert!(matches!(
         hub.begin_turn("client-a", "main", "listed", 13).unwrap(),
         RouteDecision::Assigned { .. }
@@ -108,6 +110,7 @@ fn generic_listing_presence_allows_attempt_without_claiming_load_readiness() {
     hub.register_client("client-a", "client-a", "192.0.2.1", 10_020)
         .unwrap();
     assert!(hub.needs_presence_refresh("host-a", 10_020));
+    assert!(!hub.deployment_rows(10_020)[0].model_present);
     assert!(matches!(
         hub.begin_turn("client-a", "main", "stale-presence", 10_020)
             .unwrap(),
@@ -116,6 +119,60 @@ fn generic_listing_presence_allows_attempt_without_claiming_load_readiness() {
             ..
         }
     ));
+}
+
+#[test]
+fn native_listing_allows_request_before_provider_load() {
+    for status in [Availability::JitPending, Availability::Unknown] {
+        let mut hub = fixture();
+        let mut catalog = hub.catalog_store().catalog.clone();
+        catalog.deployments[0].provider_profile = "lmstudio_chat".into();
+        let revision = hub.replace_catalog(catalog, 10).unwrap();
+        hub.save_selection("client-a", "main", selection(revision))
+            .unwrap();
+        hub.observe_present_deployment("host-a", status.clone(), 12)
+            .unwrap();
+
+        let route = lease(hub.begin_turn("client-a", "main", "listed", 13).unwrap());
+        let request = permit(
+            hub.acquire_permit("client-a", "main", &route.id, "request", 14)
+                .unwrap(),
+        );
+        assert_eq!(request.provider_profile, "lmstudio_chat");
+        assert_eq!(request.deployment_id, "host-a");
+        assert_eq!(hub.deployment_rows(14)[0].availability, status);
+        assert!(hub.deployment_rows(14)[0].model_present);
+        assert_eq!(hub.catalog_store().revision, revision);
+    }
+}
+
+#[test]
+fn listed_model_can_be_maintained_and_old_snapshots_do_not_infer_presence() {
+    let mut hub = fixture();
+    let mut catalog = hub.catalog_store().catalog.clone();
+    catalog.deployments[0].enabled = false;
+    let revision = hub.replace_catalog(catalog, 10).unwrap();
+    hub.save_selection("client-a", "main", selection(revision))
+        .unwrap();
+    hub.observe_present_deployment("host-a", Availability::JitPending, 12)
+        .unwrap();
+    let row = &hub.deployment_rows(13)[0];
+    assert!(row.model_present);
+    assert_eq!(row.availability, Availability::Maintenance);
+    assert_eq!(
+        hub.begin_turn("client-a", "main", "maintained", 13)
+            .unwrap(),
+        RouteDecision::Waiting {
+            reason: WaitReason::Maintenance,
+            retry_after_ms: 1000,
+        }
+    );
+
+    let mut older = serde_json::to_value(row).unwrap();
+    older.as_object_mut().unwrap().remove("model_present");
+    let older: DeploymentRow = serde_json::from_value(older).unwrap();
+    assert!(!older.model_present);
+    assert_eq!(older.last_observed_ms, Some(12));
 }
 
 #[test]
@@ -366,6 +423,127 @@ fn affinity_counts_user_turn_once_while_permits_count_requests() {
 }
 
 #[test]
+fn preparation_shares_permits_and_preserves_user_turn_affinity() {
+    let mut hub = fixture();
+    let user = lease(hub.begin_turn("client-a", "main", "user-1", 0).unwrap());
+    hub.finish_turn("client-a", "main", "user-1").unwrap();
+    let preparation = lease(
+        hub.begin_request(
+            "client-a",
+            "main",
+            "prepare-1",
+            RequestPurpose::Preparation,
+            1,
+        )
+        .unwrap(),
+    );
+    assert_eq!(preparation.id, user.id);
+    assert_eq!(preparation.turns_remaining, 1);
+    assert_eq!(
+        hub.begin_turn("client-a", "main", "prepare-1", 1),
+        Err(HubError::ActiveTurn)
+    );
+    let granted = permit(
+        hub.acquire_permit("client-a", "main", &preparation.id, "prepare-request", 1)
+            .unwrap(),
+    );
+    assert!(matches!(
+        hub.begin_turn("client-b", "main", "other-user", 1).unwrap(),
+        RouteDecision::Waiting { .. }
+    ));
+    hub.release_permit("client-a", "main", &granted.id).unwrap();
+    hub.cancel_turn("client-a", "main", "prepare-1").unwrap();
+    let second = lease(hub.begin_turn("client-a", "main", "user-2", 2).unwrap());
+    assert_eq!(
+        second.id, user.id,
+        "cancelling preparation retains the user's affinity"
+    );
+    assert_eq!(second.turns_remaining, 0);
+    hub.finish_turn("client-a", "main", "user-2").unwrap();
+    let fresh = lease(
+        hub.begin_request(
+            "client-a",
+            "main",
+            "prepare-2",
+            RequestPurpose::Preparation,
+            3,
+        )
+        .unwrap(),
+    );
+    assert_ne!(fresh.id, user.id);
+    assert_eq!(fresh.turns_remaining, 2);
+    assert_eq!(
+        lease(
+            hub.begin_request(
+                "client-a",
+                "main",
+                "prepare-2",
+                RequestPurpose::Preparation,
+                3
+            )
+            .unwrap()
+        ),
+        fresh
+    );
+    hub.finish_turn("client-a", "main", "prepare-2").unwrap();
+    let next = lease(hub.begin_turn("client-a", "main", "user-3", 4).unwrap());
+    assert_eq!(next.id, fresh.id);
+    assert_eq!(next.turns_remaining, 1);
+}
+
+#[test]
+fn waiting_preparation_cannot_change_purpose_and_remains_subject_to_review() {
+    let mut hub = fixture();
+    let active = lease(hub.begin_turn("client-a", "main", "active", 0).unwrap());
+    let occupied = permit(
+        hub.acquire_permit("client-a", "main", &active.id, "request", 0)
+            .unwrap(),
+    );
+    assert!(matches!(
+        hub.begin_request(
+            "client-b",
+            "main",
+            "waiting",
+            RequestPurpose::Preparation,
+            1
+        )
+        .unwrap(),
+        RouteDecision::Waiting { .. }
+    ));
+    assert_eq!(
+        hub.begin_turn("client-b", "main", "waiting", 1),
+        Err(HubError::ActiveTurn)
+    );
+    hub.release_permit("client-a", "main", &occupied.id)
+        .unwrap();
+    let ready = lease(
+        hub.begin_request(
+            "client-b",
+            "main",
+            "waiting",
+            RequestPurpose::Preparation,
+            2,
+        )
+        .unwrap(),
+    );
+    assert_eq!(ready.turns_remaining, 2);
+    hub.finish_turn("client-b", "main", "waiting").unwrap();
+    let mut catalog = hub.catalog_store().catalog.clone();
+    catalog.models[0].label = "changed model".into();
+    hub.replace_catalog(catalog, 3).unwrap();
+    assert!(matches!(
+        hub.begin_request(
+            "client-b",
+            "main",
+            "review-needed",
+            RequestPurpose::Preparation,
+            3
+        ),
+        Err(HubError::ReviewRequired { .. })
+    ));
+}
+
+#[test]
 fn leases_do_not_reserve_capacity_and_wait_can_be_canceled() {
     let mut hub = fixture();
     let a = lease(hub.begin_turn("client-a", "main", "t1", 0).unwrap());
@@ -514,11 +692,12 @@ fn heartbeat_stale_is_separate_from_activity_and_ip_is_not_identity() {
 }
 
 #[test]
-fn readiness_jit_and_maintenance_have_distinct_wait_reasons() {
+fn explicit_maintenance_and_connection_failures_remain_routing_gates() {
     let mut hub = fixture();
     for (index, (status, reason)) in [
-        (Availability::JitPending, WaitReason::JitPending),
         (Availability::Maintenance, WaitReason::Maintenance),
+        (Availability::Offline, WaitReason::TargetUnavailable),
+        (Availability::Unknown, WaitReason::TargetUnavailable),
     ]
     .into_iter()
     .enumerate()
@@ -740,6 +919,182 @@ fn lease_expiry_and_removal_do_not_reassign_active_turn_silently() {
     assert_eq!(
         hub.release_permit("client-a", "main", &active.id),
         Err(HubError::UnknownClient)
+    );
+}
+
+#[test]
+fn active_turn_heartbeats_cross_lease_boundaries_without_reissuing_requests_or_affinity() {
+    let mut hub = fixture();
+    let first = lease(hub.begin_turn("client-a", "main", "long-turn", 0).unwrap());
+    let ticket = permit(
+        hub.acquire_permit("client-a", "main", &first.id, "first", 0)
+            .unwrap(),
+    );
+    for now in [400, 4000, 8000, 12000, 16000] {
+        hub.heartbeat_with_turns(
+            "client-a",
+            ClientActivity::Waiting,
+            &[("main", "long-turn")],
+            now,
+        )
+        .unwrap();
+        hub.observe_deployment("host-a", Availability::Ready, now)
+            .unwrap();
+        let current = lease(
+            hub.begin_turn("client-a", "main", "long-turn", now)
+                .unwrap(),
+        );
+        assert_eq!(current.id, first.id);
+        assert_eq!(current.deployment_id, first.deployment_id);
+        assert_eq!(current.turns_remaining, first.turns_remaining);
+        assert_eq!(current.expires_at_ms, now + 5000);
+        if now == 400 {
+            assert_eq!(
+                permit(
+                    hub.acquire_permit("client-a", "main", &first.id, "first", now)
+                        .unwrap()
+                ),
+                ticket
+            );
+        }
+    }
+    assert_eq!(
+        hub.acquire_permit("client-a", "main", &first.id, "first", 16000),
+        Err(HubError::PermitExpired)
+    );
+    let next = permit(
+        hub.acquire_permit("client-a", "main", &first.id, "second", 16000)
+            .unwrap(),
+    );
+    assert_eq!(next.lease_id, first.id);
+    assert_ne!(next.id, ticket.id);
+    hub.finish_turn("client-a", "main", "long-turn").unwrap();
+    let affinity = lease(
+        hub.begin_turn("client-a", "main", "next-turn", 16001)
+            .unwrap(),
+    );
+    assert_eq!(affinity.id, first.id);
+    assert_eq!(affinity.turns_remaining, first.turns_remaining - 1);
+}
+
+#[test]
+fn heartbeats_do_not_revive_expired_closed_wrong_context_or_other_client_turns() {
+    let mut hub = fixture();
+    for client in ["client-a", "client-b"] {
+        hub.begin_turn(client, "main", "same-turn", 0).unwrap();
+    }
+    hub.heartbeat_with_turns(
+        "client-a",
+        ClientActivity::Running,
+        &[("side_chat", "same-turn"), ("main", "wrong-turn")],
+        4000,
+    )
+    .unwrap();
+    assert_eq!(
+        hub.begin_turn("client-a", "main", "same-turn", 5000),
+        Err(HubError::LeaseExpired)
+    );
+    hub.heartbeat_with_turns(
+        "client-a",
+        ClientActivity::Running,
+        &[("main", "same-turn")],
+        5000,
+    )
+    .unwrap();
+    assert_eq!(
+        hub.begin_turn("client-a", "main", "same-turn", 5001),
+        Err(HubError::LeaseExpired)
+    );
+    assert_eq!(
+        hub.begin_turn("client-b", "main", "same-turn", 5001),
+        Err(HubError::LeaseExpired)
+    );
+    hub.cancel_turn("client-a", "main", "same-turn").unwrap();
+    hub.heartbeat_with_turns(
+        "client-a",
+        ClientActivity::Running,
+        &[("main", "same-turn")],
+        5002,
+    )
+    .unwrap();
+    assert_eq!(
+        hub.begin_turn("client-a", "main", "same-turn", 5002),
+        Err(HubError::TurnClosed)
+    );
+    let next = lease(
+        hub.begin_turn("client-a", "main", "new-turn", 5002)
+            .unwrap(),
+    );
+    hub.heartbeat_with_turns(
+        "client-a",
+        ClientActivity::Running,
+        &[("main", "same-turn")],
+        9000,
+    )
+    .unwrap();
+    assert_eq!(
+        lease(
+            hub.begin_turn("client-a", "main", "new-turn", 9000)
+                .unwrap()
+        ),
+        next
+    );
+    hub.remove_client("client-a").unwrap();
+    assert_eq!(
+        hub.heartbeat_with_turns(
+            "client-a",
+            ClientActivity::Running,
+            &[("main", "new-turn")],
+            9001
+        ),
+        Err(HubError::UnknownClient)
+    );
+    let mut restarted = HubCore::new(hub.catalog_store().clone()).unwrap();
+    assert_eq!(
+        restarted.heartbeat_with_turns(
+            "client-b",
+            ClientActivity::Running,
+            &[("main", "same-turn")],
+            9001
+        ),
+        Err(HubError::UnknownClient)
+    );
+}
+
+#[test]
+fn turn_heartbeat_does_not_bypass_review_or_extend_omitted_turns() {
+    let mut hub = fixture();
+    hub.begin_turn("client-a", "main", "turn", 0).unwrap();
+    hub.heartbeat("client-a", ClientActivity::Running, 4000)
+        .unwrap();
+    assert_eq!(
+        hub.begin_turn("client-a", "main", "turn", 5000),
+        Err(HubError::LeaseExpired)
+    );
+    let mut hub = fixture();
+    hub.begin_turn("client-a", "main", "turn", 0).unwrap();
+    let mut catalog = hub.catalog_store().catalog.clone();
+    catalog.models[0].label = "Changed".into();
+    hub.replace_catalog(catalog, 100).unwrap();
+    hub.heartbeat_with_turns(
+        "client-a",
+        ClientActivity::Running,
+        &[("main", "turn")],
+        4000,
+    )
+    .unwrap();
+    assert!(matches!(
+        hub.begin_turn("client-a", "main", "turn", 5001),
+        Err(HubError::ReviewRequired { .. })
+    ));
+    assert!(
+        hub.heartbeat_with_turns(
+            "client-a",
+            ClientActivity::Running,
+            &[("main", "turn"), ("main", "turn")],
+            5001
+        )
+        .is_err()
     );
 }
 

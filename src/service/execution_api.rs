@@ -3,7 +3,7 @@ use crate::{
     catalog::Deployment,
     gateway::{CancelScope, Grant},
     gateway_process::ControlError,
-    protocol::{PermitDecision, RouteDecision},
+    protocol::PermitDecision,
 };
 
 fn invalid_request() -> (StatusCode, Json<Value>) {
@@ -95,6 +95,37 @@ pub(super) struct Prepare {
     request_id: String,
     expected_hub_id: String,
     reviewed_revision: String,
+    #[serde(default)]
+    purpose: crate::protocol::RequestPurpose,
+    #[serde(default)]
+    delegated_selection: Option<ReviewSelection>,
+}
+impl Prepare {
+    fn route_context(&self, core: &mut HubCore) -> Result<String, (StatusCode, Json<Value>)> {
+        check_revision(core, self)?;
+        if !crate::catalog::valid_token(&self.request_id, 128) {
+            return Err(invalid_request());
+        }
+        match (&self.delegated_selection, self.purpose) {
+            (Some(selection), crate::protocol::RequestPurpose::Delegated) => {
+                let revision = core.catalog_store().revision;
+                core.ensure_delegated_context(
+                    &self.id,
+                    self.context.id(),
+                    &self.turn_id,
+                    selection.resolve(revision)?,
+                    now_ms(),
+                )
+                .map_err(|error| core_failure(error, revision))
+            }
+            (
+                None,
+                crate::protocol::RequestPurpose::UserTurn
+                | crate::protocol::RequestPurpose::Preparation,
+            ) => Ok(self.context.id().into()),
+            _ => Err(invalid_request()),
+        }
+    }
 }
 fn check_revision(core: &HubCore, request: &Prepare) -> Result<(), (StatusCode, Json<Value>)> {
     let revision = core.catalog_store().revision;
@@ -125,10 +156,10 @@ async fn refresh_presence(
     request: &Prepare,
 ) -> Result<(), (StatusCode, Json<Value>)> {
     let groups = {
-        let core = state.core.lock().map_err(|_| failed())?;
-        check_revision(&core, request)?;
+        let mut core = state.core.lock().map_err(|_| failed())?;
+        let context = request.route_context(&mut core)?;
         let deployments = core
-            .routing_deployments(&request.id, request.context.id(), now_ms())
+            .routing_deployments(&request.id, &context, now_ms())
             .map_err(|error| core_failure(error, core.catalog_store().revision))?;
         let mut groups: BTreeMap<(String, String), Vec<Deployment>> = BTreeMap::new();
         for row in deployments
@@ -223,26 +254,15 @@ pub(super) async fn prepare(
     let device_admission_revision = model_admission_revision(&state, &headers, &request.id)?;
     let grant = {
         let mut core = state.core.lock().map_err(|_| failed())?;
-        check_revision(&core, &request)?;
+        let context = request.route_context(&mut core)?;
         let revision = core.catalog_store().revision;
-        let lease = match core
-            .begin_turn(
-                &request.id,
-                request.context.id(),
-                &request.turn_id,
-                now_ms(),
-            )
-            .map_err(|error| core_failure(error, revision))?
-        {
-            RouteDecision::Assigned { lease } => lease,
-            waiting => return Ok(Json(serde_json::to_value(waiting).map_err(|_| failed())?)),
-        };
         let permit = match core
-            .acquire_permit(
+            .prepare_request(
                 &request.id,
-                request.context.id(),
-                &lease.id,
+                &context,
+                &request.turn_id,
                 &request.request_id,
+                request.purpose,
                 now_ms(),
             )
             .map_err(|error| core_failure(error, revision))?
@@ -281,9 +301,10 @@ pub(super) async fn prepare(
         return Ok(Json(admitted));
     }
     {
-        let core = state.core.lock().map_err(|_| failed())?;
+        let mut core = state.core.lock().map_err(|_| failed())?;
         core.validate_execution_permit(&grant.permit.id, now_ms())
             .map_err(|error| core_failure(error, core.catalog_store().revision))?;
+        core.request_admitted(&grant.permit);
     }
     let token = admitted
         .get("request_token")
@@ -294,10 +315,13 @@ pub(super) async fn prepare(
     } else {
         gateway.base_url()
     };
+    let api = crate::provider::ProviderProfile::parse(&grant.deployment.provider_profile)
+        .ok_or_else(failed)?
+        .api();
     Ok(Json(
         json!({"state":"ready","lease_id":grant.permit.lease_id,"permit_id":grant.permit.id,
         "logical_model_id":grant.permit.logical_model_id,"gateway_base_url":format!("{}/r/{}/v1",gateway_base,grant.permit.id),
-        "request_token":token,"expires_at_ms":grant.permit.expires_at_ms.to_string(),"provider_profile":"openai_compatible_chat","provider_api_mode":"chat_completions"}),
+        "request_token":token,"expires_at_ms":grant.permit.expires_at_ms.to_string(),"provider_profile":api.gateway_profile(),"provider_api_mode":api.name()}),
     ))
 }
 
@@ -307,6 +331,8 @@ pub(super) struct Turn {
     id: String,
     context: ReviewContext,
     turn_id: String,
+    #[serde(default)]
+    delegated: bool,
 }
 async fn close_turn(
     state: ApiState,
@@ -315,21 +341,32 @@ async fn close_turn(
     canceled: bool,
 ) -> ApiResult {
     authorize_client(&state, &headers, &request.id)?;
-    {
+    let context = {
         let mut core = state.core.lock().map_err(|_| failed())?;
         let revision = core.catalog_store().revision;
-        if canceled {
-            core.cancel_turn(&request.id, request.context.id(), &request.turn_id)
+        if request.delegated {
+            core.close_delegated_context(
+                &request.id,
+                request.context.id(),
+                &request.turn_id,
+                canceled,
+            )
+            .map_err(|error| core_failure(error, revision))?
         } else {
-            core.finish_turn(&request.id, request.context.id(), &request.turn_id)
+            if canceled {
+                core.cancel_turn(&request.id, request.context.id(), &request.turn_id)
+            } else {
+                core.finish_turn(&request.id, request.context.id(), &request.turn_id)
+            }
+            .map_err(|error| core_failure(error, revision))?;
+            request.context.id().to_owned()
         }
-        .map_err(|error| core_failure(error, revision))?;
-    }
+    };
     if let Some(gateway) = &state.gateway {
         let _ = gateway
             .cancel(&CancelScope {
                 client_id: request.id.clone(),
-                context_id: Some(request.context.id().into()),
+                context_id: Some(context),
                 turn_id: Some(request.turn_id.clone()),
             })
             .await;

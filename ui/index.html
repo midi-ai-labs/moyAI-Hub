@@ -3,6 +3,7 @@
   <head>
     <meta charset="UTF-8"/>
     <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <link rel="icon" type="image/svg+xml" href="../icons/icon.svg"/>
     <title>
       moyAI Hub
     </title>
@@ -11,9 +12,7 @@
     <div class="shell">
       <aside class="sidebar">
         <a href="#overview" class="brand">
-          <span class="brand-mark">
-            m
-          </span>
+          <img class="brand-mark" src="../icons/icon.svg" alt="" width="42" height="42"/>
           <span>
             moyAI
             <b>
@@ -28,7 +27,8 @@
           ページ内の移動
         </div>
         <nav aria-label="ページ内の移動">
-          <a href="#device-network" class="nav-link"><span>⇄</span><span>ネットワーク設定</span></a>
+          <a href="#device-network" class="nav-link">⇄<span>ネットワーク設定</span></a>
+          <a href="#web-management" class="nav-link">↗<span>Web管理</span></a>
           <a href="#overview" class="nav-link">
             ◉
             <span>
@@ -69,7 +69,7 @@
             v0.1.0 · 管理基盤
           </p>
           <small>
-            この Hub を経由するモデル実行を管理します。
+            モデルの接続先と端末間の連係を管理します。
           </small>
         </div>
       </aside>
@@ -110,10 +110,10 @@
           </div>
           <div class="metric">
             <span>
-              ホストのロード状態
+              モデルの確認状況
             </span>
-            <div class="load-counts"><div><strong id="metric-ready">0</strong><span>ロード済み</span></div><div><strong id="metric-unknown">0</strong><span>状態不明</span></div></div>
-            <small>不明でも実行できる場合があります</small>
+            <div class="load-counts"><div><strong id="metric-present">0</strong><span>一覧あり</span></div><div><strong id="metric-unconfirmed">0</strong><span>要確認</span></div></div>
+            <small>登録先のモデル一覧への掲載を確認</small>
           </div>
           <div class="metric">
             <span>
@@ -153,11 +153,10 @@
             <p class="subtle">このHubのIPを指定してネットワークを開始し、共通設定をDesktopへ渡します。届いた参加申請は「接続端末」で許可します。モデル接続とGatewayもまとめて起動します。</p>
             <a id="open-device-network" class="primary-link" href="#device-network">端末ネットワークを設定する →</a>
           </div>
-          <div id="gateway-summary" class="execution-summary" role="status"><h3>モデルの実行状況</h3><p id="gateway-status">モデル実行は停止中</p><p id="gateway-detail" class="subtle">停止や切断の後も、接続先の処理が終わるまで実行枠を保持します。</p></div>
-          <div id="gateway-recovery" hidden><label class="checkbox"><input id="provider-quiescent" type="checkbox"/>接続先のモデル実行が終了したことを確認しました</label><button id="acknowledge-gateway" type="button" disabled>実行保留を解除</button></div>
-          <details class="technical-details"><summary>実行経路の詳しい説明</summary><p class="footnote">Hub 本体は会話本文を中継せず、別プロセスの Gateway が生成を中継します。実行枠の上限はこの経路だけに適用し、モデルホストへの直接利用は計数・制限しません。</p></details>
+          <div id="gateway-summary" class="execution-summary" role="status"><h3>Hub のモデル中継</h3><p id="gateway-status">Hub のモデル中継は停止中</p><p id="gateway-detail" class="subtle">この Hub が中継する通信の状況を表示します。</p></div>
+          <details class="technical-details"><summary>中継経路の詳しい説明</summary><p class="footnote">Gateway が Desktop とモデルホストの通信を中継します。同時接続数の上限はこの Hub 経由の通信に適用します。モデルのロード・生成・停止はホスト側が管理します。</p></details>
           <details id="manual-server-connection" data-details-key="manual-server-connection" class="manual-server-details">
-            <summary>従来の手動接続（同じPC内）</summary>
+            <summary>従来の手動接続（Hubと同じPC内）</summary>
             <p class="subtle">従来の接続先URLとトークンを手動設定する構成向けです。端末ネットワークを使う場合、この手動サーバーの開始は不要です。両方を同時には開始できません。</p>
             <div class="section-title"><h3>手動サーバー</h3><span id="server-badge" class="badge gray">停止中</span></div>
             <form id="server-form">
@@ -165,7 +164,7 @@
                 <label>
                   待受アドレス
                   <input id="bind" name="bind" value="127.0.0.1:9470" required spellcheck="false" autocomplete="off"/>
-                  <small>手動接続は同じPC内だけで利用できます。</small>
+                  <small>手動接続はHubを起動しているPC内だけで利用できます。</small>
                 </label>
                 <label>
                   接続用トークン
@@ -179,7 +178,7 @@
                 <button id="stop-server" class="danger" type="button" hidden>停止</button>
               </div>
             </form>
-            <label class="checkbox"><input id="enable-gateway" type="checkbox" form="server-form"/>モデル実行も有効にする（Gateway）</label>
+            <label class="checkbox"><input id="enable-gateway" type="checkbox" form="server-form"/>モデル中継も有効にする（Gateway）</label>
           </details>
         </section>
         <section class="panel" id="device-network" aria-labelledby="network-heading"></section>
@@ -212,11 +211,17 @@
                   接続方式
                   <select id="profile">
                     <option value="openai_compatible_chat">
-                      OpenAI 互換 / oMLX
+                        OpenAI 互換 / oMLX（Chat Completions）
                     </option>
                     <option value="lmstudio_chat">
-                      LM Studio
-                    </option>
+                        LM Studio（Chat Completions）
+                      </option>
+                      <option value="openai_compatible_responses">
+                        OpenAI 互換（Responses）
+                      </option>
+                      <option value="lmstudio_responses">
+                        LM Studio（Responses）
+                      </option>
                   </select>
                 </label>
                 <label>
@@ -251,7 +256,7 @@
               <p class="footnote">ホストが機能を未報告の場合の管理者宣言です。このモデルでツール利用を確認した場合に選択してください。ホストの報告値とは別の確認方法です。</p>
               <details class="registration-options">
                 <summary>
-                  同じモデルの別ホスト・容量を設定
+                  同じモデルの別ホスト・同時接続数を設定
                 </summary>
                 <div class="registration-fields">
                   <label>
@@ -266,18 +271,18 @@
                     </small>
                   </label>
                   <label>
-                    実行枠を共有するグループ
+                    同時接続数を共有するグループ
                     <select id="capacity-pool">
                       <option value="">
                         このホストに新しいグループを作成
                       </option>
                     </select>
                     <small>
-                      同じ GPU / 実行枠を共有する場合に選択
+                      Hub 経由の同時接続数をまとめて制限する場合に選択
                     </small>
                   </label>
                   <label>
-                    新しいグループの実行上限
+                    新しいグループの同時接続上限
                     <input id="capacity" type="number" min="1" max="1024" value="1" required/>
                   </label>
                 </div>
@@ -298,7 +303,7 @@
                     確認した対応機能
                   </th>
                   <th>
-                    共有する実行枠
+                    Hub の同時接続上限
                   </th>
                   <th>
                     最終確認
@@ -327,14 +332,9 @@
           </div>
           <div class="legend">
             <span>
-              <i class="dot blue">
-              </i>
-              ロード済み
-            </span>
-            <span>
               <i class="dot green">
               </i>
-              未ロード
+              一覧あり
             </span>
             <span>
               <i class="dot red">
@@ -344,11 +344,11 @@
             <span>
               <i class="dot gray">
               </i>
-              状態不明 / 接続不可
+              未確認 / 接続不可
             </span>
           </div>
-          <p class="footnote">ロード状態が不明でも、モデル一覧で存在を確認できた OpenAI 互換 / oMLX には実行を試せます。</p>
-          <details class="technical-details"><summary>モデル状態と実行枠の詳しい説明</summary><p class="footnote">モデル一覧への掲載とロード状態は別の情報です。ホストが報告しないロード状態は推測しません。ロード済み表示も生成の成功を保証しません。同じ GPU を使うホストは同じ実行枠グループ（容量プール）にまとめます。上限は Gateway 経由の要求に適用します。</p></details>
+          <p class="footnote">一覧にあるモデルへ要求を中継します。ロードや実行可否の判断は oMLX や LM Studio などのホスト側が行います。</p>
+          <details class="technical-details"><summary>モデルの確認と同時接続数の詳しい説明</summary><p class="footnote">Hub はモデル一覧・接続状態・管理者の設定に基づいて接続先を選びます。未ロードでも一覧にあれば割当候補になります。生成の成功はホスト側の設定と応答によります。同じホストなど、同時接続数を共有したい接続先は同じグループ（容量プール）にまとめます。</p></details>
         </section>
         <section class="panel" id="clients" aria-labelledby="clients-heading">
           <div class="section-title">
@@ -403,7 +403,7 @@
             </p>
           </div>
           <p class="footnote">
-            端末の状態は Desktop からの申告です。「操作待ち」に戻っても、接続先の処理が続く場合があります。上の実行状況で「上流終了確認待ち」を確認してください。
+            端末の状態は Desktop からの申告です。この Hub のモデル通信は概要の「Hub のモデル中継」で確認できます。
           </p>
           <p class="footnote">ここに表示する ID はモデル通信の接続 ID です。端末の永続 ID とは別で、サーバー再起動時に作り直します。30 秒間の生存確認がない接続は切断として表示します。</p>
           </details>
@@ -424,7 +424,7 @@
             </span>
           </div>
           <p class="subtle">
-            モデルや実行枠の設定を変更すると、カタログ更新番号が進みます。Desktop では次に Hub へ送信する前に、変更内容の確認が必要です。
+            モデルや同時接続数の設定を変更すると、カタログ更新番号が進みます。Desktop では次に Hub へ送信する前に、変更内容の確認が必要です。
           </p>
           <div id="revision-rows" class="revision-list">
           </div>
@@ -432,13 +432,19 @@
             変更履歴はまだありません。
           </p>
         </section>
+        <section class="network-card" aria-label="管理画面とHub本体">
+          <h3>管理画面とHub本体</h3>
+          <p class="footnote">この画面を閉じても、Hubの受付と中継は継続します。端末からの受付を止める場合は「ネットワークを停止」を使用してください。Hub本体を終了する場合は、起動元で停止してください。</p>
+          <p id="management-status" role="status">Hub本体に接続しています…</p>
+          <button id="management-reconnect" type="button" class="secondary">Hub本体へ再接続</button>
+        </section>
         <footer>
           moyAI Hub
           <span>
             ·
           </span>
           <span id="hub-identity">
-            ローカル管理
+            接続を確認中
           </span>
           <span>
             ·
@@ -464,11 +470,11 @@
           <input id="edit-label" required maxlength="160"/>
         </label>
         <label>
-          グループの実行上限
+          グループの同時接続上限
           <input id="edit-capacity" type="number" min="1" max="1024" required/>
         </label>
         <p class="footnote">
-          この実行枠グループを共有するすべての登録先に適用されます。
+          このグループに属する登録先への Hub 経由の通信に適用されます。
         </p>
         <label class="checkbox">
           <input id="edit-enabled" type="checkbox"/>

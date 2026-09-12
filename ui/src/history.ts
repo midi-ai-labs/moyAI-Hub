@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, savedMessage } from "./management.ts";
 import type { NetworkSnapshot } from "./network_state.ts";
 import { HistorySelection, historyDeviceCanRead, historyQueryKey, historySnapshotRetained, historyStateLabel } from "./history_state.ts";
 import type { HistoryDetail, HistoryDirection, HistoryPage, HistoryQuery, HistorySnapshot } from "./history_state.ts";
@@ -59,12 +59,14 @@ export function attachHistory(host: HTMLElement): { updateNetwork: (snapshot: Ne
         node<HTMLButtonElement>("history-next").disabled = busy || !canRead || currentPage?.page.next_offset == null;
         node<HTMLButtonElement>("history-previous").disabled = busy || !canRead || previousOffsets.length === 0;
         node<HTMLButtonElement>("history-export").disabled = exporting || currentDetail === null;
-        node("history-connection").textContent = selected ? `${selected.label} · ${selected.online ? "接続中" : "未接続"} · ${selected.revoked ? "恒久失効" : selected.admission === "stopped" ? "新規利用は停止中（履歴は確認可能）" : "参加を許可"}` : "";
+        const deleted = network?.deleted_devices?.find(device => device.device_id === deviceSelect.value);
+        node("history-connection").textContent = selected ? `${selected.label} · ${selected.online ? "接続中" : "未接続"} · ${selected.revoked ? "恒久失効" : selected.admission === "stopped" ? "新規利用は停止中（履歴は確認可能）" : "参加を許可"}` : deleted ? `${deleted.label} · 登録を削除済み · 保持期限内の取得済み履歴だけを確認できます。` : "";
         for (const button of node("history-rows").querySelectorAll<HTMLButtonElement>("button"))
             button.disabled = busy || (!canRead && !cachedResult(query(0, null, button.dataset.historyDetail!)));
     }
     function acquired(snapshot: HistorySnapshot): string {
-        const online = network?.devices.find(device => device.device_id === snapshot.device_id)?.online ?? snapshot.device_online;
+        const online = network?.deleted_devices?.some(device => device.device_id === snapshot.device_id) ? false
+            : network?.devices.find(device => device.device_id === snapshot.device_id)?.online ?? snapshot.device_online;
         return `取得日時: ${when(snapshot.completed_at_ms)} · ${snapshot.device_label} · ${online ? "端末は接続中" : "端末は未接続"} · 取得済みのスナップショット`;
     }
     function show(snapshot: HistorySnapshot) {
@@ -138,7 +140,7 @@ export function attachHistory(host: HTMLElement): { updateNetwork: (snapshot: Ne
         const target = currentDetail.snapshot.request_id, generation = owner.generation;
         exporting = true; controls();
         void invoke<string | null>("hub_history_export", { requestId: target }).then(saved => {
-            if (generation === owner.generation && currentDetail?.snapshot.request_id === target) message(saved ? `保存しました: ${saved}` : "保存をキャンセルしました。");
+            if (generation === owner.generation && currentDetail?.snapshot.request_id === target) message(savedMessage(saved));
         }).catch(error => { if (generation === owner.generation) message(typeof error === "string" ? error : "履歴を保存できません。", true); })
             .finally(() => { exporting = false; controls(); });
     });
@@ -147,7 +149,8 @@ export function attachHistory(host: HTMLElement): { updateNetwork: (snapshot: Ne
         updateNetwork(snapshot) {
             network = snapshot;
             if (deviceSelect !== document.activeElement) {
-                const html = '<option value="">端末を選択してください</option>' + snapshot.devices.map(device => `<option value="${escape(device.device_id)}">${escape(device.label)}${device.online ? "" : "（未接続）"}</option>`).join("");
+                const html = '<option value="">端末を選択してください</option>' + snapshot.devices.map(device => `<option value="${escape(device.device_id)}">${escape(device.label)}${device.online ? "" : "（未接続）"}</option>`).join("")
+                    + (snapshot.deleted_devices?.map(device => `<option value="${escape(device.device_id)}">${escape(device.label)}（削除済み・取得済み履歴のみ）</option>`).join("") ?? "");
                 if (deviceSelect.innerHTML !== html) { const selected = deviceSelect.value; deviceSelect.innerHTML = html; deviceSelect.value = selected;
                     if (selected && deviceSelect.value !== selected) changeSelection(); }
             }

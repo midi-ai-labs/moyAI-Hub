@@ -18,6 +18,8 @@ use std::{
 mod history;
 #[path = "device_network/join.rs"]
 mod join;
+#[path = "device_network/registry.rs"]
+mod registry;
 
 struct Fixture {
     directory: tempfile::TempDir,
@@ -1589,7 +1591,12 @@ fn schema_one_forward_load_preserves_identity_without_implicit_write() {
     old.as_object_mut().unwrap().remove("gateway_port");
     old.as_object_mut().unwrap().remove("join_requests");
     for device in old["devices"].as_object_mut().unwrap().values_mut() {
-        for field in ["stopped", "admission_revision", "join_approval"] {
+        for field in [
+            "stopped",
+            "admission_revision",
+            "join_approval",
+            "deleted_at_ms",
+        ] {
             device.as_object_mut().unwrap().remove(field);
         }
     }
@@ -1600,7 +1607,7 @@ fn schema_one_forward_load_preserves_identity_without_implicit_write() {
     assert!(owner.current_certificate(&a.receipt.device_id, &a.receipt.certificate_sha256, f.now));
     owner.set_gateway_port(&owner.revision(), 9550).unwrap();
     let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    assert_eq!(saved["schema_version"], 3);
+    assert_eq!(saved["schema_version"], 4);
     assert_eq!(saved["gateway_port"], 9550);
     let mut invalid = saved;
     invalid["authority"]["assume_all_accepted"] = json!(true);

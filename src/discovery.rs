@@ -79,11 +79,9 @@ pub fn normalize_endpoint(raw: &str) -> Result<String, String> {
 
 pub async fn discover(raw: &str, profile: &str) -> Result<Discovery, DiscoveryError> {
     let endpoint = normalize_endpoint(raw)?;
-    let path = match profile {
-        "lmstudio_chat" => "api/v1/models",
-        "openai_compatible_chat" => "v1/models",
-        _ => return Err("この接続方式はまだ利用できません。".into()),
-    };
+    let path = crate::provider::ProviderProfile::parse(profile)
+        .ok_or("この接続方式は利用できません。")?
+        .metadata_path();
     let client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -139,7 +137,9 @@ pub async fn discover(raw: &str, profile: &str) -> Result<Discovery, DiscoveryEr
 }
 
 pub fn parse_models(payload: &Value, profile: &str) -> Result<Vec<DiscoveredModel>, String> {
-    let native = profile == "lmstudio_chat";
+    let native = crate::provider::ProviderProfile::parse(profile)
+        .ok_or("この接続方式は利用できません。")?
+        .native_metadata();
     let entries = if native {
         payload.get("models").or(Some(payload))
     } else {
@@ -252,6 +252,26 @@ mod tests {
         assert_eq!(rows[0].availability, Availability::JitPending);
         assert_eq!(rows[1].availability, Availability::Ready);
         assert_eq!(rows[2].availability, Availability::Unknown);
+    }
+    #[test]
+    fn generation_api_does_not_change_the_selected_metadata_dialect() {
+        for profile in ["openai_compatible_chat", "openai_compatible_responses"] {
+            let rows = parse_models(&json!({"data":[{"id":"generic"}]}), profile).unwrap();
+            assert_eq!(rows[0].id, "generic");
+            assert_eq!(rows[0].availability, Availability::Unknown);
+            assert!(parse_models(&json!({"models":[{"key":"native"}]}), profile).is_err());
+        }
+        for profile in ["lmstudio_chat", "lmstudio_responses"] {
+            let rows = parse_models(
+                &json!({"models":[{"key":"native","type":"llm","loaded_instances":[]}]}),
+                profile,
+            )
+            .unwrap();
+            assert_eq!(rows[0].id, "native");
+            assert_eq!(rows[0].availability, Availability::JitPending);
+            assert!(parse_models(&json!({"data":[{"id":"generic"}]}), profile).is_err());
+        }
+        assert!(parse_models(&json!({"data":[]}), "unknown_profile").is_err());
     }
     #[test]
     fn endpoint_canonicalization_rejects_embedded_secrets() {

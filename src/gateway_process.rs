@@ -15,7 +15,6 @@ use tokio::{
     process::{Child, ChildStdin, ChildStdout, Command},
 };
 
-const MARKER: &str = "gateway-uncertain.json";
 const LOCK: &str = "gateway-execution.lock";
 
 #[derive(Serialize, Deserialize)]
@@ -37,8 +36,7 @@ pub struct GatewayNetwork {
     pub ca_certificate_pem: String,
 }
 
-// Only this pre-admission outcome authorizes clearing a failed-start marker.
-// Unknown replies, nonzero exit and missing exit confirmation remain uncertain.
+// Known pre-admission failures can be reported without implying provider execution.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StartupFailure {
@@ -201,7 +199,6 @@ pub struct GatewayProcess {
     child: Child,
     stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
-    directory: PathBuf,
 }
 impl GatewayProcess {
     pub async fn start(
@@ -217,22 +214,11 @@ impl GatewayProcess {
         directory: &Path,
         network: Option<GatewayNetwork>,
     ) -> Result<Self, String> {
-        if directory.join(MARKER).exists() {
-            return Err("前回の実行終了を確認できません。provider の実行停止を確認してから保留を解除してください。".into());
+        if execution_running(directory) {
+            return Err(
+                "前回の Gateway の終了処理中です。完了後にもう一度開始してください。".into(),
+            );
         }
-        let marker = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(directory.join(MARKER))
-            .map_err(|_| "Gateway の実行記録を作成できません。")?;
-        serde_json::to_writer(
-            &marker,
-            &json!({"schema_version":1,"reason":"execution_process_not_confirmed_clean"}),
-        )
-        .map_err(|_| "Gateway の実行記録を書けません。")?;
-        marker
-            .sync_all()
-            .map_err(|_| "Gateway の実行記録を同期できません。")?;
         let secret = format!("{}{}", ulid::Ulid::new(), ulid::Ulid::new());
         let init = Init {
             hub_url,
@@ -243,6 +229,7 @@ impl GatewayProcess {
         let mut command = Command::new(executable);
         command
             .arg("--gateway")
+            .kill_on_drop(true)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -253,7 +240,7 @@ impl GatewayProcess {
         }
         let mut child = command
             .spawn()
-            .map_err(|_| "Gateway を起動できません。実行終了は未確認です。")?;
+            .map_err(|_| "Gateway を起動できません。モデル要求は受け付けていません。")?;
         let mut stdin = child
             .stdin
             .take()
@@ -281,13 +268,8 @@ impl GatewayProcess {
             drop(stdin);
             if !matches!(tokio::time::timeout(Duration::from_secs(2), child.wait()).await, Ok(Ok(status)) if status.success())
             {
-                return Err(
-                    "Gateway の起動は失敗しましたが、終了を確認できません。実行保留を維持します。"
-                        .into(),
-                );
+                return Err("Gateway の起動に失敗し、子プロセスの終了を確認できません。".into());
             }
-            std::fs::remove_file(directory.join(MARKER))
-                .map_err(|_| "Gateway は終了しましたが、実行記録を解除できません。")?;
             return Err(match failure.startup_error {
                 StartupError::NetworkBindFailed => "Gateway の待受を開始できません。指定した IP とポートの使用状況を確認してください。".into(),
             });
@@ -305,11 +287,10 @@ impl GatewayProcess {
             child,
             stdin: Some(stdin),
             stdout,
-            directory: directory.to_path_buf(),
         })
     }
     pub async fn stop(mut self) -> bool {
-        // EOF closes admission; already claimed upstream work drains in the child process.
+        // EOF closes admission and cancels only this companion's HTTP connections.
         drop(self.stdin.take());
         let mut completion = String::new();
         let completed = tokio::time::timeout(
@@ -321,34 +302,36 @@ impl GatewayProcess {
             && serde_json::from_str::<Value>(&completion)
                 .ok()
                 .is_some_and(|v| v.get("clean") == Some(&Value::Bool(true)));
-        if !clean {
-            return false;
-        }
-        if !matches!(tokio::time::timeout(Duration::from_secs(2),self.child.wait()).await,Ok(Ok(status)) if status.success())
+        if clean
+            && matches!(
+                tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await,
+                Ok(Ok(_))
+            )
         {
-            return false;
+            return true;
         }
-        std::fs::remove_file(self.directory.join(MARKER)).is_ok()
+        // Bound local shutdown even if the child is unresponsive. No provider
+        // process is killed and no provider-idle acknowledgement is required.
+        self.child.start_kill().is_ok()
+            && matches!(
+                tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await,
+                Ok(Ok(_))
+            )
     }
 }
 
-pub fn uncertain(directory: &Path) -> bool {
-    directory.join(MARKER).exists()
-}
-pub fn acknowledge_quiescent(directory: &Path) -> Result<(), String> {
-    let lock = OpenOptions::new()
+/// This lock represents a local companion process, not provider execution.
+pub fn execution_running(directory: &Path) -> bool {
+    let Ok(lock) = OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
         .open(directory.join(LOCK))
-        .map_err(|_| "Gateway 状態を確認できません。")?;
-    fs2::FileExt::try_lock_exclusive(&lock)
-        .map_err(|_| "前回の Gateway がまだ実行中です。終了を待ってください。")?;
-    if uncertain(directory) {
-        std::fs::remove_file(directory.join(MARKER)).map_err(|_| "実行保留を解除できません。")?;
-    }
-    Ok(())
+    else {
+        return true;
+    };
+    fs2::FileExt::try_lock_exclusive(&lock).is_err()
 }
 
 pub async fn run_companion() -> Result<(), io::Error> {
@@ -369,6 +352,8 @@ pub async fn run_companion() -> Result<(), io::Error> {
         .write(true)
         .open(init.data_directory.join(LOCK))?;
     fs2::FileExt::try_lock_exclusive(&_lock)?;
+    // Legacy gateway-uncertain.json is retained as historical data, but is not
+    // evidence about provider activity and must not gate this process's startup.
     let gateway = Gateway::new(init.hub_url, init.control_token)
         .map_err(|_| io::Error::other("gateway client unavailable"))?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -436,7 +421,7 @@ pub async fn run_companion() -> Result<(), io::Error> {
         })
     });
     let mut stdout = tokio::io::stdout();
-    stdout
+    let ready_sent = stdout
         .write_all(
             format!(
                 "{}\n",
@@ -444,19 +429,25 @@ pub async fn run_companion() -> Result<(), io::Error> {
             )
             .as_bytes(),
         )
-        .await?;
-    stdout.flush().await?;
+        .await
+        .is_ok()
+        && stdout.flush().await.is_ok();
     input.clear();
     // Hub death and explicit stop both close this pipe. No parent heartbeat guesses are used.
-    let _ = stdin.read_line(&mut input).await;
+    if ready_sent {
+        let _ = stdin.read_line(&mut input).await;
+    }
     let clean = gateway.drain().await;
+    server.abort();
+    let _ = server.await;
+    if let Some(server) = network_server {
+        server.abort();
+        let _ = server.await;
+    }
+    // Keep the local process lock until all listeners and our HTTP tasks stop.
     stdout
         .write_all(format!("{}\n", json!({"clean":clean})).as_bytes())
         .await?;
     stdout.flush().await?;
-    server.abort();
-    if let Some(server) = network_server {
-        server.abort();
-    }
     Ok(())
 }

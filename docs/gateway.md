@@ -1,8 +1,16 @@
 # Gateway の実行境界
 
-Hub 本体は catalog、端末、選択、revision、turn、lease、request ID と容量のメタデータを扱います。prompt / response は Desktop から別 process の Gateway に送られ、Gateway が provider に転送します。同じ `moyai-hub` 実行ファイルを `--gateway` で起動し、秘密情報は親子の stdin パイプだけで初期化します。
+Hub のサーバープロセスは catalog、端末、選択、revision、turn、lease、request ID と中継接続数のメタデータを扱います。管理画面は通常のWebブラウザーで開き、Rustサーバーの管理APIへ接続します。prompt / response は Desktop からさらに別 process の Gateway に送られ、Gateway が provider に転送します。サーバーが同じ `moyai-hub` 実行ファイルを `--gateway` で起動し、Gateway の秘密情報はサーバーとの stdin パイプだけで初期化します。モデルの load / unload、推論のキューとスケジューリング、生成の開始・終了は oMLX / LM Studio などの provider が所有します。Hub は provider 内の実行状態を管理・推定しません。
 
 Gateway の管理用待受は一時的な IPv4 loopback port です。従来の同一 PC 接続はこの HTTP 経路を使います。Hub の「端末ネットワーク」を開始した場合は、同じ子プロセスに別ポートの **相互 TLS が必須の生成用 listener** を開きます。Hub のメタデータ listener と生成本文を処理する listener は別で、生成用 listener に管理 API は公開しません。生成用ポートは詳細設定で固定でき、0 は自動選択です。固定ポートが使用中なら開始を拒否し、自動ポートへ切り替えません。変更は次回開始から適用します。組織の Firewall では両ポートを確認してください。アプリは Firewall 規則を作成しません。
+
+## 管理画面とサーバーの寿命
+
+通常起動する`moyai-hub`が保存先の排他lock、catalog / DeviceNetwork、端末認証、Web / metadata / TLS listenerとGatewayを所有します。公開CLIは保存済み設定でWeb管理を自動開始し、integration testも同じ起動経路を使います。ブラウザーを閉じたり強制終了したりしてもサーバーとGatewayは停止しません。起動・保存先・公開設定は[Web管理の手順](web-management.md)を参照してください。
+
+ブラウザー管理commandは固定Host/OriginとCSRFを照合したWeb APIから同じ`Admin`へ渡します。現在のWebには管理者ログインがありません。CLIの状態確認・終了は別のprivate loopback制御へBearer認証で接続します。この資格情報は利用者限定ファイルで保護し、Web・ログ・Desktop配布用の共通設定へ載せません。端末のmTLSと実行許可はこのWeb構成変更と独立しています。catalogと端末設定の読み書きはサーバーの`Admin`が一元所有します。
+
+ブラウザーの「ネットワークを停止」は端末向けlistenerとGatewayを停止し、サーバープロセスとWeb管理を維持します。サーバー自体を終了する操作は`--stop [--data-dir <保存先>]`、またはforegroundサーバーのCtrl+Cです。Windowsサービス登録、ログオン時の自動起動、OS再起動後の自動復旧は実装していません。
 
 ## 認証と実要求
 
@@ -12,9 +20,26 @@ Gateway の管理用待受は一時的な IPv4 loopback port です。従来の�
 {"id":"client-id","context":"main","turn_id":"stable-user-turn","request_id":"request-attempt","expected_hub_id":"hub-id","reviewed_revision":"3"}
 ```
 
-`context` は `main` / `side_chat`、revision は正の十進文字列です。待機時は 200 `{state:"waiting",reason,retry_after_ms:1000}`。reason は `busy` / `global_capacity` / `target_unavailable` / `maintenance` / `jit_pending` です。
+`context` は `main` / `side_chat`、revision は正の十進文字列です。待機時は 200 `{state:"waiting",reason,retry_after_ms:1000}`。reason は `busy` / `global_capacity` / `target_unavailable` / `maintenance` です。旧版の `jit_pending` は型の互換性を保ちますが、現行 Hub は返しません。
 
-準備成功は 200 `{state:"ready",lease_id,permit_id,logical_model_id,gateway_base_url,request_token,expires_at_ms,provider_profile:"openai_compatible_chat",provider_api_mode:"chat_completions"}`。期限は十進文字列です。従来の target は `http://127.0.0.1:<port>/r/<permit_id>/v1`、端末ネットワークでは `https://<Hub-IP>:<Gateway-port>/r/<permit_id>/v1` です。Desktop は `/chat/completions` を付加し、専用 request token を Bearer に指定します。body.model は logical model ID を使用し、Gateway が登録済み provider model ID に変換します。実 endpoint・provider credential は Desktop に配布しません。現在は認証不要の provider が対象です。
+`purpose` の省略は通常の user turn です。`preparation` は依頼整形、`delegated` は [子エージェントの独立実行](delegated-execution.md) に使い、どちらも同じ permit / 中継枠の認可を通し、user-turn affinity 回数を消費しません。Delegated だけは確認済み選択の snapshot と独立した context を使い、finish/cancel と heartbeat に対象を区別する `delegated:true` を渡します。
+
+割当は登録した provider の新しいモデル一覧で存在を確認し、管理者の maintenance と選択・能力・中継接続数の条件を適用します。LM Studio の未ロード報告やロード情報の欠如を理由に待機しません。一覧にあるモデルへ要求を送り、ロードや実行可否は provider が判断します。接続不能、確認期限切れ、成功した一覧からのモデル欠落は区別します。管理画面の `model_present` は同じ観測から導出し、ロード済みを意味しません。
+
+登録/model-session が `supports_turn_heartbeat:true` を返す場合、Desktop は既存の `/v1/clients/heartbeat` に `active_turns:[{context,turn_id}]` を含めます。Hub は認証された client の同じ active turn の期限内 lease だけを `lease_ttl_ms` 分延長します。tool 実行や遠隔待機中も同じ割当を維持できますが、permit の期限、request ID、affinity の残り回数は変えません。省略は旧クライアントと同じ presence 更新のみです。失効・終了・取消済み turn、別 context/turn、旧 revision の lease は更新しません。これは provider 実行の継続や終了を証明する heartbeat ではありません。
+
+準備成功は 200 `{state:"ready",lease_id,permit_id,logical_model_id,gateway_base_url,request_token,expires_at_ms,provider_profile,provider_api_mode}`。期限は十進文字列です。従来の target は `http://127.0.0.1:<port>/r/<permit_id>/v1`、端末ネットワークでは `https://<Hub-IP>:<Gateway-port>/r/<permit_id>/v1` です。Desktop は下表の API path を付加し、専用 request token を Bearer に指定します。body.model は logical model ID を使用し、Gateway が登録済み provider model ID に変換します。実 endpoint・provider credential は Desktop に配布しません。現在は認証不要の provider が対象です。
+
+| 登録する profile | モデル一覧 | 生成 API | Desktop への profile / API mode |
+| --- | --- | --- | --- |
+| `openai_compatible_chat` | `/v1/models` | `/v1/chat/completions` | `openai_compatible_chat` / `chat_completions` |
+| `lmstudio_chat` | `/api/v1/models` | `/v1/chat/completions` | 同上 |
+| `openai_compatible_responses` | `/v1/models` | `/v1/responses` | `openai_compatible_responses` / `responses` |
+| `lmstudio_responses` | `/api/v1/models` | `/v1/responses` | 同上 |
+
+管理画面の接続方式で metadata と生成 API の組を明示します。モデル一覧の成功だけでは Responses 対応を証明しません。provider が公開する API を選び、非対応時は要求を失敗として返します。Chat Completions への自動切替は行いません。既存 profile の意味と保存 schema は維持し、新しい Responses profile の利用には対応版の Hub と Desktop が必要です。
+
+Responses は Desktop の既存 HTTP adapter と同じ全履歴の `input` 配列、`instructions`、`store:false`、`stream:true` を使います。`previous_response_id`、`conversation`、`background` を受け付けず、保存済み provider 会話や非同期 job を permit の外へ持ち越しません。Gateway は許可の profile と API path、logical model を照合した後、model 名だけを置換して本文・tool call・SSEをそのまま中継します。Chat形式への変換やprovider stateの保持はありません。Desktop は prepare の profile/API の正しい組から request ごとの immutable adapter を選びます。
 
 ネットワークの permit は発行先端末の証明書に結び付きます。別端末が token を取得しても使用できず、HTTP 経路への持ち替えも拒否します。Gateway は実行の claim 時に Hub へ照会し、証明書が現在も有効か確認します。Desktop は共通設定の公開 CA をアプリ内で信頼し、Hub / Gateway の証明書と接続先 IP を検証します。端末の TLS 秘密鍵や共通の長期 token を配布する方式ではありません。
 
@@ -24,29 +49,29 @@ Hub / Gateway の server 証明書だけに予約名 `hub.moyai.invalid` を含�
 
 モデル割当と Desktop 間の作業委任は別の資格です。作業委任では Hub の公開先一覧と方向付き許可から対象限定の短期資格を発行し、受入側 Desktop が毎回照会します。その仕事が必要とするモデル生成は上記 model session と Gateway を使います。Hub は仕事本文を受け取らず、同じ仕事を二度実行しない責任は受入側の永続 job 台帳が持ちます。
 
-`POST /v1/turns/finish` と `/v1/turns/cancel` は `{id,context,turn_id}` を受け取り、`{id,context,turn_id,closed:true}` を返します。切断も含めて未使用の予約を失効させます。開始済み要求は端末側の Stop / 接続切断だけでは空き枠に戻しません。
+`POST /v1/turns/finish` と `/v1/turns/cancel` は `{id,context,turn_id}` を受け取り、`{id,context,turn_id,closed:true}` を返します。切断も含めて未使用の予約を失効させ、対象の開始済み要求は Gateway 自身の上流 HTTP 接続を閉じます。HTTP 処理の後始末後に中継枠を解放します。provider 内の生成終了を証明する操作ではありません。
 
-HTTP エラーは本文や URL を含まない `{error,current_revision?}` です。401 `unauthorized`、409 `review_required` / `different_hub` / `active_turn` / `turn_closed` / `permit_expired` / `lease_expired` / `selection_required` / `stale_client`、400 `invalid_request` / `model_removed` / `capability_mismatch`、503 `gateway_unavailable` / `gateway_quarantined`、429 `registry_full` を返します。Gateway 自体は `permit_consumed`、`provider_unavailable`、`upstream_uncertain` 等を返します。metadata API と Gateway はブラウザー Origin 付き要求を拒否します。
+HTTP エラーは本文や URL を含まない `{error,current_revision?}` です。401 `unauthorized`、409 `review_required` / `different_hub` / `active_turn` / `turn_closed` / `permit_expired` / `lease_expired` / `selection_required` / `stale_client`、400 `invalid_request` / `model_removed` / `capability_mismatch`、503 `gateway_unavailable`、429 `registry_full` を返します。Gateway 自体は `permit_consumed`、`provider_unavailable`、`upstream_uncertain` 等を返します。`upstream_uncertain` はその要求の応答を完了できなかったエラーであり、provider の稼働判定や容量プールの保留ではありません。metadata API と Gateway はブラウザー Origin 付き要求を拒否します。
 
-## 容量と終了確認
+## 中継接続数と応答の完了
 
-core の期限付き permit は予約計算です。Gateway は未使用予約と実行中要求を数え、登録した共有容量プールと全体上限をこの Gateway 経路で強制します。通常の LM Studio / oMLX はこの permit を検証しません。他アプリや別 Gateway から provider へ直接送った要求を認識・制限できず、GPU 全体の排他を保証しません。
+core の期限付き permit は予約計算です。Gateway は未使用予約と自身が中継する HTTP 要求を数え、登録した共有容量プールと全体上限をこの Gateway 経路で強制します。これは Hub 経由の同時接続上限です。通常の LM Studio / oMLX はこの permit を検証せず、他アプリや別 Gateway からの要求や、接続終了後の provider 内の処理は数えません。GPU の容量、推論全体の同時実行数、キューは provider 側で管理します。
 
-未使用予約だけが TTL で解放されます。claim 後は TTL、Stop、切断、端末 heartbeat 失効では枠を早期解放せず、上流を読み切ります。SSE は正確な `data: [DONE]` 行と応答 EOF、非 streaming は完全な JSON 応答を終端確認に使用します。接続開始前の明確な失敗以外で、通信断・期限切れ・未終端・上限超過が起きた場合は容量プールを保留し、新規実行を拒否します。
+未使用予約は TTL で解放します。claim 後はローカル HTTP 処理が存在する間だけ枠を保持し、応答完了、Stop、接続切断、通信失敗や期限切れによる後始末で解放します。permit の期限切れだけでは進行中の HTTP 処理を終了済みにしません。Chat Completions の正確な `data: [DONE]` 行、Responses の `response.completed` / `response.failed` / `response.incomplete` と一致する response status を持つ完全な SSE event、および応答 EOFを、自身が受信した stream の終端検証に使います。Responses の失敗・不完全イベントは変更せず Desktop の既存 decoder に渡し、生成成功として扱いません。非 streaming Chat は完全な JSON を検証します。不完全な応答や上限超過はその要求のエラーとして通知し、容量プールや Hub の起動を保留しません。要求を自動再送せず、消費済みの request token を再利用しません。
 
-接続 timeout は 3 秒、headers / 各 response read の無通信 timeout は 300 秒です。**応答が継続している間の全体時間制限はありません。** body は 8 MiB、response は 64 MiB、SSE 行は 1 MiB が上限です。redirect を追わず、入力 Authorization を provider に転送しません。下流への backpressure は有界キューで受けます。
+接続 timeout は 3 秒、headers / 各 response read の無通信 timeout は 300 秒です。**応答が継続している間の全体時間制限はありません。** body は 8 MiB、response は 64 MiB、SSE 行と Responses event data は各 1 MiB が上限です。redirect を追わず、入力 Authorization を provider に転送しません。下流への backpressure は有界キューで受けます。
 
-管理画面の「応答中」「上流終了確認待ち」は、既存の Running record と端末への response channel から毎回導出します。channel の weak reference が生存し受信側が開いているものを前者、受信側が閉じたものや weak reference が失効したものを後者として数え、合計が実行枠を保持している要求数です。接続先から bytes が今届いているという意味ではなく、応答接続の状態です。独立した停止 flag や実行 counter は持たず、この分類だけでは枠を解放しません。観測に失敗した場合は不明として表示します。
+管理画面は「Hub のモデル中継」に「中継中」「予約」の件数を表示します。中継中の件数は既存の Running record から導出し、接続が閉じてローカルの後始末中のものも終了まで含めます。互換 snapshot の `responding` / `draining` は response channel の有無による内訳で、provider の生成状態ではありません。`quarantined_pools` は互換用の空配列です。`uncertain` はローカル Gateway から状態を取得できなかった場合だけに使い、oMLX / LM Studio の生成を指しません。
 
 ## 停止・異常終了と回復
 
-開始前に `gateway-uncertain.json` を作り、Gateway process は `gateway-execution.lock` を保持します。 子はすべての listener の bind と TLS 検証を終えてから受付を開始します。生成用 bind の失敗を受付前の型付き応答で報告し、親が正常退出まで確認できた場合だけ、失敗した起動の marker を解除します。未知の起動エラー・異常退出・終了未確認は保留を維持します。Hub の明示停止や終了で stdin が閉じると新規受付を閉じ、未使用予約を失効させます。Hub の停止 UI は子の応答を 3 秒待ち、さらに正常終了を確認できた場合だけ marker を削除します。未完了なら marker を保持したまま子が drain を続けます。
+Gateway process は `gateway-execution.lock` を保持して同じ保存先からの子プロセスの重複起動を防ぎます。このロックはローカルの process を表し、provider の実行状態ではありません。listener の bind や TLS 検証に失敗した場合は、その起動エラーを返します。旧版の `gateway-uncertain.json` は過去の記録として変更せずに残しますが、現行版は読み書きせず、起動・割当の条件に使いません。provider の全生成が止まったことを管理者に確認させる操作もありません。
 
-「ネットワークを停止」と Hub のウィンドウ終了は、TLS 受付・モデル管理・Gateway を同じ停止経路へ通します。CA、永続端末 ID、グループ、許可、受入済みの仕事の認可経路と root 取消を保持します。presence と60秒の短期資格は破棄し、端末が公開先を再通知してから同じ仕事の照会・停止資格を得ます。受入済みの仕事は24時間を超えても時間だけで破棄しません。受入通知が不明な intent は `recovery_required` として受入側の永続台帳を照合し、自動再実行しません。モデル client / 未使用 permit は別の一時状態です。端末失効や公開 OFF は新規受付の拒否であり、既に claim したモデル要求の終了を意味しません。
+「ネットワークを停止」と Hub サーバーの明示終了は、TLS 受付・モデル管理・Gateway を同じ停止経路へ通します。ブラウザーやタブの終了はこの経路を呼びません。CA、永続端末 ID、グループ、許可、受入済みの仕事の認可経路と root 取消を保持します。通信停止では presence と60秒の短期資格を破棄し、端末が公開先を再通知してから同じ仕事の照会・停止資格を得ます。受入済みの仕事は24時間を超えても時間だけで破棄しません。受入通知が不明な intent は `recovery_required` として受入側の永続台帳を照合し、自動再実行しません。モデル client / 未使用 permit は別の一時状態です。端末失効や公開 OFF は新規受付の拒否であり、既に claim したモデル要求の終了を意味しません。
 
-子の drain 待機は最大 305 秒です。そこで終端未確認の要求が残る場合や、Hub / Gateway の異常終了時は marker が残り、次回起動で自動的に容量を安全とみなしません。正常なウィンドウ終了は停止 command と同じ処理を待ってからアプリを終了し、確認できた子の正常終了だけが marker を解除します。プロセス終了で provider 側の実行も終了したとは限りません。
+Hub サーバーの明示停止や終了、サーバープロセスの消滅によって stdin が閉じると、Gateway は新規受付を閉じ、未使用予約を失効させ、自身の HTTP 処理へ取消を通知します。ブラウザーの消滅ではサーバーと Gateway のパイプは閉じません。後始末の待機は最大2秒です。サーバーは子の完了通知を最大3秒待ち、通常終了を確認できなければローカルの Gateway 子プロセスを終了させます。provider のプロセスは終了させません。ローカル終了の確認に失敗した場合はその状態を表示し、生存中の同じ子プロセスに重ねて起動しません。
 
-再開始するには provider 側の実行終了を管理者が確認し、停止中の Hub で「接続先のモデル実行が終了したことを確認しました」を明示選択して保留を解除します。実行ロックを保持する旧 Gateway が生存している間は解除できません。現段階は provider 自身への確実な cancel / 実行照合 API を持たず、この確認を自動化しません。
+HTTP 接続を閉じた後に生成を取り消すか、完了まで続けるかは provider が決めます。Hub の再開始を provider 全体のアイドル確認に結び付けません。途中で切れた応答を成功に変えたり、停止・再起動後に自動再送したりすることもありません。MCP の受入済み仕事の永続台帳と取消・照合は別の責務で、以下の認可記録の契約を維持します。
 
 <a id="証明書の期限と計画停止"></a>
 
@@ -66,4 +91,4 @@ Hub は本文を保存せず、origin / actor / audience / profile / scope / roo
 
 mTLS `GET /v1/network/diagnostics` はメタデータ / Gateway の実 endpoint、公開証明書の期限と更新状態、Gateway のローカル受付可否だけを返します。ローカル稼働を他 PC からの到達成功として扱いません。MCP 接続確認は専用の60秒 inspect 資格で lifecycle / tools/list のみを確認し、仕事・再委任 intent を生成しません。再委任中の確認では受入済みの親 job と元端末の DELEGATED 許可も照合し、通常の直接接続許可へ持ち替えません。inspect で仕事の実行・照会・停止はできません。
 
-実装と負例は `src/gateway.rs`、`src/gateway_process.rs`、`src/service/execution_api.rs`、`src/network/`、`tests/gateway_execution.rs`、`tests/device_network.rs` が正本です。実 provider と 2 アプリの操作証跡は Desktop 側の task-local 検証記録に置き、fixture 成功を実機成功として扱いません。
+起動・管理とサーバーの境界は`src/cli.rs`、`src/host_process.rs`、`src/web_admin.rs`、`src/admin.rs`、`src/admin/`が所有します。実行・認可の実装と負例は`src/gateway.rs`、`src/gateway_process.rs`、`src/service/execution_api.rs`、`src/network/`、`tests/gateway_execution.rs`、`tests/device_network.rs`が正本です。実providerやDesktopとの操作証跡はtask-local検証記録へ置き、fixture成功を実機成功として扱いません。サーバーとブラウザーだけの管理経路は実装・検証中であり、ブラウザー終了後の通信継続、明示停止、更新後の再開を変更後の実プロセス・実ブラウザーで確認します。

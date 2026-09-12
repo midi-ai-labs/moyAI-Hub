@@ -65,13 +65,21 @@ async function withUi(invoke: (name: string, args: Record<string, unknown>) => P
     host: NodeFixture; node: (id: string) => NodeFixture; ui: ReturnType<typeof attachHistory>;
     calls: { name: string; args: Record<string, unknown> }[]; tick: () => Promise<void>; setNow: (value: number) => void;
 }) => Promise<void>) {
-    const globals = ["window", "document", "location", "setTimeout", "clearTimeout"] as const;
+    const globals = ["fetch", "document", "location", "setTimeout", "clearTimeout"] as const;
     const originals = globals.map(key => Object.getOwnPropertyDescriptor(globalThis, key));
     const oldNow = Date.now; let now = 1000; Date.now = () => now;
     const calls: { name: string; args: Record<string, unknown> }[] = [];
     const timers = new Map<number, () => unknown>(); let nextTimer = 1;
-    const values = [{ __TAURI_INTERNALS__: { invoke: async (name: string, args: Record<string, unknown>) => { calls.push({ name, args }); return invoke(name, args); } } },
-        { activeElement: null }, { hash: "" }, (callback: () => unknown) => { const id = nextTimer++; timers.set(id, callback); return id; },
+    const values = [async (path: string, options?: RequestInit) => {
+        if (path === "/admin/session") return Response.json({ csrf: "test-csrf", epoch: "test-epoch" });
+        assert.equal(path, "/admin/command");
+        const { command, args } = JSON.parse(String(options?.body)) as { command: string; args: Record<string, unknown> };
+        calls.push({ name: command, args });
+        try { return Response.json({ result: await invoke(command, args) }); }
+        catch (error) { return Response.json({ error: String(error) }, { status: 400 }); }
+    },
+        { activeElement: null, body: { append() {} }, createElement: () => ({ href: "", download: "", click() {}, remove() {} }) },
+        { hash: "" }, (callback: () => unknown) => { const id = nextTimer++; timers.set(id, callback); return id; },
         (id: number) => timers.delete(id)];
     globals.forEach((key, index) => Object.defineProperty(globalThis, key, { configurable: true, writable: true, value: values[index] }));
     const host = new NodeFixture();
@@ -114,8 +122,8 @@ test("Hub pending direction change ignores an old in-flight result and releases 
 });
 
 test("Hub cached offline details expire consistently, escape markup, and export the selected immutable request", async () => {
-    const exportResult = deferred<string | null>();
-    await withUi(async (name, args) => name === "hub_history_export" ? exportResult.promise : response(args), async ({ ui, node, calls, setNow }) => {
+    const exportResult = deferred<HistorySnapshot>();
+    await withUi(async (name, args) => name === "hub_history_result" ? exportResult.promise : response(args), async ({ ui, node, calls, setNow }) => {
         ui.updateNetwork(network()); ui.showDevice("WinB"); await flush();
         const markup = node("history-rows").innerHTML;
         assert.match(markup, /&lt;script&gt;/); assert.match(markup, /WinA&lt;img&gt;/);
@@ -123,10 +131,10 @@ test("Hub cached offline details expire consistently, escape markup, and export 
         node("history-rows").fire("click", node("history-rows").buttons[0]); await flush();
         assert.equal(node("history-markdown").textContent, "# 履歴\n<script>bad()</script>");
         node("history-export").fire("click"); await flush();
-        assert.deepEqual(calls.at(-1), { name: "hub_history_export", args: { requestId: "detail-request" } });
+        assert.deepEqual(calls.at(-1), { name: "hub_history_result", args: { requestId: "detail-request" } });
         node("history-direction").value = "execution"; node("history-direction").fire("change");
-        exportResult.resolve("C:/logs/old-detail.md"); await flush();
-        assert.doesNotMatch(node("history-notice").textContent, /保存しました/);
+        exportResult.resolve(response({ deviceId: "WinB", direction: "instruction", offset: 0, anchor: null, id: "job-b" })); await flush();
+        assert.doesNotMatch(node("history-notice").textContent, /ダウンロードを開始しました/);
         node("history-direction").value = "instruction"; node("history-direction").fire("change");
         ui.updateNetwork(network(false));
         assert.match(node("history-acquired").textContent, /未接続.*スナップショット/);
@@ -163,5 +171,22 @@ test("Hub errors and target mismatches never become a successful empty page", as
         assert.equal(node("history-empty").hidden, false);
         assert.equal(node("history-page-label").textContent, "0 件");
         assert.match(node("history-notice").textContent, /履歴を取得しました/);
+    });
+});
+
+test("deleted device identity keeps cached details exportable while new history reads stay disabled", async () => {
+    await withUi(async (_name, args) => response(args), async ({ ui, node, calls }) => {
+        ui.updateNetwork(network()); ui.showDevice("WinB"); await flush();
+        node("history-rows").fire("click", node("history-rows").buttons[0]); await flush();
+        const before = calls.length;
+        ui.updateNetwork({ ...network(), devices: [], deleted_devices: [{ device_id: "WinB", label: "WinB", deleted_at_ms: 1001 }] });
+        assert.equal(node("history-device").value, "WinB");
+        assert.equal(node("history-detail").hidden, false);
+        assert.equal(node("history-markdown").textContent, "# 履歴\n<script>bad()</script>");
+        assert.equal(node("history-request").disabled, true);
+        assert.equal(node("history-export").disabled, false);
+        assert.match(node("history-connection").textContent, /削除済み/);
+        assert.match(node("history-detail-acquired").textContent, /未接続/);
+        assert.equal(calls.length, before);
     });
 });

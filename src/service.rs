@@ -199,7 +199,7 @@ async fn device_session(
     // first model independently, and must review the exact returned revision.
     let default_selection=models.first().map(|preferred|json!({"allowed_model_ids":models,"preferred_model_id":preferred,"required_capabilities":["tools"],"wait_policy":"allow_selected_fallback","affinity_turns":3}));
     Ok(Json(
-        json!({"id":id,"client_token":secret,"hub_id":core.catalog_store().hub_id,"revision":core.catalog_store().revision.to_string(),"heartbeat_interval_ms":10000,"identity_scope":"device_session","default_selection":default_selection}),
+        json!({"id":id,"client_token":secret,"hub_id":core.catalog_store().hub_id,"revision":core.catalog_store().revision.to_string(),"heartbeat_interval_ms":10000,"supports_turn_heartbeat":true,"supports_delegated_execution":true,"identity_scope":"device_session","default_selection":default_selection}),
     ))
 }
 
@@ -344,7 +344,7 @@ async fn register(
         },
     );
     Ok(Json(
-        json!({"id":id,"client_token":secret,"hub_id":core.catalog_store().hub_id,"revision":core.catalog_store().revision.to_string(),"heartbeat_interval_ms":10000,"identity_scope":"server_session"}),
+        json!({"id":id,"client_token":secret,"hub_id":core.catalog_store().hub_id,"revision":core.catalog_store().revision.to_string(),"heartbeat_interval_ms":10000,"supports_turn_heartbeat":true,"supports_delegated_execution":true,"identity_scope":"server_session"}),
     ))
 }
 
@@ -353,6 +353,17 @@ async fn register(
 struct HeartbeatRequest {
     id: String,
     activity: ClientActivity,
+    #[serde(default)]
+    active_turns: Vec<HeartbeatTurn>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HeartbeatTurn {
+    context: ReviewContext,
+    turn_id: String,
+    #[serde(default)]
+    delegated: bool,
 }
 
 async fn heartbeat(
@@ -372,9 +383,37 @@ async fn heartbeat(
         .find(|client| client.id == request.id)
         .ok_or_else(denied)?
         .label;
+    let active_contexts: Vec<String> = request
+        .active_turns
+        .iter()
+        .map(|turn| {
+            if turn.delegated {
+                HubCore::delegated_context_id(turn.context.id(), &turn.turn_id)
+            } else {
+                Ok(turn.context.id().into())
+            }
+        })
+        .collect::<Result<_, _>>()
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error":"invalid_request"})),
+            )
+        })?;
+    let active_turns: Vec<_> = request
+        .active_turns
+        .iter()
+        .zip(&active_contexts)
+        .map(|(turn, context)| (context.as_str(), turn.turn_id.as_str()))
+        .collect();
+    core.heartbeat_with_turns(&request.id, request.activity, &active_turns, now_ms())
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error":"invalid_request"})),
+            )
+        })?;
     core.register_client(&request.id, &label, &peer.ip().to_string(), now_ms())
-        .map_err(|_| failed())?;
-    core.heartbeat(&request.id, request.activity, now_ms())
         .map_err(|_| failed())?;
     Ok(Json(
         json!({"id":request.id,"revision":core.catalog_store().revision.to_string()}),
@@ -412,6 +451,27 @@ struct ReviewSelection {
     required_capabilities: Vec<String>,
     wait_policy: ReviewWaitPolicy,
     affinity_turns: u32,
+}
+
+impl ReviewSelection {
+    fn resolve(&self, reviewed_revision: u64) -> Result<Selection, (StatusCode, Json<Value>)> {
+        let required_capabilities: std::collections::BTreeSet<String> =
+            self.required_capabilities.iter().cloned().collect();
+        if required_capabilities.len() != self.required_capabilities.len() {
+            return Err(invalid_selection());
+        }
+        Ok(Selection {
+            allowed_model_ids: self.allowed_model_ids.clone(),
+            preferred_model_id: Some(self.preferred_model_id.clone()),
+            required_capabilities,
+            wait_policy: match self.wait_policy {
+                ReviewWaitPolicy::WaitForPreferred => WaitPolicy::WaitForPreferred,
+                ReviewWaitPolicy::AllowSelectedFallback => WaitPolicy::AnyAllowed,
+            },
+            affinity_turns: self.affinity_turns,
+            reviewed_revision,
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -470,26 +530,7 @@ async fn review(
         .ok()
         .filter(|value| *value > 0 && value.to_string() == request.reviewed_revision)
         .ok_or_else(invalid_selection)?;
-    let required_capabilities: std::collections::BTreeSet<String> = request
-        .selection
-        .required_capabilities
-        .iter()
-        .cloned()
-        .collect();
-    if required_capabilities.len() != request.selection.required_capabilities.len() {
-        return Err(invalid_selection());
-    }
-    let selection = Selection {
-        allowed_model_ids: request.selection.allowed_model_ids,
-        preferred_model_id: Some(request.selection.preferred_model_id),
-        required_capabilities,
-        wait_policy: match request.selection.wait_policy {
-            ReviewWaitPolicy::WaitForPreferred => WaitPolicy::WaitForPreferred,
-            ReviewWaitPolicy::AllowSelectedFallback => WaitPolicy::AnyAllowed,
-        },
-        affinity_turns: request.selection.affinity_turns,
-        reviewed_revision,
-    };
+    let selection = request.selection.resolve(reviewed_revision)?;
     core.save_selection(&request.id, request.context.id(), selection)
         .map_err(|error| selection_failure(error, revision))?;
     Ok(Json(

@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <title>moyAI Hub</title>
+  <rect x="32" y="32" width="448" height="448" rx="112" fill="#12363e"/>
+  <path d="M256 252 138 142M256 252 374 142M256 252v134" fill="none" stroke="#a5f3df" stroke-width="32" stroke-linecap="round"/>
+  <circle cx="138" cy="142" r="46" fill="#2dd4bf"/>
+  <circle cx="374" cy="142" r="46" fill="#2dd4bf"/>
+  <circle cx="256" cy="386" r="46" fill="#2dd4bf"/>
+  <path d="m256 178 64 37v74l-64 37-64-37v-74z" fill="#fbbf57" stroke="#12363e" stroke-width="16" stroke-linejoin="round"/>
+</svg>

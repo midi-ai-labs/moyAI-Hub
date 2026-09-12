@@ -95,6 +95,9 @@ pub struct CatalogStore {
 pub struct DeploymentRow {
     pub deployment: Deployment,
     pub availability: Availability,
+    /// A fresh successful provider listing contained this model. This is not load readiness.
+    #[serde(default)]
+    pub model_present: bool,
     pub last_observed_ms: Option<u64>,
     pub active_permits: u32,
 }
@@ -264,10 +267,7 @@ impl Catalog {
                     "endpoint must be HTTP(S), without credentials, query or fragment",
                 ));
             }
-            if !matches!(
-                deployment.provider_profile.as_str(),
-                "openai_compatible_chat" | "lmstudio_chat"
-            ) {
+            if crate::provider::ProviderProfile::parse(&deployment.provider_profile).is_none() {
                 return Err(invalid("unsupported provider profile"));
             }
         }

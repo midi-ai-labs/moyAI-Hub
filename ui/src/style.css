@@ -113,15 +113,10 @@ a {
 }
 
 .brand-mark {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: #3568d7;
-  border-radius: 11px;
-  width: 38px;
+  display: block;
+  flex: 0 0 42px;
+  width: 42px;
   height: 42px;
-  font-size: 26px;
-  font-weight: 700;
 }
 
 .workspace-label {

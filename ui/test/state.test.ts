@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { DiscoveryOwner, availability, capabilityLabel, changeSummary, gatewayStatus, loadCounts, reviewStatus } from "../src/state.ts";
+import { DiscoveryOwner, availability, capabilityLabel, changeSummary, deploymentStatus, gatewayStatus, modelCounts, reviewStatus } from "../src/state.ts";
 import type { Snapshot } from "../src/state.ts";
 test("editing endpoint invalidates in-flight discovery even when returning to same endpoint", () => {
     const owner = new DiscoveryOwner();
@@ -10,12 +10,14 @@ test("editing endpoint invalidates in-flight discovery even when returning to sa
     assert.equal(owner.accepts(request), false);
     assert.equal(owner.accepts(owner.capture()), true);
 });
-test("status text separates metadata membership, load state and maintenance", () => {
-    assert.match(availability.unknown.label, /不明/);
-    assert.match(availability.jit_pending.reason, /未ロード/);
-    assert.match(availability.jit_pending.reason, /未確認/);
-    assert.match(availability.ready.reason, /報告/);
-    assert.match(availability.maintenance.reason, /管理者/);
+test("primary model status uses fresh listing presence independent of provider load hints", () => {
+    for (const hint of ["unknown", "ready", "jit_pending"] as const) {
+        assert.equal(deploymentStatus({ availability: hint, model_present: true }).label, "一覧あり");
+        assert.equal(deploymentStatus({ availability: hint, model_present: false }).label, "未確認");
+    }
+    assert.equal(deploymentStatus({ availability: "maintenance", model_present: true }), availability.maintenance);
+    assert.equal(deploymentStatus({ availability: "offline", model_present: false }), availability.offline);
+    assert.equal(deploymentStatus({ availability: "model_missing", model_present: false }), availability.model_missing);
 });
 test("revision summary carries model removal and capacity review reasons", () => {
     assert.equal(changeSummary({
@@ -27,32 +29,35 @@ test("revision summary carries model removal and capacity review reasons", () =>
         deployments_changed: false,
         policy_changed: true,
         software_changed: false
-    }), "モデル削除 1 件 / 実行枠・割当ルールの変更");
+    }), "モデル削除 1 件 / 同時接続数・割当ルールの変更");
 });
 
-test("gateway status separates connected responses from upstream settlement after Desktop stops", () => {
+test("gateway status reports current Hub communications without claiming provider execution state", () => {
     const gateway: NonNullable<Snapshot["gateway"]> = { enabled: true, ready: true, uncertain: false,
         responding: 1, draining: 0, running: 1, reserved: 0, quarantined_pools: [], scope: "gateway_requests_only" };
-    assert.equal(gatewayStatus(gateway).label, "応答中 1 件 / 上流終了確認待ち 0 件 / 予約 0 件");
-    const stopped = gatewayStatus({ ...gateway, responding: 0, draining: 1 });
-    assert.equal(stopped.label, "応答中 0 件 / 上流終了確認待ち 1 件 / 予約 0 件");
-    assert.match(stopped.detail, /接続先の処理終了を確認するまで/);
-    assert.equal(stopped.attention, true);
+    assert.equal(gatewayStatus(gateway).label, "中継中 1 件 / 予約 0 件");
+    const closing = gatewayStatus({ ...gateway, responding: 0, draining: 1, reserved: 2 });
+    assert.equal(closing.label, "中継中 1 件 / 予約 2 件");
+    assert.match(closing.detail, /ホスト側/);
+    assert.equal(closing.attention, false);
     assert.equal(gatewayStatus({ ...gateway, responding: 0, running: 0 }).attention, false);
 });
 
-test("unavailable gateway observations and uncertain pools never imply free capacity", () => {
+test("unavailable gateway observation is a Hub communication error and stopped state needs no provider acknowledgement", () => {
     const gateway: NonNullable<Snapshot["gateway"]> = { enabled: true, ready: false, uncertain: true,
         responding: null, draining: null, running: null, reserved: 0, quarantined_pools: [], scope: "gateway_requests_only" };
-    assert.equal(gatewayStatus(gateway).label, "実行状態を確認できません");
-    assert.match(gatewayStatus({ ...gateway, responding: 0, draining: 0, running: 0, quarantined_pools: ["gpu"] }).detail, /グループ 1 件.*保留/);
-    assert.equal(gatewayStatus({ ...gateway, enabled: false }).label, "実行を保留中");
-    assert.equal(gatewayStatus(undefined).label, "モデル実行は停止中");
+    assert.equal(gatewayStatus(gateway).label, "Hub の中継状態を確認できません");
+    assert.match(gatewayStatus(gateway).detail, /中継プロセスとの通信/);
+    assert.equal(gatewayStatus(gateway).attention, true);
+    assert.equal(gatewayStatus({ ...gateway, enabled: false }).label, "Hub のモデル中継は停止中");
+    assert.equal(gatewayStatus({ ...gateway, enabled: false }).attention, false);
+    assert.equal(gatewayStatus({ ...gateway, enabled: false, stopping: true }).label, "Hub のモデル中継を停止中");
+    assert.equal(gatewayStatus(undefined).label, "Hub のモデル中継は停止中");
 });
 
-test("load counts show unknown separately without inferring readiness from other states", () => {
-    assert.deepEqual(loadCounts([{availability:"unknown"}, {availability:"offline"}, {availability:"jit_pending"}, {availability:"model_missing"}, {availability:"maintenance"}]), {ready:0, unknown:1});
-    assert.deepEqual(loadCounts([{availability:"ready"}, {availability:"unknown"}]), {ready:1, unknown:1});
+test("model counts report catalog presence without inferring loaded model counts", () => {
+    assert.deepEqual(modelCounts([{model_present:true}, {model_present:false}, {model_present:true}]), {present:2, unconfirmed:1});
+    assert.deepEqual(modelCounts([]), {present:0, unconfirmed:0});
     assert.equal(capabilityLabel("tools"), "ツール利用");
     assert.equal(capabilityLabel("custom_capability"), "custom_capability");
 });

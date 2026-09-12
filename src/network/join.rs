@@ -96,6 +96,27 @@ impl JoinRequest {
 }
 
 impl DeviceNetwork {
+    pub(super) fn pending_label_conflicts(
+        store: &Store,
+        key: &str,
+        request_id: Option<&str>,
+        now: u64,
+    ) -> bool {
+        store.join_requests.values().any(|request| {
+            request.expires_at_ms > now
+                && Some(request.request_id.as_str()) != request_id
+                && Self::label_key(&request.label) == key
+        })
+    }
+    pub(super) fn reject_registered_key(&self, csr: &str, ip: IpAddr) -> Result<()> {
+        let key = key_hash(&parsed(csr, ip)?);
+        for device in self.store.devices.values() {
+            if same_hash(&certificate_key_hash(&device.certificate_pem)?, &key) {
+                return Err(NetworkError::JoinSuperseded);
+            }
+        }
+        Ok(())
+    }
     pub(super) fn validate_joins(store: &Store) -> Result<()> {
         if store.join_requests.len() > JOIN_LIMIT {
             return Err(NetworkError::Full);
@@ -142,6 +163,9 @@ impl DeviceNetwork {
         for device in self.store.devices.values() {
             if let Some(approval) = &device.join_approval {
                 if same_hash(&approval.request.key_sha256, &key_sha256) {
+                    if device.deleted_at_ms.is_some() {
+                        return Err(NetworkError::Revoked);
+                    }
                     if approval.request.csr_pem == csr && approval.request.observed_ip == ip {
                         return Ok(approval.request.receipt(self.hub_id()));
                     }
@@ -174,6 +198,8 @@ impl DeviceNetwork {
             store
                 .join_requests
                 .retain(|_, old| old.expires_at_ms > now && old.key_sha256 != key_sha256);
+            let mut request = request.clone();
+            request.label = Self::available_label(store, &request.label, None, None, now)?;
             if store.join_requests.len() >= JOIN_LIMIT
                 || store
                     .join_requests
@@ -283,9 +309,10 @@ impl DeviceNetwork {
         )?;
         let fingerprint = pki::fingerprint(&certificate)?;
         self.edit(expected, |store| {
-            if store.devices.len() >= DEVICE_LIMIT {
+            if Self::registered_count(store) >= DEVICE_LIMIT {
                 return Err(NetworkError::Full);
             }
+            let label = Self::available_label(store, &label, None, Some(id), now)?;
             store
                 .join_requests
                 .remove(id)
@@ -297,6 +324,7 @@ impl DeviceNetwork {
                     label,
                     groups,
                     revoked: false,
+                    deleted_at_ms: None,
                     stopped: false,
                     admission_revision: store.revision.checked_add(1).ok_or(NetworkError::Full)?,
                     certificate_pem: certificate,
@@ -319,6 +347,7 @@ impl DeviceNetwork {
             "request_id":r.request_id,"label":r.label,"observed_ip":r.observed_ip,"key_sha256":r.key_sha256,
             "created_at_ms":r.created_at_ms,"expires_at_ms":r.expires_at_ms,
             "status":if r.expires_at_ms>now {"pending"} else {"expired"}
+            ,"name_conflict":Self::label_conflicts(&self.store, &r.label, None, Some(&r.request_id), now)
         })).collect()
     }
 }

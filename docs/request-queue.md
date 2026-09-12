@@ -1,0 +1,11 @@
+# モデル要求の待ち順序
+
+Hubの `/v1/requests/prepare` は、認証済みclient・context・turn・request IDを単位に、実行可能な要求からFIFOで準備します。同じ要求の再問い合わせでは順番を取り直しません。既に返したpermitの確認も、新しい要求として数えません。Gatewayが現在の通信数を理由に準備を拒否した場合、未使用のcore permitだけを撤回し、待ち順序は保持します。
+
+待ち順序はHubCoreの単一のrequest queueが所有します。従来のturnの待機・lease・purposeは同じRouteContextのままで、queueには要求の識別子と最終問い合わせ時刻だけを持ちます。本文、providerのGPUメモリ、生成中プロセスはqueueに保持しません。Gatewayが準備を受け付けるとその要求をqueueから除きます。Gateway自身が現在の中継通信を終端まで数える契約は変更しません。
+
+先行要求が使えるcapacity poolとglobal枠を考慮して、後から問い合わせた同じ枠の要求による追い越しを防ぎます。先行要求のモデルが未接続・停止中、またはpoolが満杯でも、別の実行可能なpoolとglobal枠があれば後続は進めます。先行要求と後続が両方収まる場合も、後続の別poolを空けたまま待たせません。選択されていないモデルには切り替えず、active turnのleaseも移送しません。
+
+待ちqueueは最大4096件です。取消・turn終了・client切断で該当要求を取り除き、catalog revision変更で旧確認の待ち順序を破棄します。端末のheartbeat失効、選択のreview失効、turnの失効でも無効になります。個別要求の再問い合わせが `heartbeat_stale_ms`（既定30秒）以上途絶えた場合は、Desktopのheartbeatだけが生きていてもその順位を解放します。再問い合わせは有効な既存turnであれば末尾から始めます。端末側は従来どおり `retry_after_ms`（1秒）に従います。
+
+このqueueはメモリ内の通信準備順序で、Hub再起動後には復元しません。実モデルのGPU負荷・モデルのload/unload・生成の完了判定はoMLX/LM Studioなどのproviderが所有します。queueの順序やcoreの期限を、providerが生成を停止した証拠として扱いません。

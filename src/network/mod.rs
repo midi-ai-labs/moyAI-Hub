@@ -4,6 +4,7 @@ pub mod api;
 mod authority;
 pub mod history;
 mod join;
+mod registry;
 pub use authority::Terminal;
 use authority::{Authority, Ledger};
 pub use join::JoinReceipt;
@@ -25,6 +26,8 @@ use std::{
 pub type SharedNetwork = Arc<Mutex<DeviceNetwork>>;
 pub type Result<T> = std::result::Result<T, NetworkError>;
 const DEVICE_LIMIT: usize = 128;
+const DELETED_DEVICE_LIMIT: usize = 1024;
+const DEVICE_RECORD_LIMIT: usize = DEVICE_LIMIT + DELETED_DEVICE_LIMIT;
 // Each action has a separate bounded allowance. Routine observation cannot
 // consume the capacity needed to cancel already-authorized work.
 const GRANT_LIMIT: usize = 4096;
@@ -36,6 +39,10 @@ const PRESENCE_MS: u64 = 30_000;
 pub enum NetworkError {
     #[error("invalid_request")]
     InvalidRequest,
+    #[error("device_name_conflict")]
+    DeviceNameConflict,
+    #[error("device_work_unsettled")]
+    DeviceWorkUnsettled,
     #[error("invalid_csr")]
     InvalidCsr,
     #[error("invalid_endpoint")]
@@ -108,6 +115,7 @@ struct Device {
     label: String,
     groups: BTreeSet<String>,
     revoked: bool,
+    deleted_at_ms: Option<u64>,
     stopped: bool,
     admission_revision: u64,
     certificate_pem: String,
@@ -357,11 +365,27 @@ impl DeviceNetwork {
                     device.insert("join_approval".into(), serde_json::Value::Null);
                 }
             }
+            if value["schema_version"] == 3 {
+                let fields = value.as_object_mut().ok_or(NetworkError::InvalidRequest)?;
+                fields.insert("schema_version".into(), 4.into());
+                for device in fields
+                    .get_mut("devices")
+                    .and_then(serde_json::Value::as_object_mut)
+                    .ok_or(NetworkError::InvalidRequest)?
+                    .values_mut()
+                {
+                    let device = device.as_object_mut().ok_or(NetworkError::InvalidRequest)?;
+                    if device.contains_key("deleted_at_ms") {
+                        return Err(NetworkError::InvalidRequest);
+                    }
+                    device.insert("deleted_at_ms".into(), serde_json::Value::Null);
+                }
+            }
             serde_json::from_value::<Store>(value).map_err(|_| NetworkError::InvalidRequest)?
         } else {
             let (ca, key) = pki::create_ca(hub_id)?;
             Store {
-                schema_version: 3,
+                schema_version: 4,
                 hub_id: hub_id.into(),
                 revision: 1,
                 ca_certificate_pem: ca,
@@ -375,10 +399,21 @@ impl DeviceNetwork {
                 join_requests: BTreeMap::new(),
             }
         };
-        if store.schema_version != 3
+        if store.schema_version != 4
             || store.hub_id != hub_id
             || store.revision == 0
-            || store.devices.len() > DEVICE_LIMIT
+            || store.devices.len() > DEVICE_RECORD_LIMIT
+            || Self::registered_count(&store) > DEVICE_LIMIT
+            || store
+                .devices
+                .values()
+                .filter(|device| device.deleted_at_ms.is_some())
+                .count()
+                > DELETED_DEVICE_LIMIT
+            || store.devices.values().any(|device| {
+                device.deleted_at_ms.is_some()
+                    && (!device.revoked || !device.stopped || !device.groups.is_empty())
+            })
             || store.groups.len() > 64
             || store.rules.len() > 1024
             || store.invitations.len() > DEVICE_LIMIT
@@ -515,12 +550,15 @@ impl DeviceNetwork {
         let expires_at_ms = now.saturating_add(600_000);
         self.edit(expected, |store| {
             store.invitations.retain(|i| i.expires_at_ms > now);
-            if store.invitations.len() >= DEVICE_LIMIT || store.devices.len() >= DEVICE_LIMIT {
+            if store.invitations.len() >= DEVICE_LIMIT
+                || Self::registered_count(store) >= DEVICE_LIMIT
+            {
                 return Err(NetworkError::Full);
             }
-            if !text_ok(&label, 256) || !Self::groups_valid(store, &groups) {
+            if !text_ok(label.trim(), 256) || !Self::groups_valid(store, &groups) {
                 return Err(NetworkError::InvalidRequest);
             }
+            let label = Self::available_label(store, &label, None, None, now)?;
             store.invitations.push(Invitation {
                 hash: hash(&code),
                 label,
@@ -560,9 +598,21 @@ impl DeviceNetwork {
         revoked: bool,
     ) -> Result<()> {
         self.edit(expected, |store| {
-            if !text_ok(&label, 256) || !Self::groups_valid(store, &groups) {
+            if !text_ok(label.trim(), 256) || !Self::groups_valid(store, &groups) {
                 return Err(NetworkError::InvalidRequest);
             }
+            let old = store
+                .devices
+                .get(id)
+                .filter(|device| device.deleted_at_ms.is_none())
+                .ok_or(NetworkError::InvalidRequest)?;
+            // Existing duplicates stay addressable; saving the same name does
+            // not prevent an administrator from editing unrelated settings.
+            let label = if Self::label_key(&old.label) == Self::label_key(&label) {
+                label.trim().to_string()
+            } else {
+                Self::available_label(store, &label, Some(id), None, crate::service::now_ms())?
+            };
             let device = store
                 .devices
                 .get_mut(id)
@@ -612,7 +662,10 @@ impl DeviceNetwork {
         self.edit(expected, |store| {
             for subject in [&rule.from, &rule.to] {
                 let exists = match subject {
-                    Subject::Device { id } => store.devices.contains_key(id),
+                    Subject::Device { id } => store
+                        .devices
+                        .get(id)
+                        .is_some_and(|device| device.deleted_at_ms.is_none()),
                     Subject::Group { id } => store.groups.contains_key(id),
                 };
                 if !exists {
@@ -671,9 +724,10 @@ impl DeviceNetwork {
             }
             return self.receipt(&replay.device_id);
         }
-        if self.store.devices.len() >= DEVICE_LIMIT {
+        if Self::registered_count(&self.store) >= DEVICE_LIMIT {
             return Err(NetworkError::Full);
         }
+        self.reject_registered_key(csr, ip)?;
         let id = ulid::Ulid::new().to_string();
         let cert = pki::sign_device(
             &self.store.ca_certificate_pem,
@@ -689,6 +743,7 @@ impl DeviceNetwork {
             label: invitation.label,
             groups: invitation.groups,
             revoked: false,
+            deleted_at_ms: None,
             stopped: false,
             admission_revision: self
                 .store
@@ -703,6 +758,7 @@ impl DeviceNetwork {
             join_approval: None,
         };
         self.edit(&self.revision(), |store| {
+            Self::available_label(store, &device.label, None, None, now)?;
             store.invitations[index].redeemed = Some(EnrollmentReplay {
                 device_id: id.clone(),
                 csr_sha256: hash(csr),
@@ -1627,17 +1683,21 @@ impl DeviceNetwork {
         )
     }
     pub fn snapshot(&self, now: u64) -> serde_json::Value {
-        let devices:Vec<_>=self.store.devices.values().map(|d| {
+        let devices:Vec<_>=self.store.devices.values().filter(|d| d.deleted_at_ms.is_none()).map(|d| {
             let p=self.presence.get(&d.device_id);
             serde_json::json!({"device_id":d.device_id,"label":d.label,"groups":d.groups,"revoked":d.revoked,
                 "admission":if d.revoked {"revoked"} else if d.stopped {"stopped"} else {"allowed"},
                 "certificate_sha256":d.certificate_sha256,"expires_at_ms":d.expires_at_ms,
+                "name_conflict":Self::label_conflicts(&self.store, &d.label, Some(&d.device_id), None, now),
+                "unsettled_jobs":self.unsettled_device_jobs(&d.device_id),
+                "registered_ip":d.certificate_ip,
                 "last_seen_ms":p.map(|p|p.last_seen_ms),"observed_ip":p.and_then(|p|p.observed_ip),
                 "online":!d.revoked&&d.expires_at_ms>now&&p.is_some_and(|p|now.saturating_sub(p.last_seen_ms)<=PRESENCE_MS),
                 "publications":p.map(|p|p.publications.values().cloned().collect::<Vec<_>>()).unwrap_or_default()})
         }).collect();
         serde_json::json!({"revision":self.revision(),"gateway_port":self.gateway_port(),"hub_id":self.hub_id(),"ca_certificate_pem":self.ca_certificate(),
             "ca_sha256":pki::fingerprint(self.ca_certificate()).ok(),"devices":devices,
+            "deleted_devices":self.store.devices.values().filter_map(|d| d.deleted_at_ms.map(|time| serde_json::json!({"device_id":d.device_id,"label":d.label,"deleted_at_ms":time}))).collect::<Vec<_>>(),
             "groups":self.store.groups.values().collect::<Vec<_>>(),"rules":self.store.rules.values().collect::<Vec<_>>(),"join_requests":self.pending_joins(now)})
     }
 }

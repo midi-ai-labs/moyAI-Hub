@@ -1,0 +1,103 @@
+name: Hub GUI automation
+
+on:
+  pull_request:
+    # Keep runtime, config, build and browser harness changes covered.
+    paths-ignore:
+      - 'docs/**'
+      - 'README.md'
+      - 'LICENSE'
+  push:
+    paths-ignore:
+      - 'docs/**'
+      - 'README.md'
+      - 'LICENSE'
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Browser automation suite (visual review remains separate)
+        type: choice
+        required: true
+        default: smoke
+        options:
+          - smoke
+          - regression
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hub-gui-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  gui:
+    name: Hub automated browser checks
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      GUI_SUITE: ${{ inputs.suite || 'smoke' }}
+      MOYAI_HUB_BROWSER_CHANNEL: msedge
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Locate isolated CI evidence
+        id: evidence
+        run: |
+          $artifactParent = [IO.Path]::GetFullPath((Join-Path (Split-Path $env:GITHUB_WORKSPACE -Parent) 'project_sandbox/gui-ci'))
+          "artifact_parent=$artifactParent" >> $env:GITHUB_OUTPUT
+
+      - name: Check browser dependencies
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Get-Command pwsh.exe -ErrorAction Stop | Out-Null
+          # Hub uses the installed Edge browser, not the Desktop WebView2 Runtime.
+          $edgeCandidates = @(
+            (Join-Path ${env:ProgramFiles(x86)} 'Microsoft/Edge/Application/msedge.exe'),
+            (Join-Path $env:ProgramFiles 'Microsoft/Edge/Application/msedge.exe')
+          )
+          $edge = $edgeCandidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+          if (-not $edge) { throw 'Microsoft Edge is missing from this Windows runner.' }
+          Write-Output "Microsoft Edge: $((Get-Item -LiteralPath $edge).VersionInfo.ProductVersion)"
+
+      - name: Select stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustc --version
+          cargo --version
+
+      - name: Install locked JavaScript dependencies
+        run: npm ci
+
+      - name: Verify unit tests, build and actual browser automation
+        env:
+          GUI_ARTIFACT_PARENT: ${{ steps.evidence.outputs.artifact_parent }}
+        run: |
+          npm run verify:gui -- --suite $env:GUI_SUITE --artifact-parent $env:GUI_ARTIFACT_PARENT --headless
+          exit $LASTEXITCODE
+
+      - name: Upload public summaries only
+        if: ${{ always() && steps.evidence.outputs.artifact_parent != '' }}
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: hub-gui-public-summary-${{ github.run_id }}-${{ github.run_attempt }}
+          # Raw Playwright reports/traces and hub-data can contain test credentials
+          # and CA private keys. Only the runner's allowlisted summary is public.
+          path: ${{ steps.evidence.outputs.artifact_parent }}/**/public-summary.json
+          if-no-files-found: warn
+          retention-days: 14
+          include-hidden-files: false

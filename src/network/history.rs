@@ -165,7 +165,7 @@ pub struct HistorySubmission {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HistoryStatus {
     Pending,
@@ -174,7 +174,7 @@ pub enum HistoryStatus {
     Expired,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HistorySnapshot {
     pub request_id: String,
     pub device_id: String,
@@ -236,7 +236,8 @@ impl HistoryBroker {
 }
 
 impl DeviceNetwork {
-    /// Only the local Tauri administrator calls this method. No HTTP admin route exists.
+    /// Queue a device history query through the shared server management owner.
+    /// The device returns its result over its authenticated network connection.
     pub fn request_history(
         &mut self,
         device_id: &str,

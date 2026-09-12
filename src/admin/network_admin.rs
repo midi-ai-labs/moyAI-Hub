@@ -1,6 +1,6 @@
 use super::*;
-use moyai_hub::network::{self, DeviceNetwork, Effect, NetworkError, Rule, Subject, Usage};
-use std::{collections::BTreeSet, net::IpAddr};
+use crate::network::{self, DeviceNetwork, Effect, NetworkError, Rule, Subject, Usage};
+use std::collections::BTreeSet;
 
 pub(super) struct NetworkServer {
     bind: String,
@@ -17,6 +17,8 @@ fn message(error: NetworkError) -> String {
         NetworkError::Revoked => "失効した端末は元に戻せません。新しい鍵での参加申請が必要です。",
         NetworkError::Full => "登録または許可の上限に達しています。",
         NetworkError::InvalidRequest => "入力内容と対象を確認してください。",
+        NetworkError::DeviceNameConflict => "同じ端末名が登録または申請されています。前後の空白・大文字小文字を変えるだけでは区別できません。別の端末名を入力してください。",
+        NetworkError::DeviceWorkUnsettled => "この端末に関係する受入済みタスクの終了を確認できないため削除できません。Desktopで停止または完了を確認し、最新情報を取得してから再試行してください。オフラインだけでは完了と判断しません。",
         _ => "端末設定を処理できませんでした。元の設定は保持されています。",
     }
     .into()
@@ -44,16 +46,15 @@ fn history_message(error: NetworkError) -> String {
     .into()
 }
 
-#[tauri::command]
 pub(super) fn hub_history_request(
-    admin: State<'_, Admin>,
+    admin: &Admin,
     device_id: String,
     direction: network::history::HistoryDirection,
     offset: usize,
     anchor: Option<String>,
     id: Option<String>,
 ) -> Result<network::history::HistorySnapshot, String> {
-    owner(&admin)?
+    owner(admin)?
         .request_history(
             &device_id,
             network::history::HistoryQuery {
@@ -67,74 +68,18 @@ pub(super) fn hub_history_request(
         .map_err(history_message)
 }
 
-#[tauri::command]
 pub(super) fn hub_history_result(
-    admin: State<'_, Admin>,
+    admin: &Admin,
     request_id: String,
 ) -> Result<network::history::HistorySnapshot, String> {
-    owner(&admin)?
+    owner(admin)?
         .history_result(&request_id, now_ms())
         .map_err(history_message)
 }
 
-#[tauri::command]
-pub(super) async fn hub_history_export(
-    admin: State<'_, Admin>,
-    request_id: String,
-) -> Result<Option<String>, String> {
-    use std::io::Write;
-    let snapshot = owner(&admin)?
-        .history_result(&request_id, now_ms())
-        .map_err(history_message)?;
-    let Some(network::history::HistoryResponse::Detail(detail)) = snapshot.response else {
-        return Err("履歴の詳細を取得してから保存してください。".into());
-    };
-    let filename = format!("moyai-mcp-{}.md", detail.row.id);
-    let selected = tokio::task::spawn_blocking(move || {
-        rfd::FileDialog::new()
-            .set_title("MCP履歴を新しいMarkdownファイルへ保存")
-            .add_filter("Markdown", &["md"])
-            .set_file_name(filename)
-            .save_file()
-    })
-    .await
-    .map_err(|_| "保存先を選択できません。".to_string())?;
-    let Some(selected) = selected else {
-        return Ok(None);
-    };
-    // Snapshots never change after settlement. Still require the exact request
-    // to be retained after the native dialog, before writing a file.
-    owner(&admin)?
-        .history_result(&request_id, now_ms())
-        .map_err(history_message)?;
-    let markdown = format!(
-        "# Hubから取得したMCP履歴\n\n- 端末: {}\n- 端末ID: `{}`\n- 取得日時（Unix ms）: {}\n- 取得済みのスナップショットです。現在の実行状態を保証しません。\n\n{}",
-        snapshot.device_label.replace(['\r', '\n'], " "),
-        snapshot.device_id,
-        snapshot.completed_at_ms.unwrap_or(snapshot.requested_at_ms),
-        detail.markdown
-    );
-    let saved = selected.to_string_lossy().into_owned();
-    tokio::task::spawn_blocking(move || {
-        let parent = selected.parent().ok_or("保存先を確認してください。")?;
-        let mut file = tempfile::NamedTempFile::new_in(parent)
-            .map_err(|_| "保存先にファイルを作成できません。")?;
-        file.write_all(markdown.as_bytes())
-            .and_then(|_| file.as_file().sync_all())
-            .map_err(|_| "履歴を書き込めません。")?;
-        file.persist_noclobber(selected)
-            .map_err(|_| "保存できません。同名ファイルがある場合は別の名前を選んでください。")?;
-        Ok::<_, &str>(())
-    })
-    .await
-    .map_err(|_| "履歴を保存できません。".to_string())?
-    .map_err(str::to_owned)?;
-    Ok(Some(saved))
-}
-#[tauri::command]
-pub(super) async fn hub_network_snapshot(admin: State<'_, Admin>) -> Result<Value, String> {
+pub(super) async fn hub_network_snapshot(admin: &Admin) -> Result<Value, String> {
     let server = admin.network_server.lock().await;
-    let mut value = owner(&admin)?.snapshot(now_ms());
+    let mut value = owner(admin)?.snapshot(now_ms());
     let certificate = server
         .as_ref()
         .map(|server| server.runtime.certificate())
@@ -142,20 +87,23 @@ pub(super) async fn hub_network_snapshot(admin: State<'_, Admin>) -> Result<Valu
         .map_err(message)?;
     value["server"] = json!({"running":server.as_ref().is_some_and(|s|!s.task.is_finished()),"bind":server.as_ref().map(|s|&s.bind),
         "gateway_bind":server.as_ref().and_then(|s|s.runtime.gateway_endpoint()),"certificate":certificate});
+    value["hosting"] = admin
+        .network_hosting
+        .lock()
+        .map_err(|_| "ネットワーク起動設定を開けません。")?
+        .snapshot();
     Ok(value)
 }
-#[tauri::command]
 pub(super) fn hub_network_settings(
-    admin: State<'_, Admin>,
+    admin: &Admin,
     expected_revision: String,
     gateway_port: u16,
 ) -> Result<(), String> {
-    owner(&admin)?
+    owner(admin)?
         .set_gateway_port(&expected_revision, gateway_port)
         .map_err(message)
 }
-#[tauri::command]
-pub(super) async fn hub_network_renew_certificate(admin: State<'_, Admin>) -> Result<(), String> {
+pub(super) async fn hub_network_renew_certificate(admin: &Admin) -> Result<(), String> {
     let server = admin.network_server.lock().await;
     let server = server
         .as_ref()
@@ -166,9 +114,8 @@ pub(super) async fn hub_network_renew_certificate(admin: State<'_, Admin>) -> Re
     })?;
     Ok(())
 }
-#[tauri::command]
 pub(super) async fn hub_network_diagnostics(
-    admin: State<'_, Admin>,
+    admin: &Admin,
 ) -> Result<network::server_runtime::NetworkDiagnostics, String> {
     let server = admin.network_server.lock().await;
     let server = server
@@ -177,62 +124,66 @@ pub(super) async fn hub_network_diagnostics(
         .ok_or("端末ネットワークを開始してください。")?;
     server.runtime.diagnostics().await.map_err(message)
 }
-#[tauri::command]
 pub(super) fn hub_network_invite(
-    admin: State<'_, Admin>,
+    admin: &Admin,
     expected_revision: String,
     label: String,
     groups: BTreeSet<String>,
 ) -> Result<Value, String> {
-    owner(&admin)?
+    owner(admin)?
         .invite(&expected_revision, label, groups, now_ms())
         .map_err(message)
 }
-#[tauri::command]
 pub(super) fn hub_network_approve(
-    admin: State<'_, Admin>,
+    admin: &Admin,
     expected_revision: String,
     request_id: String,
     label: String,
     groups: BTreeSet<String>,
 ) -> Result<(), String> {
-    owner(&admin)?
+    owner(admin)?
         .approve_join(&expected_revision, &request_id, label, groups, now_ms())
         .map_err(message)
 }
-#[tauri::command]
 pub(super) fn hub_network_admission(
-    admin: State<'_, Admin>,
+    admin: &Admin,
     expected_revision: String,
     device_id: String,
     stopped: bool,
 ) -> Result<(), String> {
-    owner(&admin)?
+    owner(admin)?
         .set_admission(&expected_revision, &device_id, stopped)
         .map_err(message)
 }
-#[tauri::command]
 pub(super) fn hub_network_group(
-    admin: State<'_, Admin>,
+    admin: &Admin,
     expected_revision: String,
     id: Option<String>,
     label: String,
 ) -> Result<(), String> {
-    owner(&admin)?
+    owner(admin)?
         .set_group(&expected_revision, id, label)
         .map_err(message)
 }
-#[tauri::command]
 pub(super) fn hub_network_device(
-    admin: State<'_, Admin>,
+    admin: &Admin,
     expected_revision: String,
     device_id: String,
     label: String,
     groups: BTreeSet<String>,
     revoked: bool,
 ) -> Result<(), String> {
-    owner(&admin)?
+    owner(admin)?
         .set_device(&expected_revision, &device_id, label, groups, revoked)
+        .map_err(message)
+}
+pub(super) fn hub_network_delete_device(
+    admin: &Admin,
+    expected_revision: String,
+    device_id: String,
+) -> Result<(), String> {
+    owner(admin)?
+        .delete_device(&expected_revision, &device_id, now_ms())
         .map_err(message)
 }
 #[derive(Deserialize)]
@@ -246,13 +197,12 @@ pub(super) struct RuleDraft {
     max_depth: u8,
     profile_id: Option<String>,
 }
-#[tauri::command]
 pub(super) fn hub_network_rule(
-    admin: State<'_, Admin>,
+    admin: &Admin,
     expected_revision: String,
     rule: RuleDraft,
 ) -> Result<(), String> {
-    owner(&admin)?
+    owner(admin)?
         .set_rule(
             &expected_revision,
             Rule {
@@ -267,36 +217,22 @@ pub(super) fn hub_network_rule(
         )
         .map_err(message)
 }
-#[tauri::command]
 pub(super) fn hub_network_delete_rule(
-    admin: State<'_, Admin>,
+    admin: &Admin,
     expected_revision: String,
     id: String,
 ) -> Result<(), String> {
-    owner(&admin)?
+    owner(admin)?
         .delete_rule(&expected_revision, &id)
         .map_err(message)
 }
 
-#[tauri::command]
 pub(super) async fn hub_network_start(
-    admin: State<'_, Admin>,
+    admin: &Arc<Admin>,
     bind: String,
     advertise_ip: String,
 ) -> Result<(), String> {
-    let address: SocketAddr = bind
-        .parse()
-        .map_err(|_| "待受先を IP:port で指定してください。")?;
-    let public_ip: IpAddr = advertise_ip
-        .parse()
-        .map_err(|_| "接続先へ案内する具体的な IP アドレスを指定してください。")?;
-    if address.port() == 0
-        || public_ip.is_unspecified()
-        || public_ip.is_multicast()
-        || (!address.ip().is_unspecified() && address.ip() != public_ip)
-    {
-        return Err("待受先と案内する IP アドレスを確認してください。".into());
-    }
+    let settings = network_hosting::Settings::new(&bind, &advertise_ip)?;
     let mut network_server = admin.network_server.lock().await;
     if network_server
         .as_ref()
@@ -304,12 +240,41 @@ pub(super) async fn hub_network_start(
     {
         return Err("端末ネットワークはすでに起動しています。".into());
     }
+    start_network(admin, &mut network_server, settings, true).await
+}
+
+pub(super) async fn hub_network_start_saved(admin: &Arc<Admin>) -> Result<(), String> {
+    // Keep the existing lifetime owner locked through lookup and start. Parallel
+    // launch clicks see the running instance rather than replace its listeners.
+    let mut network_server = admin.network_server.lock().await;
+    if network_server
+        .as_ref()
+        .is_some_and(|server| !server.task.is_finished())
+    {
+        return Ok(());
+    }
+    let settings = admin
+        .network_hosting
+        .lock()
+        .map_err(|_| "ネットワーク起動設定を開けません。")?
+        .configured()?;
+    start_network(admin, &mut network_server, settings, false).await
+}
+
+async fn start_network(
+    admin: &Arc<Admin>,
+    network_server: &mut Option<NetworkServer>,
+    settings: network_hosting::Settings,
+    save_on_start: bool,
+) -> Result<(), String> {
+    let address = settings.bind;
+    let public_ip = settings.advertise_ip;
     let mut server = admin.server.lock().await;
     if server.is_some() {
         return Err("モデルサーバーを停止してから端末ネットワークを開始してください。必要な Gateway も一緒に起動します。".into());
     }
     let (certificate, key, ca, gateway_port) = {
-        let mut network = owner(&admin)?;
+        let mut network = owner(admin)?;
         network.reset_runtime();
         let (cert, key) = network
             .server_certificate(public_ip, now_ms())
@@ -364,6 +329,28 @@ pub(super) async fn hub_network_start(
         metadata_endpoint.clone(),
         public_ip,
     );
+    // All fallible startup preparation is complete, including bound listeners
+    // and the ready Gateway. Publish the config before spawning their tasks;
+    // a failed atomic replacement leaves the old config and no new service.
+    if save_on_start {
+        let saved = admin
+            .network_hosting
+            .lock()
+            .map_err(|_| "ネットワーク起動設定を開けません。".to_string())
+            .and_then(|mut hosting| hosting.save(settings));
+        if let Err(error) = saved {
+            let stopped = gateway.stop().await;
+            drop(listener);
+            drop(local);
+            return Err(if stopped {
+                format!("{error} ネットワークの起動を取り消しました。")
+            } else {
+                format!(
+                    "{error} Hubの中継プロセスの終了を確認できません。Hubを再起動してください。"
+                )
+            });
+        }
+    }
     let local_router = service::router_with_registered_gateway(
         admin.core.clone(),
         format!("{}{}", ulid::Ulid::new(), ulid::Ulid::new()),
@@ -431,27 +418,27 @@ pub(super) async fn stop_network(admin: &Admin) -> Result<(), String> {
     if let Some(mut server) = owner.take() {
         server.renewal.abort();
         let _ = server.renewal.await;
-        // Admission stops before bounded gateway drain; upstream ownership remains
-        // with the existing companion until settlement or its uncertainty marker.
+        // Close admission before canceling this Hub's model relay connections.
+        // Provider processes and accepted remote jobs have their own lifecycle.
         let _ = server.stop.send(());
         admin
             .network
             .lock()
             .map_err(|_| "端末設定を開けません。")?
             .reset_runtime();
-        super::stop_server(admin).await?;
+        let gateway_result = super::stop_server(admin).await;
         if tokio::time::timeout(std::time::Duration::from_secs(2), &mut server.task)
             .await
             .is_err()
         {
             server.task.abort();
         }
+        gateway_result?;
     }
     Ok(())
 }
-#[tauri::command]
-pub(super) async fn hub_network_stop(admin: State<'_, Admin>) -> Result<(), String> {
-    stop_network(&admin).await
+pub(super) async fn hub_network_stop(admin: &Admin) -> Result<(), String> {
+    stop_network(admin).await
 }
 
 fn export_value(admin: &Admin, hub_url: &str) -> Result<Value, String> {
@@ -476,44 +463,6 @@ fn export_value(admin: &Admin, hub_url: &str) -> Result<Value, String> {
     );
     Ok(json!({"toml":toml,"ca_certificate_pem":ca}))
 }
-#[tauri::command]
-pub(super) fn hub_network_export(
-    admin: State<'_, Admin>,
-    hub_url: String,
-) -> Result<Value, String> {
-    export_value(&admin, &hub_url)
-}
-#[tauri::command]
-pub(super) async fn hub_network_save_config(
-    admin: State<'_, Admin>,
-    hub_url: String,
-) -> Result<Option<String>, String> {
-    let value = export_value(&admin, &hub_url)?;
-    let text = value["toml"]
-        .as_str()
-        .ok_or("設定を書き出せません。")?
-        .to_owned();
-    tokio::task::spawn_blocking(move || {
-        let Some(path) = rfd::FileDialog::new()
-            .set_title("Hub 参加設定を保存")
-            .set_file_name("hub-participation.toml")
-            .add_filter("TOML", &["toml"])
-            .save_file()
-        else {
-            return Ok(None);
-        };
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(
-                |_| "既存ファイルへの上書きは行いません。新しいファイル名を指定してください。",
-            )?;
-        file.write_all(text.as_bytes())
-            .and_then(|_| file.sync_all())
-            .map_err(|_| "公開設定を保存できません。")?;
-        Ok(Some(path.to_string_lossy().into_owned()))
-    })
-    .await
-    .map_err(|_| "保存ダイアログを開けません。")?
+pub(super) fn hub_network_export(admin: &Admin, hub_url: String) -> Result<Value, String> {
+    export_value(admin, &hub_url)
 }

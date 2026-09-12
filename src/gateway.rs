@@ -1,8 +1,9 @@
 //! Generation traffic lives in the `--gateway` companion process, never the Hub router.
-//! Reservations expire; claimed requests hold capacity until upstream terminal settlement.
+//! Capacity covers this Gateway's HTTP requests, never the provider's execution lifecycle.
+use crate::provider::{GenerationApi, ProviderProfile};
 use crate::{catalog::Deployment, protocol::ExecutionPermit, service::now_ms};
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::{Body, Bytes},
     extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, StatusCode},
@@ -12,7 +13,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     io,
     pin::Pin,
     sync::{Arc, Mutex},
@@ -24,7 +25,7 @@ use tokio::sync::{Notify, mpsc, oneshot};
 const REQUEST_LIMIT: usize = 8 * 1024 * 1024;
 const RESPONSE_LIMIT: usize = 64 * 1024 * 1024;
 const UPSTREAM_INACTIVITY: Duration = Duration::from_secs(300);
-const DRAIN_DEADLINE: Duration = Duration::from_secs(305);
+const DRAIN_DEADLINE: Duration = Duration::from_secs(2);
 
 fn upstream_client(inactivity: Duration) -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
@@ -54,7 +55,6 @@ enum Phase {
     Reserved,
     Running,
     Settled,
-    Uncertain,
 }
 struct Record {
     grant: Grant,
@@ -63,10 +63,10 @@ struct Record {
     // Observe the existing response channel without keeping the stream open or
     // independently owning a second execution/stop state.
     downstream: Option<mpsc::WeakSender<Result<Bytes, io::Error>>>,
+    cancel: Option<oneshot::Sender<()>>,
 }
 struct Registry {
     grants: BTreeMap<String, Record>,
-    quarantined: BTreeSet<String>,
     accepting: bool,
 }
 
@@ -122,7 +122,6 @@ impl Gateway {
         Ok(Arc::new(Self {
             registry: Mutex::new(Registry {
                 grants: BTreeMap::new(),
-                quarantined: BTreeSet::new(),
                 accepting: true,
             }),
             control_token,
@@ -143,13 +142,27 @@ impl Gateway {
                     .post(update_tls)
                     .layer(DefaultBodyLimit::max(48 * 1024)),
             )
-            .route("/r/{permit_id}/v1/chat/completions", post(generate))
+            .route(
+                "/r/{permit_id}/v1/chat/completions",
+                post(generate).layer(Extension(GenerationApi::ChatCompletions)),
+            )
+            .route(
+                "/r/{permit_id}/v1/responses",
+                post(generate).layer(Extension(GenerationApi::Responses)),
+            )
             .layer(DefaultBodyLimit::max(REQUEST_LIMIT))
             .with_state(self)
     }
     pub fn network_router(self: Arc<Self>) -> Router {
         Router::new()
-            .route("/r/{permit_id}/v1/chat/completions", post(generate))
+            .route(
+                "/r/{permit_id}/v1/chat/completions",
+                post(generate).layer(Extension(GenerationApi::ChatCompletions)),
+            )
+            .route(
+                "/r/{permit_id}/v1/responses",
+                post(generate).layer(Extension(GenerationApi::Responses)),
+            )
             .layer(DefaultBodyLimit::max(REQUEST_LIMIT))
             .with_state(self)
     }
@@ -195,7 +208,7 @@ impl Gateway {
             }
         }
         json!({"accepting":registry.accepting,"reserved":registry.grants.values().filter(|r|r.phase==Phase::Reserved).count(),
-            "running":responding + draining,"responding":responding,"draining":draining,"quarantined_pools":registry.quarantined,
+            "running":responding + draining,"responding":responding,"draining":draining,"quarantined_pools":[],
             "scope":"gateway_requests_only"})
     }
     pub async fn drain(&self) -> bool {
@@ -205,6 +218,9 @@ impl Gateway {
             for record in registry.grants.values_mut() {
                 if record.phase == Phase::Reserved {
                     record.phase = Phase::Settled;
+                }
+                if let Some(cancel) = record.cancel.take() {
+                    let _ = cancel.send(());
                 }
             }
         }
@@ -227,27 +243,18 @@ impl Gateway {
         if tokio::time::timeout(DRAIN_DEADLINE, wait).await.is_err() {
             return false;
         }
-        self.registry.lock().unwrap().quarantined.is_empty()
+        true
     }
-    async fn settled(&self, permit_id: &str, uncertain: bool) {
+    async fn settled(&self, permit_id: &str) {
         {
             let mut registry = self.registry.lock().unwrap();
-            let pool = registry.grants.get_mut(permit_id).map(|record| {
-                record.phase = if uncertain {
-                    Phase::Uncertain
-                } else {
-                    Phase::Settled
-                };
-                record.grant.deployment.capacity_pool_id.clone()
-            });
-            if uncertain {
-                if let Some(pool) = pool {
-                    registry.quarantined.insert(pool);
-                }
+            if let Some(record) = registry.grants.get_mut(permit_id) {
+                record.phase = Phase::Settled;
+                record.cancel = None;
             }
         }
         self.changed.notify_waiters();
-        // A failed metadata callback cannot release this process's capacity early.
+        // The local HTTP future is already gone; this says nothing about provider work.
         let _ = self
             .client
             .post(format!("{}/_gateway/settle", self.hub_url))
@@ -282,13 +289,11 @@ async fn admit(
     }
     if grant.permit.deployment_id != grant.deployment.id
         || grant.permit.logical_model_id != grant.deployment.logical_model_id
+        || grant.permit.provider_profile != grant.deployment.provider_profile
         || grant.pool_limit == 0
         || grant.global_limit == 0
         || grant.permit.expires_at_ms <= now_ms()
-        || !matches!(
-            grant.deployment.provider_profile.as_str(),
-            "openai_compatible_chat" | "lmstudio_chat"
-        )
+        || ProviderProfile::parse(&grant.deployment.provider_profile).is_none()
     {
         return Err(error(StatusCode::BAD_REQUEST, "invalid_grant"));
     }
@@ -298,15 +303,6 @@ async fn admit(
         return Err(error(
             StatusCode::SERVICE_UNAVAILABLE,
             "gateway_unavailable",
-        ));
-    }
-    if registry
-        .quarantined
-        .contains(&grant.deployment.capacity_pool_id)
-    {
-        return Err(error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "gateway_quarantined",
         ));
     }
     if let Some(existing) = registry.grants.get(&grant.permit.id) {
@@ -350,6 +346,7 @@ async fn admit(
             token: secret.clone(),
             phase: Phase::Reserved,
             downstream: None,
+            cancel: None,
         },
     );
     Ok(Json(json!({"state":"ready","request_token":secret})))
@@ -382,13 +379,17 @@ async fn cancel(
                 .turn_id
                 .as_ref()
                 .is_none_or(|id| id == &permit.turn_id)
-            && record.phase == Phase::Reserved
         {
-            record.phase = Phase::Settled;
+            if record.phase == Phase::Reserved {
+                record.phase = Phase::Settled;
+            }
+            if let Some(cancel) = record.cancel.take() {
+                let _ = cancel.send(());
+            }
         }
     }
     Ok(Json(
-        json!({"canceled":true,"running_requests":"drain_until_terminal"}),
+        json!({"canceled":true,"running_requests":"close_gateway_connection"}),
     ))
 }
 async fn status(
@@ -468,6 +469,7 @@ type ResponseHead = Result<(StatusCode, String), ApiError>;
 async fn generate(
     State(gateway): State<Arc<Gateway>>,
     Path(permit_id): Path<String>,
+    Extension(api): Extension<GenerationApi>,
     headers: HeaderMap,
     peer: Option<axum::Extension<axum::extract::ConnectInfo<crate::network::tls::TlsPeer>>>,
     body: Result<Bytes, axum::extract::rejection::BytesRejection>,
@@ -482,18 +484,12 @@ async fn generate(
     };
     let (head_send, head_receive) = oneshot::channel();
     let (send, receive) = mpsc::channel(8);
+    let (cancel, canceled) = oneshot::channel();
     let grant = {
         let mut registry = gateway.registry.lock().unwrap();
         registry.expire(now_ms());
         if !registry.accepting {
             return error(StatusCode::SERVICE_UNAVAILABLE, "gateway_unavailable").into_response();
-        }
-        if registry.grants.get(&permit_id).is_some_and(|record| {
-            registry
-                .quarantined
-                .contains(&record.grant.deployment.capacity_pool_id)
-        }) {
-            return error(StatusCode::SERVICE_UNAVAILABLE, "gateway_quarantined").into_response();
         }
         let Some(record) = registry.grants.get_mut(&permit_id) else {
             return error(StatusCode::UNAUTHORIZED, "unauthorized").into_response();
@@ -512,16 +508,20 @@ async fn generate(
             return error(StatusCode::CONFLICT, "permit_consumed").into_response();
         }
         if body.get("model").and_then(Value::as_str) != Some(&record.grant.permit.logical_model_id)
-            || !body.get("messages").is_some_and(Value::is_array)
+            || ProviderProfile::parse(&record.grant.deployment.provider_profile)
+                .map(ProviderProfile::api)
+                != Some(api)
+            || !valid_generation_body(api, &body)
         {
             return error(StatusCode::BAD_REQUEST, "invalid_request").into_response();
         }
         record.phase = Phase::Running;
         record.downstream = Some(send.downgrade());
+        record.cancel = Some(cancel);
         record.grant.clone()
     };
     body["model"] = json!(grant.deployment.provider_model);
-    tokio::spawn(run_request(gateway, grant, body, head_send, send));
+    tokio::spawn(run_request(gateway, grant, body, head_send, send, canceled));
     match head_receive.await {
         Ok(Ok((status, content_type))) => (
             status,
@@ -537,7 +537,26 @@ async fn generate(
     }
 }
 
-fn upstream_url(endpoint: &str) -> Option<String> {
+fn valid_generation_body(api: GenerationApi, body: &Value) -> bool {
+    match api {
+        GenerationApi::ChatCompletions => body.get("messages").is_some_and(Value::is_array),
+        // The Desktop HTTP Responses adapter sends complete canonical input each
+        // time. Persistent conversations/background work cannot follow the request
+        // permit lifecycle and are not part of this transport contract.
+        GenerationApi::Responses => {
+            body.get("input").is_some_and(Value::is_array)
+                && body.get("instructions").is_some_and(Value::is_string)
+                && body.get("store") == Some(&Value::Bool(false))
+                && body.get("stream") == Some(&Value::Bool(true))
+                && body.get("messages").is_none()
+                && body.get("previous_response_id").is_none()
+                && body.get("conversation").is_none()
+                && body.get("background").is_none()
+        }
+    }
+}
+
+fn upstream_url(endpoint: &str, api: GenerationApi) -> Option<String> {
     let url = reqwest::Url::parse(endpoint).ok()?;
     if !matches!(url.scheme(), "http" | "https")
         || !url.username().is_empty()
@@ -549,23 +568,66 @@ fn upstream_url(endpoint: &str) -> Option<String> {
     }
     let endpoint = endpoint.trim_end_matches('/');
     Some(if endpoint.ends_with("/v1") {
-        format!("{endpoint}/chat/completions")
+        format!("{endpoint}/{}", api.path())
     } else {
-        format!("{endpoint}/v1/chat/completions")
+        format!("{endpoint}/v1/{}", api.path())
     })
 }
 
-#[derive(Default)]
 struct SseTerminal {
+    api: GenerationApi,
     line: Vec<u8>,
+    data: Vec<u8>,
     done: bool,
 }
 impl SseTerminal {
+    fn new(api: GenerationApi) -> Self {
+        Self {
+            api,
+            line: Vec::new(),
+            data: Vec::new(),
+            done: false,
+        }
+    }
     fn feed(&mut self, bytes: &[u8]) -> bool {
         for &byte in bytes {
             if byte == b'\n' {
-                if self.line.strip_suffix(b"\r").unwrap_or(&self.line) == b"data: [DONE]" {
+                let line = self.line.strip_suffix(b"\r").unwrap_or(&self.line);
+                if self.api == GenerationApi::ChatCompletions && line == b"data: [DONE]" {
                     self.done = true;
+                }
+                if self.api == GenerationApi::Responses {
+                    if line.is_empty() {
+                        if let Ok(event) = serde_json::from_slice::<Value>(&self.data) {
+                            let terminal_status = match event.get("type").and_then(Value::as_str) {
+                                Some("response.completed") => Some("completed"),
+                                Some("response.failed") => Some("failed"),
+                                Some("response.incomplete") => Some("incomplete"),
+                                _ => None,
+                            };
+                            if terminal_status.is_some()
+                                && event
+                                    .get("response")
+                                    .and_then(|response| response.get("status"))
+                                    .and_then(Value::as_str)
+                                    == terminal_status
+                            {
+                                // This is an HTTP stream terminal, not a claim that
+                                // provider inference succeeded. Desktop decodes the result.
+                                self.done = true;
+                            }
+                        }
+                        self.data.clear();
+                    } else if let Some(data) = line.strip_prefix(b"data:") {
+                        let data = data.strip_prefix(b" ").unwrap_or(data);
+                        if self.data.len().saturating_add(data.len()).saturating_add(1)
+                            > 1024 * 1024
+                        {
+                            return false;
+                        }
+                        self.data.extend_from_slice(data);
+                        self.data.push(b'\n');
+                    }
                 }
                 self.line.clear();
             } else {
@@ -585,6 +647,7 @@ async fn run_request(
     body: Value,
     head: oneshot::Sender<ResponseHead>,
     send: mpsc::Sender<Result<Bytes, io::Error>>,
+    canceled: oneshot::Receiver<()>,
 ) {
     let permit_id = grant.permit.id.clone();
     let operation = async {
@@ -623,7 +686,13 @@ async fn run_request(
             let _ = head.send(Err(error(status, &code)));
             return false;
         }
-        let Some(url) = upstream_url(&grant.deployment.endpoint) else {
+        let Some(api) =
+            ProviderProfile::parse(&grant.deployment.provider_profile).map(ProviderProfile::api)
+        else {
+            let _ = head.send(Err(error(StatusCode::BAD_GATEWAY, "invalid_provider")));
+            return false;
+        };
+        let Some(url) = upstream_url(&grant.deployment.endpoint, api) else {
             let _ = head.send(Err(error(StatusCode::BAD_GATEWAY, "invalid_provider")));
             return false;
         };
@@ -655,10 +724,11 @@ async fn run_request(
             let _ = head.send(Ok((status, content_type.into())));
         } else {
             // Provider errors can contain internal targets or other diagnostics. Send
-            // only a safe code downstream, but still drain and verify the upstream body.
+            // only a safe code downstream. Drop this HTTP response immediately.
             let _ = head.send(Err(error(status, "provider_rejected")));
+            return false;
         }
-        let mut terminal = SseTerminal::default();
+        let mut terminal = SseTerminal::new(api);
         let mut json_body = Vec::new();
         let mut total = 0_usize;
         loop {
@@ -671,7 +741,7 @@ async fn run_request(
                     if !sse {
                         json_body.extend_from_slice(&bytes);
                     }
-                    // Receiver disappearance is a client Stop, not provider settlement.
+                    // Backpressure and every network await are covered by cancellation below.
                     if status.is_success() {
                         let _ = send.send(Ok(bytes)).await;
                     }
@@ -687,20 +757,25 @@ async fn run_request(
             }
         }
     };
-    let uncertain = operation.await;
-    if uncertain {
-        let _ = send.try_send(Err(io::Error::other(
-            "upstream execution could not be confirmed complete",
-        )));
+    // Dropping the entire operation closes only our upstream HTTP connection. It
+    // does not prove or control model execution on oMLX / LM Studio. Settle after
+    // the future has been dropped, including during headers/read/backpressure.
+    let incomplete = tokio::select! {
+        result = operation => result,
+        _ = canceled => false,
+        _ = send.closed() => false,
+    };
+    if incomplete {
+        let _ = send.try_send(Err(io::Error::other("provider response was incomplete")));
     }
-    gateway.settled(&permit_id, uncertain).await;
+    gateway.settled(&permit_id).await;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn response_channel_closure_and_weak_expiry_do_not_release_or_double_count_execution() {
+    fn response_channel_projection_counts_each_local_request_until_cleanup_once() {
         let gateway = Gateway::new("http://127.0.0.1:9".into(), "test".into()).unwrap();
         let (send, receive) = mpsc::channel(1);
         let grant = Grant {
@@ -740,6 +815,7 @@ mod tests {
                 token: "test".into(),
                 phase: Phase::Running,
                 downstream: Some(send.downgrade()),
+                cancel: None,
             },
         );
         let status = gateway.status();
@@ -839,7 +915,7 @@ mod tests {
     }
     #[test]
     fn terminal_requires_an_exact_sse_line_and_accepts_split_chunks() {
-        let mut terminal = SseTerminal::default();
+        let mut terminal = SseTerminal::new(GenerationApi::ChatCompletions);
         assert!(terminal.feed(b"data: {\"content\":\"data: [DONE]\"}\n\n"));
         assert!(!terminal.done);
         terminal.feed(b"data: [DO");
@@ -847,12 +923,46 @@ mod tests {
         assert!(terminal.done);
     }
     #[test]
+    fn responses_terminal_requires_a_complete_bounded_event_with_matching_status() {
+        let mut terminal = SseTerminal::new(GenerationApi::Responses);
+        assert!(terminal.feed(b"data: [DONE]\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"response.completed\"}\n\n"));
+        assert!(!terminal.done);
+        assert!(terminal.feed(b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"in_progress\"}}\n\n"));
+        assert!(!terminal.done);
+        assert!(terminal.feed(b"event: response.completed\r\ndata: {\"type\":\"response.completed\",\r\ndata: \"response\":{\"status\":\"completed\"}}\r"));
+        assert!(!terminal.done);
+        assert!(terminal.feed(b"\n\r\n"));
+        assert!(terminal.done);
+        for status in ["failed", "incomplete"] {
+            let mut terminal = SseTerminal::new(GenerationApi::Responses);
+            assert!(terminal.feed(format!("data: {{\"type\":\"response.{status}\",\"response\":{{\"status\":\"{status}\"}}}}\n\n").as_bytes()));
+            assert!(
+                terminal.done,
+                "failure is a terminal response, not successful inference"
+            );
+        }
+        let mut terminal = SseTerminal::new(GenerationApi::Responses);
+        assert!(!terminal.feed(&vec![b'x'; 1024 * 1024 + 1]));
+        let mut terminal = SseTerminal::new(GenerationApi::Responses);
+        let line = format!("data: {}\n", "x".repeat(512 * 1024));
+        assert!(terminal.feed(line.as_bytes()));
+        assert!(!terminal.feed(line.as_bytes()));
+    }
+    #[test]
     fn target_normalization_rejects_credential_and_query_handoff() {
         assert_eq!(
-            upstream_url("http://127.0.0.1:8119/v1/").unwrap(),
+            upstream_url("http://127.0.0.1:8119/v1/", GenerationApi::ChatCompletions).unwrap(),
             "http://127.0.0.1:8119/v1/chat/completions"
         );
-        assert!(upstream_url("http://secret@localhost:8119").is_none());
-        assert!(upstream_url("http://localhost:8119?secret=x").is_none());
+        assert_eq!(
+            upstream_url("http://127.0.0.1:1234", GenerationApi::Responses).unwrap(),
+            "http://127.0.0.1:1234/v1/responses"
+        );
+        assert_eq!(
+            upstream_url("http://127.0.0.1:1234/proxy/v1/", GenerationApi::Responses).unwrap(),
+            "http://127.0.0.1:1234/proxy/v1/responses"
+        );
+        assert!(upstream_url("http://secret@localhost:8119", GenerationApi::Responses).is_none());
+        assert!(upstream_url("http://localhost:8119?secret=x", GenerationApi::Responses).is_none());
     }
 }

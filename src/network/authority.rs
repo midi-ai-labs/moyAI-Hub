@@ -66,7 +66,7 @@ impl Ledger {
     pub fn validate(&self) -> Result<()> {
         if self.authorities.len() > AUTHORITY_LIMIT * 2
             || self.roots.len() > ACTIVE_ROOT_LIMIT + TERMINAL_ROOT_LIMIT
-            || self.retired_before.len() > DEVICE_LIMIT
+            || self.retired_before.len() > DEVICE_RECORD_LIMIT
             || self.retired_opaque.len() > OPAQUE_RETIREMENT_LIMIT
         {
             return Err(NetworkError::InvalidRequest);

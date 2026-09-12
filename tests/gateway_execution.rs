@@ -4,10 +4,9 @@ use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
 };
-#[cfg(feature = "tauri-desktop")]
-use moyai_hub::gateway_process::{GatewayProcess, acknowledge_quiescent, uncertain};
+use moyai_hub::gateway_process::{GatewayProcess, execution_running};
 use moyai_hub::{
     catalog::*,
     core::HubCore,
@@ -22,7 +21,10 @@ use std::{
     io,
     net::SocketAddr,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -30,6 +32,12 @@ use tokio::sync::{Notify, mpsc};
 
 const BOOTSTRAP: &str = "bootstrap-test-secret-000000000000000000000";
 const CONTROL: &str = "companion-test-secret-000000000000000000000";
+#[path = "gateway_execution/delegated.rs"]
+mod delegated;
+#[path = "gateway_execution/orphaned.rs"]
+mod orphaned;
+#[path = "gateway_execution/responses.rs"]
+mod responses;
 #[derive(Clone)]
 struct Provider {
     records: Arc<Mutex<Vec<Value>>>,
@@ -37,6 +45,11 @@ struct Provider {
     held: bool,
     truncated: bool,
     reject: bool,
+    hold_headers: Arc<AtomicBool>,
+    metadata_reads: Arc<AtomicUsize>,
+    unexpected_requests: Arc<AtomicUsize>,
+    large_body: Arc<AtomicBool>,
+    emitted_bytes: Arc<AtomicUsize>,
 }
 struct Stream(mpsc::Receiver<Result<Bytes, io::Error>>);
 impl futures_core::Stream for Stream {
@@ -55,6 +68,9 @@ async fn generation(
         .lock()
         .unwrap()
         .push(json!({"body":body,"authorization_present":headers.contains_key("authorization")}));
+    if provider.hold_headers.load(Ordering::SeqCst) {
+        provider.release.notified().await;
+    }
     if provider.reject {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -64,6 +80,20 @@ async fn generation(
     }
     let (send, receive) = mpsc::channel(4);
     tokio::spawn(async move {
+        if provider.large_body.load(Ordering::SeqCst) {
+            let bytes = Bytes::from(format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}}}}]}}\n\n",
+                "x".repeat(256 * 1024)
+            ));
+            for _ in 0..96 {
+                if send.send(Ok(bytes.clone())).await.is_err() {
+                    return;
+                }
+                provider
+                    .emitted_bytes
+                    .fetch_add(bytes.len(), Ordering::SeqCst);
+            }
+        }
         let _ = send
             .send(Ok(Bytes::from_static(
                 b"data: {\"choices\":[{\"delta\":{\"content\":\"MODEL_OK\"}}]}\n\n",
@@ -100,6 +130,32 @@ impl Drop for Fixture {
     }
 }
 impl Fixture {
+    async fn companion(&mut self, directory: &std::path::Path) -> GatewayProcess {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        self.hub = format!("http://{}", listener.local_addr().unwrap());
+        let process = GatewayProcess::start(
+            std::path::Path::new(env!("CARGO_BIN_EXE_moyai-hub")),
+            self.hub.clone(),
+            directory,
+        )
+        .await
+        .unwrap();
+        self.control = process.control.clone();
+        let router = router_with_gateway(
+            self.core.clone(),
+            BOOTSTRAP.into(),
+            Some(self.control.clone()),
+        );
+        self.tasks.push(tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        }));
+        process
+    }
     async fn new(held: bool, truncated: bool) -> Self {
         Self::with_rejection(held, truncated, false).await
     }
@@ -110,11 +166,28 @@ impl Fixture {
             held,
             truncated,
             reject,
+            hold_headers: Arc::new(AtomicBool::new(false)),
+            metadata_reads: Arc::new(AtomicUsize::new(0)),
+            unexpected_requests: Arc::new(AtomicUsize::new(0)),
+            large_body: Arc::new(AtomicBool::new(false)),
+            emitted_bytes: Arc::new(AtomicUsize::new(0)),
         };
         let provider_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let provider_url = format!("http://{}/v1", provider_listener.local_addr().unwrap());
         let provider_router = Router::new()
             .route("/v1/chat/completions", post(generation))
+            .route("/v1/responses", post(responses::generation))
+            .route(
+                "/api/v1/models",
+                get(|State(provider): State<Provider>| async move {
+                    provider.metadata_reads.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({"models":[{"key":"actual-provider-model","type":"llm","loaded_instances":[]}]}))
+                }),
+            )
+            .fallback(|State(provider): State<Provider>| async move {
+                provider.unexpected_requests.fetch_add(1, Ordering::SeqCst);
+                StatusCode::NOT_FOUND
+            })
             .with_state(provider.clone());
         let provider_task = tokio::spawn(async move {
             axum::serve(provider_listener, provider_router)
@@ -242,6 +315,60 @@ impl Fixture {
         .await
         .unwrap()
     }
+}
+
+#[tokio::test]
+async fn companion_stop_cancels_its_transport_without_waiting_for_provider_completion() {
+    let mut fixture = Fixture::new(true, false).await;
+    let directory = tempfile::tempdir().unwrap();
+    let process = fixture.companion(directory.path()).await;
+    let client = fixture.register().await;
+    let ready = fixture.prepare(&client, "main", "turn", "request").await.1;
+    let response = fixture.generate(&ready).await;
+    fixture.wait_status(|s| s["running"] == 1).await;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(6), process.stop())
+            .await
+            .expect("stopping local forwarding must be bounded")
+    );
+    assert!(!execution_running(directory.path()));
+    assert!(!directory.path().join("gateway-uncertain.json").exists());
+    drop(response);
+    assert_eq!(fixture.provider.records.lock().unwrap().len(), 1);
+    let next = fixture.companion(directory.path()).await;
+    assert!(next.stop().await);
+}
+
+#[tokio::test]
+async fn companion_failed_spawn_never_claims_provider_uncertainty() {
+    let directory = tempfile::tempdir().unwrap();
+    let result = GatewayProcess::start(
+        &directory.path().join("missing.exe"),
+        "http://127.0.0.1:9".into(),
+        directory.path(),
+    )
+    .await;
+    assert!(result.is_err());
+    assert!(
+        !directory.path().join("gateway-uncertain.json").exists(),
+        "no process was launched or request admitted"
+    );
+}
+
+#[tokio::test]
+async fn companion_response_failure_does_not_require_provider_recovery_before_restart() {
+    let mut fixture = Fixture::new(false, true).await;
+    let directory = tempfile::tempdir().unwrap();
+    let process = fixture.companion(directory.path()).await;
+    let client = fixture.register().await;
+    let ready = fixture.prepare(&client, "main", "turn", "request").await.1;
+    let _ = fixture.generate(&ready).await.bytes().await;
+    let status = fixture.wait_status(|s| s["running"] == 0).await;
+    assert_eq!(status["quarantined_pools"], json!([]));
+    assert!(process.stop().await);
+    assert!(!directory.path().join("gateway-uncertain.json").exists());
+    let next = fixture.companion(directory.path()).await;
+    assert!(next.stop().await);
 }
 
 #[tokio::test]
@@ -517,6 +644,33 @@ async fn network_model_permit_requires_exact_client_certificate_and_rechecks_rev
 }
 
 #[tokio::test]
+async fn unloaded_native_catalog_model_is_forwarded_without_a_load_command() {
+    let fixture = Fixture::new(false, false).await;
+    {
+        let mut core = fixture.core.lock().unwrap();
+        let mut catalog = core.catalog_store().catalog.clone();
+        catalog.deployments[0].provider_profile = "lmstudio_chat".into();
+        core.replace_catalog(catalog, now_ms()).unwrap();
+        core.observe_deployment("deployment-qwen", Availability::Unknown, 0)
+            .unwrap();
+    }
+    let client = fixture.register().await;
+    let (status, ready) = fixture.prepare(&client, "main", "turn", "request").await;
+    assert_eq!(status, 200);
+    assert_eq!(ready["state"], "ready");
+    assert_eq!(fixture.provider.metadata_reads.load(Ordering::SeqCst), 1);
+    let response = fixture.generate(&ready).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.text().await.unwrap().contains("MODEL_OK"));
+    fixture.wait_status(|value| value["running"] == 0).await;
+    assert_eq!(fixture.provider.records.lock().unwrap().len(), 1);
+    assert_eq!(
+        fixture.provider.unexpected_requests.load(Ordering::SeqCst),
+        0
+    );
+}
+
+#[tokio::test]
 async fn public_prepare_is_idempotent_and_one_claim_rewrites_only_provider_model() {
     let fixture = Fixture::new(false, false).await;
     let client = fixture.register().await;
@@ -552,6 +706,84 @@ async fn public_prepare_is_idempotent_and_one_claim_rewrites_only_provider_model
 }
 
 #[tokio::test]
+async fn public_preparation_preserves_affinity_and_cannot_change_its_purpose() {
+    let fixture = Fixture::new(false, false).await;
+    let client = fixture.register().await;
+    let request = json!({"id":client["id"],"context":"main","turn_id":"enhance","request_id":"draft",
+        "expected_hub_id":client["hub_id"],"reviewed_revision":client["revision"],"purpose":"preparation"});
+    let (status, ready) = fixture
+        .post(
+            "/v1/requests/prepare",
+            client["client_token"].as_str().unwrap(),
+            request,
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(ready["state"], "ready");
+    assert_eq!(
+        fixture.prepare(&client, "main", "enhance", "draft").await.0,
+        409
+    );
+    let observed = fixture
+        .core
+        .lock()
+        .unwrap()
+        .begin_request(
+            client["id"].as_str().unwrap(),
+            "main",
+            "enhance",
+            moyai_hub::protocol::RequestPurpose::Preparation,
+            now_ms(),
+        )
+        .unwrap();
+    let moyai_hub::protocol::RouteDecision::Assigned { lease } = observed else {
+        panic!("prepared route");
+    };
+    assert_eq!(lease.turns_remaining, 2);
+    assert!(
+        fixture
+            .generate(&ready)
+            .await
+            .text()
+            .await
+            .unwrap()
+            .contains("MODEL_OK")
+    );
+    fixture.wait_status(|value| value["running"] == 0).await;
+    assert_eq!(
+        fixture
+            .post(
+                "/v1/turns/finish",
+                client["client_token"].as_str().unwrap(),
+                json!({"id":client["id"],"context":"main","turn_id":"enhance"})
+            )
+            .await
+            .0,
+        200
+    );
+    let ordinary = fixture
+        .prepare(&client, "main", "submitted", "answer")
+        .await;
+    assert_eq!(ordinary.0, 200);
+    assert_eq!(ordinary.1["lease_id"], ready["lease_id"]);
+    let observed = fixture
+        .core
+        .lock()
+        .unwrap()
+        .begin_turn(
+            client["id"].as_str().unwrap(),
+            "main",
+            "submitted",
+            now_ms(),
+        )
+        .unwrap();
+    let moyai_hub::protocol::RouteDecision::Assigned { lease } = observed else {
+        panic!("ordinary route");
+    };
+    assert_eq!(lease.turns_remaining, 1);
+}
+
+#[tokio::test]
 async fn provider_error_body_is_redacted_while_confirmed_error_releases_capacity() {
     let fixture = Fixture::with_rejection(false, false, true).await;
     let client = fixture.register().await;
@@ -568,7 +800,7 @@ async fn provider_error_body_is_redacted_while_confirmed_error_releases_capacity
 }
 
 #[tokio::test]
-async fn downstream_stop_and_advisory_expiry_do_not_release_running_gateway_capacity() {
+async fn forwarding_holds_capacity_past_reservation_expiry_and_stop_releases_it() {
     let fixture = Fixture::new(true, false).await;
     let client = fixture.register().await;
     let ready = fixture
@@ -580,22 +812,10 @@ async fn downstream_stop_and_advisory_expiry_do_not_release_running_gateway_capa
     let status = fixture.control.status().await.unwrap();
     assert_eq!(status["responding"], 1);
     assert_eq!(status["draining"], 0);
-    drop(response);
-    assert_eq!(
-        fixture
-            .post(
-                "/v1/turns/cancel",
-                client["client_token"].as_str().unwrap(),
-                json!({"id":client["id"],"context":"main","turn_id":"turn-main"})
-            )
-            .await
-            .0,
-        200
-    );
     tokio::time::sleep(Duration::from_millis(1050)).await;
-    let status = fixture.wait_status(|value| value["draining"] == 1).await;
+    let status = fixture.control.status().await.unwrap();
     assert_eq!(status["running"], 1);
-    assert_eq!(status["responding"], 0);
+    assert_eq!(status["responding"], 1);
     let waiting = fixture
         .prepare(&client, "side_chat", "turn-side", "request-side")
         .await
@@ -610,10 +830,23 @@ async fn downstream_stop_and_advisory_expiry_do_not_release_running_gateway_capa
         .await;
     assert_eq!(status, 200);
     assert_eq!(still_waiting["state"], "waiting");
-    fixture.provider.release.notify_one();
+    assert_eq!(
+        fixture
+            .post(
+                "/v1/turns/cancel",
+                client["client_token"].as_str().unwrap(),
+                json!({"id":client["id"],"context":"main","turn_id":"turn-main"})
+            )
+            .await
+            .0,
+        200
+    );
     let status = fixture.wait_status(|value| value["running"] == 0).await;
     assert_eq!(status["responding"], 0);
     assert_eq!(status["draining"], 0);
+    assert_eq!(status["quarantined_pools"], json!([]));
+    assert_eq!(fixture.generate(&ready).await.status().as_u16(), 409);
+    drop(response);
     let (first, concurrent) = tokio::join!(
         fixture.prepare(&client, "side_chat", "turn-side", "request-side"),
         fixture.prepare(&client, "side_chat", "turn-side", "request-side")
@@ -634,6 +867,116 @@ async fn downstream_stop_and_advisory_expiry_do_not_release_running_gateway_capa
         200
     );
     assert_eq!(fixture.control.status().await.unwrap()["reserved"], 0);
+}
+
+#[tokio::test]
+async fn downstream_disconnect_cancels_local_forwarding_without_a_finish_notification() {
+    let fixture = Fixture::new(true, false).await;
+    let client = fixture.register().await;
+    let ready = fixture.prepare(&client, "main", "turn", "request").await.1;
+    let mut response = fixture.generate(&ready).await;
+    assert!(response.chunk().await.unwrap().is_some());
+    drop(response);
+    let status = fixture.wait_status(|value| value["running"] == 0).await;
+    assert_eq!(status["quarantined_pools"], json!([]));
+    assert_eq!(fixture.generate(&ready).await.status().as_u16(), 409);
+    let ready = fixture
+        .prepare(&client, "side_chat", "next-turn", "next-request")
+        .await
+        .1;
+    assert_eq!(ready["state"], "ready");
+    assert_eq!(fixture.provider.records.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn cancel_an_unread_large_response_does_not_wait_for_downstream_consumption() {
+    let fixture = Fixture::new(true, false).await;
+    fixture.provider.large_body.store(true, Ordering::SeqCst);
+    let client = fixture.register().await;
+    let ready = fixture.prepare(&client, "main", "turn", "request").await.1;
+    // Retain the response without polling its body while the provider sends many
+    // bounded chunks. Cancellation must cover blocked downstream writes as well.
+    let response = fixture.generate(&ready).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while fixture.provider.emitted_bytes.load(Ordering::SeqCst) < 1024 * 1024 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(fixture.control.status().await.unwrap()["running"], 1);
+    assert_eq!(
+        fixture
+            .post(
+                "/v1/turns/cancel",
+                client["client_token"].as_str().unwrap(),
+                json!({"id":client["id"],"context":"main","turn_id":"turn"})
+            )
+            .await
+            .0,
+        200
+    );
+    let status = fixture.wait_status(|value| value["running"] == 0).await;
+    assert_eq!(status["quarantined_pools"], json!([]));
+    assert_eq!(fixture.generate(&ready).await.status().as_u16(), 409);
+    let next = fixture
+        .prepare(&client, "side_chat", "next-turn", "next-request")
+        .await
+        .1;
+    assert_eq!(next["state"], "ready");
+    assert_eq!(fixture.provider.records.lock().unwrap().len(), 1);
+    drop(response);
+}
+
+#[tokio::test]
+async fn cancel_while_waiting_for_provider_headers_releases_local_forwarding() {
+    let fixture = Fixture::new(false, false).await;
+    fixture.provider.hold_headers.store(true, Ordering::SeqCst);
+    let client = fixture.register().await;
+    let ready = fixture.prepare(&client, "main", "turn", "request").await.1;
+    let request = fixture
+        .client
+        .post(format!(
+            "{}/chat/completions",
+            ready["gateway_base_url"].as_str().unwrap()
+        ))
+        .bearer_auth(ready["request_token"].as_str().unwrap())
+        .json(&json!({"model":ready["logical_model_id"],"messages":[],"stream":true}));
+    let response = tokio::spawn(async move { request.send().await });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while fixture.provider.records.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(fixture.control.status().await.unwrap()["running"], 1);
+    assert_eq!(
+        fixture
+            .post(
+                "/v1/turns/cancel",
+                client["client_token"].as_str().unwrap(),
+                json!({"id":client["id"],"context":"main","turn_id":"turn"})
+            )
+            .await
+            .0,
+        200
+    );
+    fixture.wait_status(|value| value["running"] == 0).await;
+    let result = tokio::time::timeout(Duration::from_secs(3), response)
+        .await
+        .unwrap()
+        .unwrap();
+    if let Ok(response) = result {
+        assert!(!response.status().is_success());
+    }
+    assert_eq!(fixture.generate(&ready).await.status().as_u16(), 409);
+    let next = fixture
+        .prepare(&client, "side_chat", "next-turn", "next-request")
+        .await
+        .1;
+    assert_eq!(next["state"], "ready");
+    assert_eq!(fixture.provider.records.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -695,19 +1038,17 @@ async fn revision_and_identity_are_rechecked_before_claim_without_upstream_side_
 }
 
 #[tokio::test]
-async fn truncated_upstream_quarantines_pool_instead_of_freeing_it_for_reuse() {
+async fn truncated_upstream_fails_the_response_and_releases_only_its_local_slot() {
     let fixture = Fixture::new(false, true).await;
     let client = fixture.register().await;
     let ready = fixture.prepare(&client, "main", "turn", "request").await.1;
-    let _ = fixture.generate(&ready).await.text().await;
-    let status = fixture
-        .wait_status(|value| {
-            value["quarantined_pools"]
-                .as_array()
-                .is_some_and(|pools| !pools.is_empty())
-        })
-        .await;
-    assert_eq!(status["quarantined_pools"], json!(["gpu"]));
+    let response = fixture.generate(&ready).await;
+    assert!(
+        response.bytes().await.is_err(),
+        "truncation must not become successful EOF"
+    );
+    let status = fixture.wait_status(|value| value["running"] == 0).await;
+    assert_eq!(status["quarantined_pools"], json!([]));
     fixture
         .post(
             "/v1/turns/finish",
@@ -715,11 +1056,11 @@ async fn truncated_upstream_quarantines_pool_instead_of_freeing_it_for_reuse() {
             json!({"id":client["id"],"context":"main","turn_id":"turn"}),
         )
         .await;
-    let (status, error) = fixture
+    let (status, next) = fixture
         .prepare(&client, "side_chat", "next-turn", "next-request")
         .await;
-    assert_eq!(status, 503);
-    assert_eq!(error["error"], "gateway_quarantined");
+    assert_eq!(status, 200);
+    assert_eq!(next["state"], "ready");
     assert_eq!(fixture.provider.records.lock().unwrap().len(), 1);
 }
 
@@ -766,42 +1107,60 @@ async fn unclaimed_ticket_expires_and_wrong_model_or_credential_never_contacts_p
 }
 
 #[tokio::test]
-#[cfg(feature = "tauri-desktop")]
-async fn companion_clean_stop_clears_marker_but_lost_owner_needs_explicit_quiescence_ack() {
+async fn companion_exclusivity_ends_with_local_stop_or_parent_disconnect() {
     let directory = tempfile::tempdir().unwrap();
     let executable = std::path::Path::new(env!("CARGO_BIN_EXE_moyai-hub"));
     let process = GatewayProcess::start(executable, "http://127.0.0.1:9".into(), directory.path())
         .await
         .unwrap();
-    assert!(uncertain(directory.path()));
-    assert!(acknowledge_quiescent(directory.path()).is_err());
+    assert!(execution_running(directory.path()));
+    assert!(
+        GatewayProcess::start(executable, "http://127.0.0.1:9".into(), directory.path())
+            .await
+            .is_err(),
+        "a second local companion cannot own the same execution lock"
+    );
     assert!(process.stop().await);
-    assert!(!uncertain(directory.path()));
+    assert!(!execution_running(directory.path()));
     let process = GatewayProcess::start(executable, "http://127.0.0.1:9".into(), directory.path())
         .await
         .unwrap();
     drop(process);
-    assert!(uncertain(directory.path()));
-    assert!(
-        GatewayProcess::start(executable, "http://127.0.0.1:9".into(), directory.path())
-            .await
-            .is_err()
-    );
     tokio::time::timeout(Duration::from_secs(4), async {
-        loop {
-            if acknowledge_quiescent(directory.path()).is_ok() {
-                break;
-            }
+        while moyai_hub::gateway_process::execution_running(directory.path()) {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
     .await
     .unwrap();
-    assert!(!uncertain(directory.path()));
+    assert!(!directory.path().join("gateway-uncertain.json").exists());
 }
 
 #[tokio::test]
-#[cfg(feature = "tauri-desktop")]
+async fn parent_disconnect_closes_forwarding_even_when_provider_never_finishes() {
+    let mut fixture = Fixture::new(true, false).await;
+    let directory = tempfile::tempdir().unwrap();
+    let process = fixture.companion(directory.path()).await;
+    let client = fixture.register().await;
+    let ready = fixture.prepare(&client, "main", "turn", "request").await.1;
+    let response = fixture.generate(&ready).await;
+    fixture.wait_status(|s| s["running"] == 1).await;
+    drop(process);
+    tokio::time::timeout(Duration::from_secs(6), async {
+        while execution_running(directory.path()) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("loss of the parent closes local forwarding without provider cooperation");
+    drop(response);
+    assert!(!directory.path().join("gateway-uncertain.json").exists());
+    let next = fixture.companion(directory.path()).await;
+    assert!(next.stop().await);
+    assert_eq!(fixture.provider.records.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn fixed_gateway_port_conflict_is_clean_before_admission_and_can_retry_exact_port() {
     use moyai_hub::{gateway_process::GatewayNetwork, network::DeviceNetwork};
     let directory = tempfile::tempdir().unwrap();
@@ -828,7 +1187,7 @@ async fn fixed_gateway_port_conflict_is_clean_before_admission_and_can_retry_exa
     .await;
     assert!(result.is_err());
     assert!(
-        !uncertain(directory.path()),
+        !directory.path().join("gateway-uncertain.json").exists(),
         "known pre-admission bind failure must not claim a provider may be running"
     );
     drop(occupied);
@@ -845,12 +1204,11 @@ async fn fixed_gateway_port_conflict_is_clean_before_admission_and_can_retry_exa
         Some(format!("https://{address}").as_str())
     );
     assert!(process.stop().await);
-    assert!(!uncertain(directory.path()));
+    assert!(!directory.path().join("gateway-uncertain.json").exists());
 }
 
 #[tokio::test]
-#[cfg(feature = "tauri-desktop")]
-async fn unclassified_gateway_startup_failure_preserves_uncertainty() {
+async fn tls_setup_failure_before_admission_does_not_leave_uncertainty() {
     use moyai_hub::{gateway_process::GatewayNetwork, network::DeviceNetwork};
     let directory = tempfile::tempdir().unwrap();
     let owner =
@@ -871,12 +1229,34 @@ async fn unclassified_gateway_startup_failure_preserves_uncertainty() {
     )
     .await;
     assert!(result.is_err());
-    assert!(uncertain(directory.path()));
+    assert!(!directory.path().join("gateway-uncertain.json").exists());
     tokio::time::timeout(Duration::from_secs(4), async {
-        while acknowledge_quiescent(directory.path()).is_err() {
+        while execution_running(directory.path()) {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn legacy_execution_records_are_preserved_but_do_not_control_provider_or_startup() {
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("gateway-uncertain.json");
+    for bytes in [
+        br#"{"schema_version":1,"reason":"execution_process_not_confirmed_clean"}"#.as_slice(),
+        b"incomplete-record".as_slice(),
+    ] {
+        std::fs::write(&marker, bytes).unwrap();
+        let process = GatewayProcess::start(
+            std::path::Path::new(env!("CARGO_BIN_EXE_moyai-hub")),
+            "http://127.0.0.1:9".into(),
+            directory.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&marker).unwrap(), bytes);
+        assert!(process.stop().await);
+        assert_eq!(std::fs::read(&marker).unwrap(), bytes);
+    }
 }

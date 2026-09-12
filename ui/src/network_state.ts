@@ -19,6 +19,9 @@ export interface NetworkDevice {
     last_seen_ms: number | null;
     observed_ip: string | null;
     online: boolean;
+    registered_ip?: string;
+    name_conflict?: boolean;
+    unsettled_jobs?: number;
     publications: { profile_id: string; name: string; enabled: boolean; mode: string; endpoint: string }[];
 }
 export interface NetworkJoinRequest {
@@ -29,6 +32,7 @@ export interface NetworkJoinRequest {
     created_at_ms: number;
     expires_at_ms: number;
     status: "pending" | "expired";
+    name_conflict?: boolean;
 }
 export interface NetworkSnapshot {
     revision: string;
@@ -36,9 +40,11 @@ export interface NetworkSnapshot {
     ca_certificate_pem: string;
     ca_sha256: string;
     gateway_port: number;
+    hosting: { configured: boolean; bind: string | null; advertise_ip: string | null; error: string | null };
     server: { running: boolean; bind: string | null; gateway_bind: string | null;
         certificate: { sha256: string; expires_at_ms: string; renew_after_ms: string; last_success_ms: string; last_error: string | null } | null };
     devices: NetworkDevice[];
+    deleted_devices?: { device_id: string; label: string; deleted_at_ms: number }[];
     join_requests: NetworkJoinRequest[];
     groups: { id: string; label: string }[];
     rules: NetworkRule[];
@@ -102,6 +108,13 @@ export function networkServerAddress(bind: string): { ip: string; port: string }
     return { ip: url.hostname.replace(/^\[|\]$/g, ""), port: url.port || "443" };
 }
 
+export function networkHostingAddress(snapshot: NetworkSnapshot): { ip: string; port: string } | null {
+    if (snapshot.server.running && snapshot.server.bind) return networkServerAddress(snapshot.server.bind);
+    const hosting = snapshot.hosting;
+    if (!hosting.configured || !hosting.bind || !hosting.advertise_ip) return null;
+    return { ip: hosting.advertise_ip, port: networkServerAddress(`https://${hosting.bind}`).port };
+}
+
 /** Each editor keeps the revision the user actually began reviewing. */
 export class NetworkEdits {
     snapshot: NetworkSnapshot | null = null;
@@ -118,6 +131,9 @@ export class NetworkEdits {
         return this.revisions.get(editor) ?? this.snapshot?.revision ?? null;
     }
     saved(editor: string): void { this.revisions.delete(editor); }
+    serverAddress(): { ip: string; port: string } | null {
+        return this.snapshot && !this.revisions.has("network-server-form") ? networkHostingAddress(this.snapshot) : null;
+    }
     reviewLatest(): void {
         if (this.snapshot) for (const editor of this.revisions.keys()) this.revisions.set(editor, this.snapshot.revision);
     }
@@ -133,6 +149,17 @@ export function networkDeviceStatus(device: NetworkDevice): { label: string; col
     return device.publications.some(profile => profile.enabled)
         ? { label: "オンライン", color: "green", detail: "受付申告あり。実際の利用には承認と接続ルールが必要です。" }
         : { label: "オンライン", color: "blue", detail: "受付の申告なし。端末の生存確認は届いています。" };
+}
+/** Capture the exact reviewed device, including when its label is duplicated. */
+export function networkDeviceDeletion(device: NetworkDevice, revision: string): {
+    args: { expectedRevision: string; deviceId: string }; identity: string; warning: string;
+} {
+    return {
+        args: { expectedRevision: revision, deviceId: device.device_id },
+        identity: `${device.label}\n端末ID: ${device.device_id}\n観測IP: ${device.observed_ip ?? "未確認"}\n登録IP: ${device.registered_ip ?? "未確認"}\n接続: ${device.online ? "オンライン" : "オフライン"}\n証明書 SHA-256: ${device.certificate_sha256}`,
+        warning: device.unsettled_jobs ? `受入済みタスク ${device.unsettled_jobs} 件の終了が未確認です。Desktopで停止または完了を確認してから再試行してください。`
+            : "この登録と個別の接続ルールを削除し、旧証明書を失効します。過去の履歴と端末IDの帰属は保持します。再参加には新しい鍵での申請と管理者の許可が必要です。進行中のモデル通信や端末のプロセスを停止する操作ではありません。",
+    };
 }
 export function networkAdmissionStatus(device: NetworkDevice): { label: string; color: string; detail: string } {
     if (device.revoked || device.admission === "revoked") return { label: "恒久失効", color: "red", detail: "この端末の認証は元に戻せません。" };
@@ -162,7 +189,7 @@ export type NetworkClientAction = {
 };
 /** The row action carries the exact revision and identity that were displayed. */
 export function networkClientAction(client: NetworkClient, revision: string): NetworkClientAction | null {
-    if (client.kind === "request") return client.request.status === "pending" ? {
+    if (client.kind === "request") return client.request.status === "pending" && !client.request.name_conflict ? {
         command: "hub_network_approve", label: "許可",
         args: { expectedRevision: revision, requestId: client.request.request_id, label: client.request.label, groups: [] },
     } : null;

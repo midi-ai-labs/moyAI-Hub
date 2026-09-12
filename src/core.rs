@@ -1,6 +1,10 @@
 use crate::catalog::{Catalog, CatalogStore, Deployment, DeploymentRow, valid_token};
 use crate::protocol::*;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+mod delegated;
+use delegated::DelegatedContext;
+mod queue;
+use queue::RequestTicket;
 
 const MAX_CLIENTS: usize = 256;
 const MAX_CONTEXTS_PER_CLIENT: usize = 16;
@@ -18,6 +22,7 @@ struct Observation {
 #[derive(Clone)]
 struct ActiveTurn {
     id: String,
+    purpose: RequestPurpose,
     lease: RouteLease,
     requests: BTreeMap<String, String>,
 }
@@ -30,14 +35,16 @@ struct Client {
     last_seen_ms: u64,
     activity: ClientActivity,
     contexts: BTreeMap<String, RouteContext>,
+    closed_delegations: BTreeMap<String, String>,
 }
 
 #[derive(Clone)]
 struct RouteContext {
+    delegated: Option<DelegatedContext>,
     selection: Selection,
     lease: Option<RouteLease>,
     active_turn: Option<ActiveTurn>,
-    waiting_turn: Option<String>,
+    waiting_turn: Option<(String, RequestPurpose)>,
     recent_closed_turns: VecDeque<String>,
 }
 
@@ -60,6 +67,7 @@ pub struct HubCore {
     observations: BTreeMap<String, Observation>,
     clients: BTreeMap<String, Client>,
     permits: BTreeMap<String, PermitState>,
+    request_queue: VecDeque<RequestTicket>,
 }
 
 impl HubCore {
@@ -70,6 +78,7 @@ impl HubCore {
             observations: BTreeMap::new(),
             clients: BTreeMap::new(),
             permits: BTreeMap::new(),
+            request_queue: VecDeque::new(),
         })
     }
 
@@ -84,7 +93,11 @@ impl HubCore {
             .filter(|new| self.store.catalog.deployments.iter().any(|old| old == *new))
             .map(|deployment| deployment.id.clone())
             .collect();
+        let previous_revision = self.store.revision;
         let revision = self.store.replace_catalog(catalog, now_ms)?;
+        if revision != previous_revision {
+            self.request_queue.clear();
+        }
         self.observations
             .retain(|id, _| unchanged_deployments.contains(id));
         // Existing requests may finish. The revision gate rejects any new admission.
@@ -174,14 +187,7 @@ impl HubCore {
     }
 
     pub fn needs_presence_refresh(&self, deployment_id: &str, now_ms: u64) -> bool {
-        !self
-            .observations
-            .get(deployment_id)
-            .is_some_and(|observation| {
-                observation.model_present
-                    && now_ms.saturating_sub(observation.observed_at_ms)
-                        < self.store.catalog.policy.heartbeat_stale_ms
-            })
+        !self.model_present(deployment_id, now_ms)
     }
 
     /// The gateway calls this at claim time. A prepared token cannot bypass a later review,
@@ -201,6 +207,11 @@ impl HubCore {
             .contexts
             .get(&permit.context_id)
             .ok_or(HubError::SelectionRequired)?;
+        if context.delegated.as_ref().is_some_and(|delegated| {
+            delegated.expired(now_ms, self.store.catalog.policy.heartbeat_stale_ms)
+        }) {
+            return Err(HubError::TurnClosed);
+        }
         self.validate_selection(&context.selection)?;
         let turn = context.active_turn.as_ref().ok_or(HubError::TurnClosed)?;
         if turn.id != permit.turn_id || turn.lease.id != permit.lease_id {
@@ -262,6 +273,7 @@ impl HubCore {
                 last_seen_ms: now_ms,
                 activity: ClientActivity::Idle,
                 contexts: BTreeMap::new(),
+                closed_delegations: BTreeMap::new(),
             },
         );
         Ok(())
@@ -273,15 +285,80 @@ impl HubCore {
         activity: ClientActivity,
         now_ms: u64,
     ) -> Result<(), HubError> {
+        self.heartbeat_with_turns(id, activity, &[], now_ms)
+    }
+
+    /// Renew only live turns explicitly reported by the authenticated runtime owner.
+    /// This extends affinity metadata, never an execution permit or a closed/expired turn.
+    pub fn heartbeat_with_turns(
+        &mut self,
+        id: &str,
+        activity: ClientActivity,
+        active_turns: &[(&str, &str)],
+        now_ms: u64,
+    ) -> Result<(), HubError> {
+        let mut contexts = BTreeSet::new();
+        if active_turns.len() > MAX_CONTEXTS_PER_CLIENT {
+            return Err(HubError::InvalidRequest {
+                message: "too many active turn contexts".into(),
+            });
+        }
+        for (context, turn) in active_turns {
+            check_token(context)?;
+            check_token(turn)?;
+            if !contexts.insert(*context) {
+                return Err(HubError::InvalidRequest {
+                    message: "duplicate active turn context".into(),
+                });
+            }
+        }
+        self.expire_delegated_contexts(id, now_ms)?;
         let client = self.clients.get_mut(id).ok_or(HubError::UnknownClient)?;
         client.last_seen_ms = now_ms;
         client.activity = activity;
+        for (context_id, turn_id) in active_turns {
+            let Some(context) = client.contexts.get_mut(*context_id) else {
+                continue;
+            };
+            if context
+                .active_turn
+                .as_ref()
+                .is_some_and(|turn| turn.id == *turn_id)
+                || context
+                    .waiting_turn
+                    .as_ref()
+                    .is_some_and(|(turn, _)| turn == *turn_id)
+            {
+                if let Some(delegated) = &mut context.delegated {
+                    delegated.last_seen_ms = now_ms;
+                }
+            }
+            let Some(turn) = context.active_turn.as_mut().filter(|turn| {
+                turn.id == *turn_id
+                    && turn.lease.expires_at_ms > now_ms
+                    && turn.lease.catalog_revision == self.store.revision
+            }) else {
+                // Delayed heartbeats may overlap prepare, finish or a newer turn.
+                continue;
+            };
+            turn.lease.expires_at_ms = now_ms
+                .saturating_add(self.store.catalog.policy.lease_ttl_ms)
+                .max(turn.lease.expires_at_ms);
+            if let Some(affinity) = context
+                .lease
+                .as_mut()
+                .filter(|lease| lease.id == turn.lease.id)
+            {
+                affinity.expires_at_ms = turn.lease.expires_at_ms;
+            }
+        }
         Ok(())
     }
 
     /// Revocation discards runtime routing state and all advisory permits for this identity.
     pub fn remove_client(&mut self, id: &str) -> Result<(), HubError> {
         self.clients.remove(id).ok_or(HubError::UnknownClient)?;
+        self.request_queue.retain(|ticket| ticket.client_id != id);
         self.permits
             .retain(|_, permit| permit.permit.client_id != id);
         Ok(())
@@ -294,6 +371,9 @@ impl HubCore {
         selection: Selection,
     ) -> Result<(), HubError> {
         check_token(context_id)?;
+        if context_id.starts_with("delegated-") {
+            return Err(HubError::WrongOwner);
+        }
         self.validate_selection(&selection)?;
         let client = self.clients.get_mut(id).ok_or(HubError::UnknownClient)?;
         if let Some(context) = client.contexts.get_mut(context_id) {
@@ -309,6 +389,7 @@ impl HubCore {
             client.contexts.insert(
                 context_id.to_owned(),
                 RouteContext {
+                    delegated: None,
                     selection,
                     lease: None,
                     active_turn: None,
@@ -327,6 +408,17 @@ impl HubCore {
         turn_id: &str,
         now_ms: u64,
     ) -> Result<RouteDecision, HubError> {
+        self.begin_request(id, context_id, turn_id, RequestPurpose::UserTurn, now_ms)
+    }
+
+    pub fn begin_request(
+        &mut self,
+        id: &str,
+        context_id: &str,
+        turn_id: &str,
+        purpose: RequestPurpose,
+        now_ms: u64,
+    ) -> Result<RouteDecision, HubError> {
         check_token(turn_id)?;
         self.expire_permits(now_ms);
         let context = self
@@ -337,6 +429,17 @@ impl HubCore {
             .clone();
         let selection = &context.selection;
         self.validate_selection(selection)?;
+        if (purpose == RequestPurpose::Delegated) != context.delegated.is_some() {
+            return Err(HubError::WrongOwner);
+        }
+        if let Some(delegated) = &context.delegated {
+            if delegated.expired(now_ms, self.store.catalog.policy.heartbeat_stale_ms) {
+                return Err(HubError::TurnClosed);
+            }
+            if Self::delegated_context_id(&delegated.parent, turn_id)? != context_id {
+                return Err(HubError::WrongOwner);
+            }
+        }
         if context
             .recent_closed_turns
             .iter()
@@ -345,7 +448,7 @@ impl HubCore {
             return Err(HubError::TurnClosed);
         }
         if let Some(turn) = context.active_turn {
-            if turn.id != turn_id {
+            if turn.id != turn_id || turn.purpose != purpose {
                 return Err(HubError::ActiveTurn);
             }
             if turn.lease.expires_at_ms <= now_ms {
@@ -356,7 +459,9 @@ impl HubCore {
         if context
             .waiting_turn
             .as_ref()
-            .is_some_and(|waiting| waiting != turn_id)
+            .is_some_and(|(waiting, waiting_purpose)| {
+                waiting != turn_id || *waiting_purpose != purpose
+            })
         {
             return Err(HubError::ActiveTurn);
         }
@@ -375,14 +480,14 @@ impl HubCore {
                 .ok_or(HubError::LeaseExpired)?
                 .clone();
             if let Some(reason) = self.unavailable_reason(&deployment, now_ms)? {
-                return Ok(self.wait_for_route(id, context_id, turn_id, reason));
+                return Ok(self.wait_for_route(id, context_id, turn_id, purpose, reason));
             }
             (deployment, Some(lease))
         } else {
             match self.select_deployment(selection, now_ms) {
                 Ok(deployment) => (deployment, None),
                 Err(RouteBlock::Wait(reason)) => {
-                    return Ok(self.wait_for_route(id, context_id, turn_id, reason));
+                    return Ok(self.wait_for_route(id, context_id, turn_id, purpose, reason));
                 }
                 Err(RouteBlock::Failure(error)) => return Err(error),
             }
@@ -398,7 +503,9 @@ impl HubCore {
             turns_remaining: selection.affinity_turns,
             advisory_only: true,
         });
-        lease.turns_remaining -= 1;
+        if purpose == RequestPurpose::UserTurn {
+            lease.turns_remaining -= 1;
+        }
         let context = self
             .clients
             .get_mut(id)
@@ -407,6 +514,7 @@ impl HubCore {
         context.lease = Some(lease.clone());
         context.active_turn = Some(ActiveTurn {
             id: turn_id.to_owned(),
+            purpose,
             lease: lease.clone(),
             requests: BTreeMap::new(),
         });
@@ -547,6 +655,7 @@ impl HubCore {
             .map(|deployment| DeploymentRow {
                 deployment: deployment.clone(),
                 availability: self.availability(deployment, now_ms),
+                model_present: self.model_present(&deployment.id, now_ms),
                 last_observed_ms: self
                     .observations
                     .get(&deployment.id)
@@ -580,6 +689,7 @@ impl HubCore {
                 contexts: client
                     .contexts
                     .iter()
+                    .filter(|(_, context)| context.delegated.is_none())
                     .map(|(id, context)| RouteContextRow {
                         context_id: id.clone(),
                         reviewed_revision: context.selection.reviewed_revision,
@@ -613,21 +723,36 @@ impl HubCore {
         {
             return Ok(());
         }
-        if context
+        let purpose = if context
             .active_turn
             .as_ref()
             .is_some_and(|turn| turn.id == turn_id)
         {
-            context.active_turn = None;
-        } else if context.waiting_turn.as_deref() == Some(turn_id) {
-            context.waiting_turn = None;
+            context
+                .active_turn
+                .take()
+                .expect("matching active turn")
+                .purpose
+        } else if context
+            .waiting_turn
+            .as_ref()
+            .is_some_and(|(id, _)| id == turn_id)
+        {
+            context
+                .waiting_turn
+                .take()
+                .expect("matching waiting turn")
+                .1
         } else {
             return Err(HubError::WrongOwner);
-        }
+        };
         self.permits.retain(|_, state| {
             state.permit.client_id != id || state.permit.context_id != context_id
         });
-        if cancel {
+        self.request_queue.retain(|ticket| {
+            ticket.client_id != id || ticket.context_id != context_id || ticket.turn_id != turn_id
+        });
+        if cancel && purpose == RequestPurpose::UserTurn {
             context.lease = None;
         }
         context.recent_closed_turns.push_back(turn_id.to_owned());
@@ -778,6 +903,7 @@ impl HubCore {
         id: &str,
         context_id: &str,
         turn_id: &str,
+        purpose: RequestPurpose,
         reason: WaitReason,
     ) -> RouteDecision {
         if let Some(context) = self
@@ -785,7 +911,7 @@ impl HubCore {
             .get_mut(id)
             .and_then(|client| client.contexts.get_mut(context_id))
         {
-            context.waiting_turn = Some(turn_id.to_owned());
+            context.waiting_turn = Some((turn_id.to_owned(), purpose));
         }
         RouteDecision::Waiting {
             reason,
@@ -799,24 +925,15 @@ impl HubCore {
         now_ms: u64,
     ) -> Result<Option<WaitReason>, HubError> {
         match self.availability(deployment, now_ms) {
-            Availability::Ready => {}
-            Availability::Unknown
-                if deployment.provider_profile == "openai_compatible_chat"
-                    && self
-                        .observations
-                        .get(&deployment.id)
-                        .is_some_and(|observation| {
-                            observation.model_present
-                                && now_ms.saturating_sub(observation.observed_at_ms)
-                                    < self.store.catalog.policy.heartbeat_stale_ms
-                        }) => {}
-            Availability::JitPending => return Ok(Some(WaitReason::JitPending)),
             Availability::Maintenance => return Ok(Some(WaitReason::Maintenance)),
             Availability::ModelMissing => {
                 return Err(HubError::DeploymentModelMissing {
                     deployment_id: deployment.id.clone(),
                 });
             }
+            // Provider-reported load state is observational. A listed model may load
+            // on its first request; only the provider decides whether/how to do that.
+            _ if self.model_present(&deployment.id, now_ms) => {}
             _ => return Ok(Some(WaitReason::TargetUnavailable)),
         }
         let active: Vec<&PermitState> = self
@@ -849,15 +966,22 @@ impl HubCore {
         if !deployment.enabled {
             return Availability::Maintenance;
         }
-        self.observations
-            .get(&deployment.id)
-            .filter(|observation| {
-                now_ms.saturating_sub(observation.observed_at_ms)
-                    < self.store.catalog.policy.heartbeat_stale_ms
-            })
+        self.fresh_observation(&deployment.id, now_ms)
             .map_or(Availability::Unknown, |observation| {
                 observation.availability.clone()
             })
+    }
+
+    fn model_present(&self, deployment_id: &str, now_ms: u64) -> bool {
+        self.fresh_observation(deployment_id, now_ms)
+            .is_some_and(|observation| observation.model_present)
+    }
+
+    fn fresh_observation(&self, deployment_id: &str, now_ms: u64) -> Option<&Observation> {
+        self.observations.get(deployment_id).filter(|observation| {
+            now_ms.saturating_sub(observation.observed_at_ms)
+                < self.store.catalog.policy.heartbeat_stale_ms
+        })
     }
 
     fn checked_client(&self, id: &str, now_ms: u64) -> Result<&Client, HubError> {

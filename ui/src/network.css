@@ -46,8 +46,8 @@
 .network-rule p { margin: 6px 0 0; }
 #network-invite-receipt { padding: 15px; margin-top: 17px; background: #f0f5ff; border: 1px solid #c9d9fa; border-radius: 10px; }
 #network-invite-code { letter-spacing: .12em; font: 18px Consolas, monospace; }
-#network-device-dialog { width: min(560px, calc(100vw - 40px)); }
+#network-device-dialog, #network-delete-dialog { width: min(560px, calc(100vw - 40px)); }
 #network-device-revoke-details { border-top: 1px solid var(--line); padding-top: 12px; }
 #network-device-revoke-details summary { cursor: pointer; font-size: 13px; margin-bottom: 12px; }
-#network-device-id { white-space: pre-line; }
+#network-device-id, #network-delete-identity { white-space: pre-line; }
 @media (max-width: 1050px) { .network-grid { grid-template-columns: minmax(0, 1fr); } }

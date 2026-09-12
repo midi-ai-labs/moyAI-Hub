@@ -44,7 +44,7 @@ fn join_requires_key_proof_and_exact_approval_and_survives_response_loss_and_res
     let (_, other_csr) = self::csr();
     let other = f
         .owner
-        .request_join("同名のPC".into(), &other_csr, ip(), f.now)
+        .request_join("別のPC".into(), &other_csr, ip(), f.now)
         .unwrap();
     assert_ne!(first.request_id, other.request_id);
     let signed = proof(&key, &first);
@@ -541,7 +541,12 @@ fn schema_two_preserves_accepted_authority_and_strict_join_fields_on_forward_loa
     old["schema_version"] = json!(2);
     old.as_object_mut().unwrap().remove("join_requests");
     for device in old["devices"].as_object_mut().unwrap().values_mut() {
-        for field in ["stopped", "admission_revision", "join_approval"] {
+        for field in [
+            "stopped",
+            "admission_revision",
+            "join_approval",
+            "deleted_at_ms",
+        ] {
             device.as_object_mut().unwrap().remove(field);
         }
     }
@@ -580,7 +585,7 @@ fn schema_two_preserves_accepted_authority_and_strict_join_fields_on_forward_loa
         .request_join("pending".into(), &csr().1, ip(), f.now)
         .unwrap();
     let mut invalid: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    assert_eq!(invalid["schema_version"], 3);
+    assert_eq!(invalid["schema_version"], 4);
     invalid["join_requests"][&pending.request_id]["admin"] = true.into();
     let bytes = serde_json::to_vec(&invalid).unwrap();
     std::fs::write(&path, &bytes).unwrap();

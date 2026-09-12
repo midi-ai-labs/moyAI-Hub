@@ -1,18 +1,34 @@
 # moyAI Hub
 
-Tauri で動作する LLM ホストの管理アプリです。moyAI Desktop **3.0.0 / LYNX** と連係する Hub の最初の開発版（0.1.0）です。Desktop とは別プロセス・別リポジトリで動作します。
+LLM接続と端末連携を提供するRustサーバーと、TypeScript・HTML/CSSのブラウザー管理画面で構成します。moyAI Desktop **3.0.0 / LYNX** と連係するHubの開発版（0.1.0）です。HubにTauri管理アプリやWebView2は不要です。ビルドしたWeb画面をサーバーに同梱します。
 
-モデル登録・状態確認・revision 管理・認証付きカタログ、Main / Side Chat ごとの確認保存に加え、永続端末登録、TLS による LAN 接続、公開先の探索と方向付きの依頼許可を実装しています。モデル要求は **別プロセス Gateway 経由の Chat Completions** に対応します。モデル実行の prompt / response は同じ実行ファイルの `--gateway` process が扱い、Hub 本体では中継しません。この Gateway が短期実行権を一度だけ受け付け、Gateway を通る要求の容量を制御します。普通の LM Studio / oMLX への外部からの直接実行は計数・制限できません。管理者が明示的に開く「MCP履歴」では、各Desktopの保存済み記録を取得し、Hubのメモリ上で一時的に閲覧できます。
+モデル登録・状態確認・revision 管理・認証付きカタログ、Main / Side Chat ごとの確認保存に加え、永続端末登録、TLS による LAN 接続、公開先の探索と方向付きの依頼許可を実装しています。モデル要求は **別プロセス Gateway 経由の Chat Completions / Responses** に対応します。prompt / response は同じ実行ファイルの `--gateway` process が中継し、Hub 本体では扱いません。Gateway は短期実行権を一度だけ受け付け、自身の同時 HTTP 接続数を制限します。モデルのロード・アンロード、生成のキューと実行・終了は LM Studio / oMLX が管理します。他アプリからの直接要求や接続終了後の provider 内の処理を Hub が数えたり、停止したと判定したりすることはありません。管理者が明示的に開く「MCP履歴」では、各Desktopの保存済み記録を取得し、Hubのメモリ上で一時的に閲覧できます。
 
-Desktop の「moyAI Hub」画面から接続し、カタログの取得、Main / Side Chat ごとのモデル選択と確認保存、更新後の再確認、切断を行います。選択した logical model と Hub の識別情報を保存し、接続トークンは保存しません。Direct / Hub の選択と生成 lifecycle は Desktop が所有し、Hub 障害時に Direct へ暗黙に切り替えません。
+Desktop の「moyAI Hub」画面から接続し、カタログの取得、Main / Side Chat ごとのモデル選択と確認保存、更新後の再確認、切断を行います。選択した logical model と Hub の識別情報を保存し、接続トークンは保存しません。Direct / Hub の選択とチャットの要求・停止操作は Desktop が所有し、Hub 障害時に Direct へ暗黙に切り替えません。
+
+## 起動・管理・終了
+
+Windowsでは、実行ファイルと同じフォルダーに置いた `Start-Hub.cmd`（元ファイルは `scripts/`）を開くと、Hubをバックグラウンドで起動し、通常の既定ブラウザーで管理画面を開きます。ショートカットのリンク先を `moyai-hub.exe --launch` にしても同じです。初回だけ「端末ネットワーク」でIP・ポートを入力して開始してください。成功した設定を保存し、次回の起動からHub・端末ネットワーク・Gatewayをまとめて開始します。起動済みなら同じHubの管理画面を開きます。
+
+新規保存先の初回Web URLは `http://127.0.0.1:9080/admin/` です。現在は管理者ログインを設けておらず、Webへ到達できる人がモデル・端末・利用許可・MCP履歴を管理できます。Desktopの端末認証とMCPの利用許可は継続します。
+
+**ブラウザーを閉じてもHubの通信は続きます。** 端末通信の開始・停止はブラウザーの「端末ネットワーク」で行います。端末通信を停止してもWeb画面は使えます。通常のコンソール起動で同じ保存先を二重起動した場合は終了し、稼働中のサーバーを置き換えません。`--launch` は起動済みのHubを再利用します。
+
+サーバー本体は `Stop-Hub.cmd` または `moyai-hub.exe --stop` で終了します。`--data-dir`を指定した場合は停止時も同じ保存先を指定します。`--status`で稼働状態とWeb URLを確認できます。停止・状態確認はサーバーを自動起動しません。`--launch`なしで直接実行する従来のコンソール起動ではWebだけを開始し、端末ネットワークは画面から開始します。この起動方法はCtrl+Cでも終了できます。
+
+IP変更・ポート競合などでホスティングを再開できない場合はエラーを表示し、Web管理画面を復旧用に残します。IP・ポートを修正して開始すると保存設定を更新します。Web自体が起動できない場合は終了し、保存先の `hub-startup.log` に起動エラーを残します。`--launch --no-browser` はブラウザーを開かず結果をJSONで返す検証・運用用入口です。
+
+`--web-port`でこのPC用のポート、`--web-settings`でLAN向けHTTP・HTTPS・同一PCのreverse proxyを設定します。[Web管理の起動設定](docs/web-management.md)を参照してください。端末参加用configやHub CAはWeb管理者の認証へ流用しません。Windowsサービス登録・OS起動時の自動起動は未実装です。
 
 ## モデルを登録する
 
-1. 接続方式で `OpenAI compatible / oMLX` または `LM Studio` を選びます。
+1. 接続方式でホストの種類（OpenAI compatible / oMLX または LM Studio）と生成API（Chat Completions または Responses）を選びます。モデル一覧の取得成功だけでは生成APIへの対応は確認できません。ホストが提供する方式を選び、別APIへ自動では切り替えません。
 2. ホストの `IP:port` または HTTP(S) URL を入力します。入力完了後にモデル候補を自動取得します。入力値が変わった場合、古い候補は無効になります。
-3. モデルと表示名を選び、登録します。ツール利用を管理者が確認済みの場合に限り「ツール利用を許可（管理者確認）」を選べます。これは provider が報告しない能力の明示的な宣言で、モデル一覧への掲載から能力を推測するものではありません。同一 logical model の別ホストとして追加する場合は「同じモデルの別ホスト・容量を設定」を開きます。登録する capability が異なる配置は同じ logical model に束ねません。
-4. 同じ GPU / provider 実行枠を共有する登録先は、「実行枠を共有するグループ」（容量プール）を同じにします。この容量と全体上限は Gateway 経由の実行に適用されます。
-5. 「状態を確認」で登録先のメタデータを再取得します。「編集」で表示名、プール容量、メンテナンス状態を変更できます。最後の配置を削除すると、その logical model も削除されます。
+3. モデルと表示名を選び、登録します。ツール利用を管理者が確認済みの場合に限り「ツール利用を許可（管理者確認）」を選べます。これは provider が報告しない能力の明示的な宣言で、モデル一覧への掲載から能力を推測するものではありません。同一 logical model の別ホストとして追加する場合は「同じモデルの別ホスト・同時接続数を設定」を開きます。登録する capability が異なる配置は同じ logical model に束ねません。
+4. 同じホストなど、Hub 経由の同時接続数をまとめて制限したい登録先は、「同時接続数を共有するグループ」（容量プール）を同じにします。このグループと Hub 全体の上限は Gateway の HTTP 接続に適用されます。GPU の容量や生成の同時実行数はホスト側で設定します。
+5. 「状態を確認」で登録先のメタデータを再取得します。「編集」で配置の表示名、グループの同時接続上限、メンテナンス状態を変更できます。最後の配置を削除すると、その logical model も削除されます。
+
+要求の準備は、同じ利用可能な実行枠を待つ要求のFIFO順を保ちます。再問い合わせで順位を取り直さず、別の利用可能なpoolを不必要に止めません。取消・切断・期限の扱いは [モデル要求の待ち順序](docs/request-queue.md) を参照してください。
 
 モデル登録はローカル設定へ保存されます。表示名、IP、provider の model 文字列を identity として使わず、logical model・配置・プールにはそれぞれ stable ID を付けます。モデルロード・アンロードや provider プロセスの起動・停止は行いません。
 
@@ -20,20 +36,19 @@ Desktop の「moyAI Hub」画面から接続し、カタログの取得、Main /
 
 | 表示 | 色 | 根拠 |
 | --- | --- | --- |
-| ロード済み | 青 | LM Studio `/api/v1/models` が `loaded_instances` を報告 |
-| 未ロード | 緑 | LM Studio にモデルがあり、`loaded_instances` が空。JIT 自動ロードが設定されているかは確認しない |
+| 一覧あり | 緑 | 接続先のモデル一覧で登録済み model ID を確認 |
 | モデルなし | 赤 | モデル一覧の取得成功後、登録済み model ID が一覧に存在しない |
-| ロード状態不明 | 灰 | 未確認・期限切れ、ロード情報なし、または HTTP / 応答形式の確認失敗 |
+| 未確認 | 灰 | 未確認・期限切れ、または HTTP / 応答形式の確認失敗 |
 | 接続・確認不可 | 灰 | ホストへの接続に失敗 |
 | メンテナンス | 黄 | 管理者が割当候補から除外 |
 
-汎用 `/v1/models` への掲載から ready を推測しません。ただし OpenAI compatible / oMLX は新しい一覧で存在を確認できたモデルに実要求を試行できます。表示はロード状態不明のままで、ロード済み表示も生成の成功を保証しません。状態には観測時刻を付け、runtime の観測は再起動時に復元しません。metadata request は redirect 禁止、接続 3 秒・全体 8 秒、応答 2 MiB・2,048 model の上限を持ちます。現在の discovery は認証不要のホストを対象とします。
+OpenAI compatible / oMLX と LM Studio のどちらも、新しい一覧で存在を確認できたモデルへ要求を中継します。未ロードやロード情報なしを理由に待機しません。要求時にロードするか、要求を受け付けるかはホスト側が判断するため、「一覧あり」は生成成功の保証ではありません。状態には観測時刻を付け、runtime の観測は再起動時に復元しません。metadata request は redirect 禁止、接続 3 秒・全体 8 秒、応答 2 MiB・2,048 model の上限を持ちます。現在の discovery は認証不要のホストを対象とします。
 
-概要には登録先ごとの「ロード済み」と「状態不明」の件数を並べます。ロード済みが 0 でも、使えるモデルがないという意味ではありません。左ナビはページ内の移動リンクで、常に概要を選択表示するものではありません。モデル状態や実行経路の技術的な説明は必要時に展開できます。
+概要には登録先ごとの「一覧あり」と「要確認」の件数を並べます。メンテナンスの対象でも一覧に存在すれば「一覧あり」に数えますが、新規割当からは除外します。左ナビはページ内の移動リンクで、常に概要を選択表示するものではありません。モデル状態や中継経路の技術的な説明は必要時に展開できます。
 
 ## 端末ネットワークを開始する
 
-初期状態は停止です。別 PC の Desktop を参加させる場合は、Hub の「端末ネットワーク」を使います。従来のモデルサーバーが稼働している場合は先に停止してください。
+未設定の初期状態は停止です。別 PC の Desktop を参加させる場合は、Hub の「端末ネットワーク」を使います。成功したIP・ポートを `network-hosting.json` に保存し、ワンクリック起動で再利用します。従来のモデルサーバーが稼働している場合は先に停止してください。
 
 組織で固定ポートが必要な場合は詳細設定の Gateway ポートを保存してください。0 は自動選択、変更は次回開始から適用します。画面には実際の待受先を別に表示します。診断は公開 endpoint と証明書状態を確認するもので、他 PC からの到達成功を保証したり Firewall 設定を変更したりしません。
 
@@ -45,21 +60,23 @@ Desktop の「moyAI Hub」画面から接続し、カタログの取得、Main /
 6. 受入側 Desktop で公開対象と権限を確認し、受付を開始します。Hub の「方向付きの接続許可」で送信元・受入先・公開対象を選びます。端末が参加しただけでは依頼できません。「この宛先の公開対象すべて」は、後から受付を開始する対象も許可範囲に含みます。
 7. 送信側 Desktop で利用する受入先を選びます。この選択は Hub の許可を狭める操作です。逆方向には別の許可が必要です。端末間の仕事本文と結果は Desktop 同士の直接 TLS 接続を使い、Hub を中継しません。
 
+端末の表示名は、前後空白を除き小文字化した同一名を新たに登録できません。旧重複は注意表示からIDを確認して改名・削除します。「削除」は終了未確認のMCPタスクがある場合に拒否し、旧資格の復活や新登録への許可の自動移行は行いません。[名前と削除の契約](docs/device-registry.md) を参照してください。
+
 Gateway ポートが自動の場合は再開始時に変わることがあります。ポート変更や配布物の更新・移動で実行ファイルのパスが変わった場合は受信規則を見直し、別 PC から再診断してください。Hub PC 内の診断成功や受信規則の保存成功だけでは、別 PC からの接続確認は完了しません。
 
 グループの許可に端末同士の個別例外を加えられます。再委任には、直前の端末から宛先への「直接の依頼」と、最初の依頼元から宛先への「再委任の宛先」の両方の許可が必要です。例えば 00 → 19 → 20 を許可しても、00 → 20 の直接接続を許可する必要はありません。元の依頼・経路・公開対象を短期資格に結び付け、循環と段数を制限します。
 
-Hub は端末ごとに公開証明書を発行・更新します。公開 CA の信頼はアプリ内に限定し、Windows 全体の信頼ストアへ追加しません。初回参加を除くネットワーク API は端末証明書による相互 TLS 認証が必要です。公開先の探索、対象ごとの資格発行、受入時の照会で現在の許可を検証します。IP が変わった端末は証明書更新と公開情報の再登録が必要です。
+Hub は端末ごとに公開証明書を発行・更新します。公開 CA の信頼はアプリ内に限定し、Windows 全体の信頼ストアへ追加しません。初回参加を除く端末用ネットワーク API は端末証明書による相互 TLS 認証が必要です。任意公開のWeb管理は別の管理キー/sessionで認証し、端末参加資格と共用しません。公開先の探索、対象ごとの資格発行、受入時の照会で現在の許可を検証します。IP が変わった端末は証明書更新と公開情報の再登録が必要です。
 
-公開 OFF、端末失効、許可変更は新しい受付を止め、以前の実行資格を復活させません。**既に受け付けた仕事の停止完了とは別です。** 実行中の仕事は Desktop の停止操作と状態表示で確認します。Hub の停止・ウィンドウ終了はネットワーク受付も止めます。常駐や tray は未実装です。CA、端末、グループ、許可、受入済み仕事の認可経路と root 取消を保持します。接続状態と60秒の資格は再接続時に取得し直します。同じ仕事の資格再発行は同じ authority を使い、Hub再起動や24時間経過を理由に自動再実行しません。受入通知が不明な場合は受入側の永続台帳を照合します。終端確認・保持上限・退役後の扱いは [仕事の認可記録と診断](docs/gateway.md#仕事の認可記録と診断) を参照してください。
+公開 OFF、端末失効、許可変更は新しい受付を止め、以前の実行資格を復活させません。**既に受け付けた仕事の停止完了とは別です。** 実行中の仕事は Desktop の停止操作と状態表示で確認します。「ネットワークを停止」は受付とモデル中継を止めますが、管理画面を閉じるだけでは止まりません。CA、端末、グループ、許可、受入済み仕事の認可経路と root 取消を保持します。通信の停止後は、接続状態と60秒の資格を再接続時に取得し直します。同じ仕事の資格再発行は同じ authority を使い、Hubサーバー再起動や24時間経過を理由に自動再実行しません。受入通知が不明な場合は受入側の永続台帳を照合します。終端確認・保持上限・退役後の扱いは [仕事の認可記録と診断](docs/gateway.md#仕事の認可記録と診断) を参照してください。
 
-モデルの実行状態は「応答中」「上流終了確認待ち」「予約」に分けます。端末への応答接続が閉じても provider の終端を確認するまで実行枠を保持します。**Stop は即座の空き枠を意味しません。** 保留と回復の手順は [Gateway の実行境界](docs/gateway.md) を参照してください。
+「Hub のモデル中継」にはこの Hub 経由の「中継中」「予約」を表示します。Stop や応答接続の切断では Gateway 自身の上流 HTTP 接続を閉じ、後始末後に中継枠を解放します。provider 内の生成終了を意味する表示ではありません。不完全な応答はその要求のエラーとし、他の要求や Hub の再開始を保留しません。境界と停止処理は [Gateway の実行境界](docs/gateway.md) を参照してください。
 
 ## MCP履歴を確認する
 
 「MCP履歴」で端末と「MCP指示」「MCP実行」を選び、保存済み記録を取得できます。「接続端末」の「履歴を見る」からも開けます。詳細はMarkdownとして保存でき、受付OFFや新規利用停止中の端末でも、接続と有効な参加資格があれば診断用に確認できます。実行・停止操作は各Desktopで行います。
 
-Hubは取得日時を明示し、過去の記録と現在の接続状態を分けます。取得は最大60秒、取得済みsnapshotはメモリ上で最大64件・30分間保持し、Hub再起動で消えます。詳細は64 KiBまでで、省略を明示します。履歴の正本と全体の書き出しは各Desktopに残ります。手順と通信範囲は [MCP履歴](docs/mcp-history.md) を参照してください。
+Hubは取得日時を明示し、過去の記録と現在の接続状態を分けます。取得は最大60秒、取得済みsnapshotはサーバーのメモリ上で最大64件・30分間保持し、Hubサーバー再起動で消えます。詳細は64 KiBまでで、省略を明示します。履歴の正本と全体の書き出しは各Desktopに残ります。手順と通信範囲は [MCP履歴](docs/mcp-history.md) を参照してください。
 
 ## 従来の同一 PC 接続（互換導線）
 
@@ -67,9 +84,9 @@ Hubは取得日時を明示し、過去の記録と現在の接続状態を分�
 
 この手順の待受は **loopback のみ** です。別 PC の参加には上記の端末ネットワークを使います。ここで発行する一時的な model client ID / token と、端末ネットワークの永続 ID / 証明書は別です。
 
-「停止」またはウィンドウを閉じると listener が終了します。常駐・tray/background lifecycle は未実装です。共通接続トークンは保持されず、再開始時に設定が必要です。端末別トークンと端末登録は失効し、端末は再登録します。
+「停止」で listener が終了します。管理画面を閉じても、開始済みの listener と接続は続きます。共通接続トークンはサーバーの停止後には保持されず、通信の再開始時に設定が必要です。通信を停止すると、この互換接続の端末別トークンと端末登録は失効し、端末は再登録します。
 
-実生成を使う場合は開始前に「モデル実行も有効にする（Gateway）」を選びます。初期値は無効で、自動起動しません。実行状況を「応答中」「上流終了確認待ち」「予約」に分けて表示します。「応答中」は端末との応答接続がある要求、「上流終了確認待ち」は応答接続が閉じても上流の終端をまだ確認していない要求です。端末側の「操作待ち」とは異なる観測で、**Stop は即座の空き枠を意味しません**。終了不明の保留と回復手順は [Gateway の実行境界](docs/gateway.md) を参照してください。
+実生成を使う場合は開始前に「モデル中継も有効にする（Gateway）」を選びます。初期値は無効で、自動起動しません。モデルのロードや生成状態は接続先のホスト側で確認し、Hub では自身の中継通信を確認します。旧版の `gateway-uncertain.json` が残っていても、現行版は変更せずに無視します。provider 全体の停止確認や手動の保留解除は不要です。同じ保存先の Gateway 子プロセスが生存している場合は、重複起動を防ぐローカルロックが働きます。
 
 ### モデル API（protocol 1 の互換接続）
 
@@ -79,12 +96,12 @@ Hubは取得日時を明示し、過去の記録と現在の接続状態を分�
 | --- | --- |
 | `GET /v1/health` | `{hub_id, software_version, revision: string, mode: "management_preview"}` |
 | `GET /v1/catalog` | `{hub_id, software_version, revision: string, models: [{id,label,capabilities}], changes: [{revision: string,at_ms,summary}]}` |
-| `POST /v1/clients/register` | 入力 `{label}`。出力 `{id,client_token,hub_id,revision: string,heartbeat_interval_ms,identity_scope:"server_session"}` |
-| `POST /v1/clients/heartbeat` | 入力 `{id,activity:"idle"\|"waiting"\|"running"}`。端末専用 `client_token` で認証。出力 `{id,revision: string}` |
+| `POST /v1/clients/register` | 入力 `{label}`。出力 `{id,client_token,hub_id,revision: string,heartbeat_interval_ms,supports_turn_heartbeat:true,identity_scope:"server_session"}` |
+| `POST /v1/clients/heartbeat` | 入力 `{id,activity:"idle"\|"waiting"\|"running",active_turns?:[{context,turn_id}]}`。端末専用 `client_token` で認証。出力 `{id,revision: string}` |
 | `POST /v1/clients/review` | 入力 `{id,context,expected_hub_id,reviewed_revision,selection}`。出力 `{id,context,reviewed_revision: string}`。共有トークンでは保存できない |
 | `POST /v1/clients/disconnect` | 入力 `{id}`。端末専用トークンを失効させ、その端末の context を削除。出力 `{id,disconnected:true}`。既に失効したトークンは 401 |
 | `POST /v1/requests/prepare` | 端末・context・turn・request・確認済み revision を検証し、待機理由または一回限りの Gateway target を返す。本文は受け付けない |
-| `POST /v1/turns/finish` / `POST /v1/turns/cancel` | 入力 `{id,context,turn_id}`。turn を閉じ、未使用の予約を失効させる。既に始まった実行は読み切る |
+| `POST /v1/turns/finish` / `POST /v1/turns/cancel` | 入力 `{id,context,turn_id}`。turn を閉じ、未使用予約を失効させ、対象の中継接続を閉じる |
 
 端末 ID はサーバーが発行し、そのサーバー session 中は同じ ID を使います。IP は HTTP 接続から観測し、認証や identity に使用しません。共通接続トークンでは他端末の heartbeat や確認保存を送れません。端末一覧の「操作待ち」「空き待ち」「処理中」は端末の申告であり、provider の実測値ではありません。Gateway の実行状況は別に表示します。端末一覧は Main / Side Chat の確認状況を独立して表示し、一方の保存は他方を確認済みにしません。
 
@@ -92,11 +109,13 @@ Hubは取得日時を明示し、過去の記録と現在の接続状態を分�
 
 core は端末 identity と route context を分け、context ごとに選択・lease・active turn・待機を所有します。現在は端末あたり最大 16 context に制限し、HTTP API は Main / Side Chat の 2 context を公開します。lease の N user turn と、個別 request の実行予約は別に扱います。[実行 API](docs/gateway.md) に wire と保証範囲を記載しています。
 
-公開カタログは provider endpoint、credential、prompt / response 本文を含みません。短期 handoff にも実 provider endpoint / model ID を含めません。ネットワーク経由のモデル探索・登録・削除・設定編集はなく、管理操作は Tauri ローカル command に限定します。
+長時間の作業では、Desktop が既存 heartbeat に実行中・待機中の Main / Side Chat の turn ID を添えます。同じ認証端末・context・turn の有効な割当だけを `lease_ttl_ms` 分延長するため、既定の 15 分を超えても同じモデルで継続できます。permit の期限、request ID、affinity の残り回数は延長・再発行しません。期限切れ・完了・取消済みの turn や変更済みカタログは復活せず、heartbeat の遅延で別 turn の割当を更新することもありません。登録および model-session 応答の `supports_turn_heartbeat` がない旧 Hub へは新項目を送信しません。長時間継続を利用するには Hub と Desktop の両方を更新してください。
+
+公開カタログは provider endpoint、credential、prompt / response 本文を含みません。短期 handoff にも実 provider endpoint / model ID を含めません。参加端末向け API にモデル探索・登録・削除・設定編集は公開しません。ブラウザー管理画面は同じHubサーバーへ操作を依頼します。現在のWeb管理には管理者認証を設けていません。
 
 ## 保存と revision
 
-Tauri のアプリデータフォルダーに `catalog.json`、`device-network.json` と `hub.lock` を保存します。`MOYAI_HUB_DATA_DIR` で検証用保存先を明示できます。catalog の schema version は 1、端末ネットワークは 3 です。端末ネットワークの schema 1 / 2 は既存の CA・端末・許可と保存済みの仕事の認可記録を保ったまま読み込み、次回の保存で 3 へ進めます。過去の一時資格から仕事の受入を推測しません。設定ファイルの破損・非対応 schema は起動エラーとし、空設定へ置き換えません。単一のデータフォルダーは OS ファイルロックで一つの Hub インスタンスだけが所有します。
+従来のHubと同じデータフォルダーに `catalog.json`、`device-network.json` と `hub.lock` を保存します。`MOYAI_HUB_DATA_DIR` で検証用保存先を明示できます。catalog の schema version は 1、端末ネットワークは 4 です。端末ネットワークの schema 1 / 2 / 3 は既存の CA・端末・許可と保存済みの仕事の認可記録を保ったまま読み込み、次回の保存で 4 へ進めます。名前の一意性と削除済みIDの保持は [端末登録の管理](docs/device-registry.md) を参照してください。過去の一時資格から仕事の受入を推測しません。設定ファイルの破損・非対応 schema は起動エラーとし、空設定へ置き換えません。単一のデータフォルダーは OS ファイルロックで一つの Hub サーバープロセスだけが所有し、管理画面は設定ファイルを直接編集しません。ローカル管理接続の資格情報も、利用者以外の読み書きを制限したファイルで保持します。
 
 設定の検証後に一時ファイルへ書き、ディスク同期・置換が成功してから runtime の設定を切り替えます。カタログや容量設定・software version の変更は revision を単調増加させ、直近 64 件の差分を保持します。health / catalog は JavaScript での精度損失を避けるため、revision を十進文字列として配布します。端末の選択集合・review 済み revision と Hub の最新 revision は別に扱います。
 
@@ -104,29 +123,32 @@ Tauri のアプリデータフォルダーに `catalog.json`、`device-network.j
 
 ## 開発
 
-Rust / Windows Tauri のビルド環境、Node.js（組み込み TypeScript を実行できる版）、WebView2 が必要です。
+RustとNode.js（組み込みTypeScriptを実行できる版）が必要です。ブラウザーには既存のEdgeまたはChromeを使用できます。
 
 ```powershell
 npm ci
 npm test
 npm run build
-cargo test --no-default-features
-cargo check --all-features
+cargo test --all-features -- --test-threads=1
 cargo build --bin moyai-hub
 cargo run --bin moyai-hub
 ```
 
-UI を開発サーバーで動かす場合は `npm run tauri:dev` を使用します。`node_modules` はリポジトリへ含めません。本作業環境では既存 moyAI のキャッシュ済み依存を使用して検証しています。
+画面はRustのビルド時に同梱します。UI変更後は `npm run build` に続けて `cargo build --bin moyai-hub` を実行してください。`npm run dev` はフロントエンド作業用で、単独では管理APIを提供しません。
 
-実 Tauri / WebView2 の管理フローは `node tests/management_smoke.mjs --binary <exe の絶対パス> --artifacts <新しい証跡フォルダーの絶対パス>` で確認します。既存設定を使わず、指定フォルダー内の隔離データと動的 loopback fixture を使用します。登録・状態確認・編集・サーバー開始停止・端末認証・Main / Side 個別確認・古い revision の拒否・端末別切断・再起動を操作し、画像と `results.json` を保存します。管理操作は画面入力、端末側の操作は公開 HTTP API を使います。物理 keyboard / IME、native pointer、WebView2 子プロセスの完全終了は別途確認します。
+通常のGUI確認は `npm run verify:gui` で行います。単体試験→画面ビルド→Rustビルド→実ブラウザーのsmoke 3ケースを直列実行し、途中の失敗で後続段階を止めます。広い回帰確認は `npm run verify:gui -- --suite regression` です。既定でEdge等の画面を表示し、`--headless`も指定できます。既存ビルドのE2Eだけを行う `npm run test:gui` は、ソースとの一致を保証しません。単体とGUIの結果、画像の目視判定は分けて記録します。
+
+公開CLIで実サーバーと一時データを起動して操作し、終了時にサーバーとGatewayを停止します。設定・証跡・確認範囲と、個別調査用の既存Playwright入口は [ブラウザー試験](tests/browser/README.md) を参照してください。全機能の受入をsmokeだけで完了とは扱いません。
 
 ## 検証状況と残る範囲
 
-- 名前・参加コードを入力しない共通config読込→自動申請→Hubで許可→Desktopの自動接続を、同一Windowsの実Hub/Desktop画面で確認しました。接続端末一覧の停止・再許可、Desktopの自動更新、Hub経由のoMLX実応答も確認済みです。配布物自体の確認範囲は、対応する暫定ビルドの検証記録を参照してください。
-- 端末登録・方向付き許可・失効・証明書更新・実 TLS 接続・Gateway 連係は deterministic fixture で検証しています。同一 Windows 上の実 Hub / Desktop 画面と分離した送受信 runtime で、参加・方向付き許可・利用先選択・実作業の結果返却・受付 ON/OFF を確認しました。Hub 最終ビルドでも実画面から開始・稼働・停止を確認し、後始末の監査は PASS しています。期限競合は単体・protocol 試験での検証です。物理 LAN をまたぐ複数 Windows と3台再委任の受入は未実施です。確認範囲は [端末接続の実装状況](../moyAI/docs/design/hub-device-network.md#7-実装状況) を参照してください。
-- CA root の自動 rotation、認証付き provider discovery、tray lifecycle は未実装です。端末 leaf は 30 日、CA root は 10 年の期限を持ち、期限切れ CA の無人交換は行いません。
+今回の追加は、FIFOの要求準備、端末名の一意性と登録削除、Responses、独立した子エージェントのモデル実行、Web管理、周期更新時の操作保持、Hub専用アイコンです。Web管理の独立待受への見直しを含め実装済みで、確認済みの経路と残る最終検証・運用受入を各手順書に区別しています。全GUI監査・物理N台・長時間soakの合格やリリース完了を意味しません。
+
+- ブラウザー管理は、実サーバーの起動、ネットワーク開始・停止、グループ保存、共通configのダウンロード、再接続と後始末をEdgeで確認しました。旧Hubネイティブ画面とDesktopを組み合わせたシナリオは削除しており、ブラウザーと実Desktopによる参加承認・モデル選択・実応答・端末委任の一連の結合試験への置換は未完了です。[Desktop側の試験範囲](../moyAI/tests/desktop_e2e/README.md)を参照してください。
+- 端末登録・方向付き許可・失効・証明書更新・実 TLS 接続・Gateway 連係は deterministic fixture で検証しています。旧管理画面による過去の実施結果は、[端末接続の実装状況](../moyAI/docs/design/hub-device-network.md#7-実装状況)に記録しています。旧構成の成功は現在のブラウザー構成・配布物・物理複数端末の受入へ流用しません。
+- CA root の自動 rotation、認証付き provider discovery は未実装です。端末 leaf は 30 日、CA root は 10 年の期限を持ち、期限切れ CA の無人交換は行いません。
 - Hub / Gateway のサーバー証明書は30日間有効で、期限7日前から停止せず更新します。更新失敗と現在の期限を管理画面で確認でき、明示更新もできます。[証明書の期限と更新](docs/gateway.md#証明書の期限と更新) に動作と失敗時の制約を記載しています。
-- Responses / その他の provider wire、provider 自身が検証する権限、外部実行を含む負荷把握、終了不明状態の provider 側照合。現 Gateway は Chat Completions のみです。
+- Chat Completions / Responsesの4 profileを実装し、既存Desktop adapterへrequest単位で接続します。新経路は最終検証中で、対応外APIへのfallbackや全providerとの互換性は保証しません。providerの負荷・GPU管理・生成終了の照合はホスト側の責務とし、Hubの再開始条件にはしません。
 - MCP 公開対象・作業権限・実行履歴の正本は Desktop が所有します。Hub は管理者が選択した端末の履歴を既存の認証済み接続で読み取り、期限付きスナップショットとして表示・Markdown保存できます。仕事本文の全件自動集約は行いません。[MCP履歴](docs/mcp-history.md) に取得と保存の境界を記載しています。
 
 実装済みと未実装を分け、preview を production-ready な負荷分散サーバーとして扱わないことを前提としています。

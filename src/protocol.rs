@@ -3,13 +3,24 @@ use std::collections::BTreeSet;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestPurpose {
+    #[default]
+    UserTurn,
+    Preparation,
+    Delegated,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Availability {
     Unknown,
     Offline,
     ModelMissing,
+    /// Provider-reported loaded instances, not a guarantee of generation readiness.
     Ready,
+    /// Legacy wire name for provider-reported unloaded state. Routing does not wait on it.
     JitPending,
     Maintenance,
 }
@@ -55,6 +66,7 @@ pub enum WaitReason {
     GlobalCapacity,
     TargetUnavailable,
     Maintenance,
+    /// Retained for wire compatibility with older Hubs; current routing never emits this.
     JitPending,
 }
 

@@ -1,14 +1,36 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { NetworkEdits, networkAdmissionStatus, networkCertificateStatus, networkClientAction, networkClients, networkDevices, networkDeviceStatus, networkDiagnosticMatches, networkDiagnosticStages, networkDiagnosticTarget, networkGatewayPort, networkServerAddress, networkSubject, type NetworkSnapshot, type NetworkDiagnostics } from "../src/network_state.ts";
+import { NetworkEdits, networkAdmissionStatus, networkCertificateStatus, networkClientAction, networkClients, networkDeviceDeletion, networkDevices, networkDeviceStatus, networkDiagnosticMatches, networkDiagnosticStages, networkDiagnosticTarget, networkGatewayPort, networkHostingAddress, networkServerAddress, networkSubject, type NetworkSnapshot, type NetworkDiagnostics } from "../src/network_state.ts";
 
 function snapshot(revision = "9007199254740993"): NetworkSnapshot {
-    return { revision, hub_id: "hub-a", ca_certificate_pem: "public-ca", ca_sha256: "digest", gateway_port: 0, server: { running: false, bind: null, gateway_bind: null, certificate: null },
+    return { revision, hub_id: "hub-a", ca_certificate_pem: "public-ca", ca_sha256: "digest", gateway_port: 0, hosting: { configured: false, bind: null, advertise_ip: null, error: null }, server: { running: false, bind: null, gateway_bind: null, certificate: null },
         devices: [{ device_id: "device-a", label: "Win19", groups: ["dev", "gpu"], revoked: false, admission: "allowed", certificate_sha256: "device-cert",
             expires_at_ms: 99999999, last_seen_ms: 30, observed_ip: "192.168.1.19", online: true,
             publications: [{ profile_id: "receiver", name: "Temp受付", enabled: true, mode: "agent", endpoint: "https://192.168.1.19:7332" }] }],
         join_requests: [], groups: [{ id: "dev", label: "開発" }, { id: "gpu", label: "GPU搭載" }], rules: [] };
 }
+
+test("saved hosting restores its public address while stopped and preserves a dirty server editor across polls", () => {
+    const current = snapshot();
+    assert.equal(networkHostingAddress(current), null);
+    current.hosting = { configured: true, bind: "0.0.0.0:9471", advertise_ip: "192.168.1.10", error: null };
+    const owner = new NetworkEdits(); owner.accept(current);
+    assert.deepEqual(owner.serverAddress(), { ip: "192.168.1.10", port: "9471" });
+    owner.touch("network-server-form");
+    owner.accept({ ...current, revision: "9007199254740994" });
+    assert.equal(owner.serverAddress(), null, "an intentionally cleared IP or port must not be refilled by polling");
+    owner.reviewLatest();
+    assert.equal(owner.serverAddress(), null, "refresh retains the user's draft too");
+    owner.saved("network-server-form");
+    assert.deepEqual(owner.serverAddress(), { ip: "192.168.1.10", port: "9471" });
+    current.server = { ...current.server, running: true, bind: "https://127.0.0.1:9941" };
+    assert.deepEqual(networkHostingAddress(current), { ip: "127.0.0.1", port: "9941" }, "the active endpoint takes precedence");
+    current.server.running = false;
+    current.hosting = { configured: true, bind: "[::]:443", advertise_ip: "::1", error: null };
+    assert.deepEqual(networkHostingAddress(current), { ip: "::1", port: "443" });
+    current.hosting = { configured: false, bind: null, advertise_ip: null, error: "unsupported schema" };
+    assert.equal(networkHostingAddress(current), null, "invalid settings must not invent a usable endpoint");
+});
 
 test("fixed Gateway port stays explicit and renewal failure is distinct from an expired certificate", () => {
     assert.equal(networkGatewayPort(""), 0);
@@ -134,6 +156,24 @@ test("permission subjects preserve direction and typed device or group identity"
     assert.deepEqual(networkSubject("device:from"), { kind: "device", id: "from" });
     assert.deepEqual(networkSubject("group:to"), { kind: "group", id: "to" });
     for (const invalid of ["", "device:", "from", "profile:to"]) assert.equal(networkSubject(invalid), null);
+});
+
+test("deletion confirms the exact identity even for duplicate names and reports unsettled work", () => {
+    const current = snapshot(); const first = current.devices[0];
+    const second = { ...first, device_id: "replacement", registered_ip: "192.168.1.20", unsettled_jobs: 2 };
+    const a = networkDeviceDeletion(first, current.revision); const b = networkDeviceDeletion(second, current.revision);
+    assert.notDeepEqual(a.args, b.args);
+    assert.match(b.identity, /replacement/); assert.match(b.identity, /192\.168\.1\.20/);
+    assert.match(b.warning, /2 件/); assert.match(b.warning, /停止または完了/);
+    assert.match(a.warning, /過去の履歴/); assert.match(a.warning, /停止する操作ではありません/);
+    first.device_id = "a later registration";
+    assert.equal(a.args.deviceId, "device-a", "the confirmation target must not follow later snapshots");
+});
+
+test("legacy pending name collisions require the name editor instead of blind one-click approval", () => {
+    const request = { request_id: "pending", label: "Win19", observed_ip: "192.168.1.20", key_sha256: "key", created_at_ms: 1, expires_at_ms: 99, status: "pending" as const, name_conflict: true };
+    assert.equal(networkClientAction({ kind: "request", request }, "2"), null);
+    assert.equal(networkClientAction({ kind: "request", request: { ...request, name_conflict: false } }, "2")?.command, "hub_network_approve");
 });
 
 test("a running network snapshot restores its HTTPS bind as IP and port without adding a second scheme", () => {

@@ -33,6 +33,7 @@ export interface Deployment {
 export interface DeploymentRow {
     deployment: Deployment;
     availability: Availability;
+    model_present: boolean;
     last_observed_ms: number | null;
     active_permits: number;
 }
@@ -68,7 +69,7 @@ export interface CatalogChange {
     software_changed: boolean;
 }
 export interface Snapshot {
-    gateway?: { enabled: boolean; ready: boolean; uncertain: boolean; reserved: number; running: number | null; responding: number | null; draining: number | null; quarantined_pools: string[]; scope: "gateway_requests_only" };
+    gateway?: { enabled: boolean; ready: boolean; uncertain: boolean; stopping?: boolean; reserved: number; running: number | null; responding: number | null; draining: number | null; quarantined_pools: string[]; scope: "gateway_requests_only" };
     store: {
         hub_id: string;
         revision: string;
@@ -88,25 +89,19 @@ export interface Snapshot {
 
 export function gatewayStatus(gateway: Snapshot["gateway"]): { label: string; detail: string; attention: boolean } {
     if (!gateway?.enabled) {
-        return gateway?.uncertain
-            ? { label: "実行を保留中", detail: "前回の処理終了を確認できません。接続先の実行終了を確認してから保留を解除してください。", attention: true }
-            : { label: "モデル実行は停止中", detail: "モデル実行を有効にしてサーバーを開始すると、ここに応答と終了確認の状況を表示します。", attention: false };
+        if (gateway?.stopping) return { label: "Hub のモデル中継を停止中", detail: "この Hub の通信を終了しています。モデルのロード・生成管理はホスト側で行います。", attention: true };
+        return { label: "Hub のモデル中継は停止中", detail: "ネットワークを開始すると、この Hub が中継する通信の状況を表示します。", attention: false };
     }
-    if (gateway.running === null || gateway.responding === null || gateway.draining === null) {
-        return { label: "実行状態を確認できません", detail: "終了が未確認のため、新しい実行を保留しています。", attention: true };
+    if (!gateway.ready || gateway.running === null) {
+        return { label: "Hub の中継状態を確認できません", detail: "Hub の中継プロセスとの通信を確認してください。モデルホストの状態はホスト側で確認できます。", attention: true };
     }
-    const counts = `応答中 ${gateway.responding} 件 / 上流終了確認待ち ${gateway.draining} 件 / 予約 ${gateway.reserved} 件`;
-    if (gateway.uncertain) {
-        return { label: counts, detail: `処理終了を確認できない実行枠グループ ${gateway.quarantined_pools.length} 件は、新しい実行を保留しています。`, attention: true };
-    }
-    return { label: counts, detail: gateway.draining > 0
-        ? "端末への応答接続は閉じています。接続先の処理終了を確認するまで、実行枠を保持しています。"
-        : "応答中は端末との接続を維持している要求です。停止や切断の後も、接続先の処理が終わるまで実行枠を保持します。", attention: gateway.draining > 0 };
+    return { label: `中継中 ${gateway.running} 件 / 予約 ${gateway.reserved} 件`,
+        detail: "この Hub 経由の通信件数です。モデルのロード・生成管理は oMLX や LM Studio などのホスト側で行います。", attention: false };
 }
 
-export function loadCounts(rows: Pick<DeploymentRow, "availability">[]): { ready: number; unknown: number } {
-    return { ready: rows.filter(row => row.availability === "ready").length,
-        unknown: rows.filter(row => row.availability === "unknown").length };
+export function modelCounts(rows: Pick<DeploymentRow, "model_present">[]): { present: number; unconfirmed: number } {
+    const present = rows.filter(row => row.model_present).length;
+    return { present, unconfirmed: rows.length - present };
 }
 
 export function capabilityLabel(capability: string): string {
@@ -118,14 +113,14 @@ export const availability: Record<Availability, {
     reason: string;
 }> = {
     ready: {
-        label: "ロード済み",
-        color: "blue",
-        reason: "ホストがモデルのロード済み状態を報告"
+        label: "一覧あり",
+        color: "green",
+        reason: "ホストのモデル一覧で確認"
     },
     jit_pending: {
-        label: "未ロード",
+        label: "一覧あり",
         color: "green",
-        reason: "モデルあり・未ロード。要求時の自動ロード設定は未確認"
+        reason: "ホストのモデル一覧で確認"
     },
     model_missing: {
         label: "モデルなし",
@@ -138,9 +133,9 @@ export const availability: Record<Availability, {
         reason: "直近のモデル確認に失敗しました"
     },
     unknown: {
-        label: "ロード状態不明",
+        label: "未確認",
         color: "gray",
-        reason: "未確認、またはホストにロード情報なし"
+        reason: "ホストのモデル一覧をまだ確認できていません"
     },
     maintenance: {
         label: "メンテナンス",
@@ -148,6 +143,14 @@ export const availability: Record<Availability, {
         reason: "管理者が割当候補から除外"
     },
 };
+
+export function deploymentStatus(row: Pick<DeploymentRow, "availability" | "model_present">): typeof availability[Availability] {
+    if (row.availability === "maintenance") return availability.maintenance;
+    if (row.model_present) return availability.ready;
+    // Fresh model-list presence is the source for membership, not the legacy load hint.
+    return row.availability === "ready" || row.availability === "jit_pending"
+        ? availability.unknown : availability[row.availability];
+}
 // Each identity edit invalidates candidate ownership immediately, including during IME.
 export class DiscoveryOwner {
     private generation = 0;
@@ -172,7 +175,7 @@ export function changeSummary(change: CatalogChange): string {
     if (change.deployments_changed)
         parts.push("配置の変更");
     if (change.policy_changed)
-        parts.push("実行枠・割当ルールの変更");
+        parts.push("同時接続数・割当ルールの変更");
     if (change.software_changed)
         parts.push("Hub の更新");
     return parts.join(" / ");
