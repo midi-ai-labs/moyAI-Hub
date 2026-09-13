@@ -1,0 +1,17 @@
+.shared-admin-tabs { display:flex; flex-wrap:wrap; gap:6px; margin:20px 0; }
+.shared-admin-tabs [aria-selected="true"] { color:var(--ink,#20272b); background:#e0eadc; border-color:#6b815f; }
+.shared-admin-columns { display:grid; grid-template-columns:minmax(240px,1fr) minmax(300px,1fr); gap:24px; align-items:start; }
+.shared-admin-row { border-bottom:1px solid var(--line,#dce1de); padding:18px 0; }
+.shared-admin-row h3 { margin:0 0 8px; }
+.shared-admin-row p { margin:5px 0; overflow-wrap:anywhere; }
+.shared-admin-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
+.shared-admin-mono { font-family:monospace; overflow-wrap:anywhere; font-size:12px; }
+#shared-admin-editor { background:#f5f7f2; padding:20px; border-radius:14px; }
+#shared-admin-editor form { display:grid; gap:14px; }
+#shared-admin-editor label:not(.shared-admin-check) { display:grid; gap:6px; }
+#shared-admin-editor fieldset { border:1px solid #d3dccd; padding:12px; }
+#shared-admin-editor small { font-weight:normal; color:#586452; }
+.shared-admin-check { display:flex; align-items:center; gap:10px; margin:8px 0; }
+.shared-admin-check input { width:auto; margin:0; }
+#shared-admin-editor textarea { width:100%; resize:vertical; font:inherit; border:1px solid #cad4c5; border-radius:7px; padding:10px; }
+@media(max-width:900px) { .shared-admin-columns { grid-template-columns:1fr; } }

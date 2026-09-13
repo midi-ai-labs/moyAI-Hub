@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 axum = "0.8.6"
+base64 = "0.22.1"
 fs2 = "0.4.3"
 reqwest = { version = "0.12.24", default-features = false, features = ["json", "stream", "rustls-tls"] }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -26,6 +27,8 @@ futures-core = "0.3.31"
 futures-util = "0.3.32"
 rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "pem", "ring", "x509-parser"] }
 sha2 = "0.10.9"
+ring = "0.17.14"
+rusqlite = { version = "0.32.1", features = ["bundled"] }
 time = "0.3.47"
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 ulid = { version = "1.2.1", features = ["serde"] }

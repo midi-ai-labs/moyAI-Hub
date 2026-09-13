@@ -9,28 +9,33 @@ const when = (value: number | null) => value ? new Date(value).toLocaleString("j
 
 export function attachDeviceNetwork(host: HTMLElement, clientsHost: HTMLElement, interactionActive: () => boolean,
     onSnapshot: (snapshot: NetworkSnapshot) => void): { refresh: () => Promise<void> } {
-    host.innerHTML = `<div class="section-title"><div><p class="eyebrow">端末間のタスク委任</p><h2 id="network-heading">端末ネットワーク</h2></div><button id="network-refresh" class="secondary">最新情報を取得</button></div>
-      <p class="subtle">端末を登録し、どの端末からどの端末へ依頼できるかを管理します。一つの端末で送信と受付の両方を使えます。</p>
+    host.innerHTML = `<div class="section-title"><div><p class="eyebrow">初めての接続・端末の追加</p><h2 id="network-heading">Desktopの接続</h2></div><button id="network-refresh" class="secondary">最新情報を取得</button></div>
+      <p class="subtle">Hubを公開し、接続ファイルをDesktopへ渡して、届いた参加申請を許可します。同じ接続ファイルを複数の端末で使えます。</p>
       <p id="network-notice" class="field-status" role="status" aria-live="polite"></p>
-      <div class="network-grid"><section class="network-card"><h3>1. ネットワークを開く <span id="network-server-status" class="badge gray">停止中</span></h3>
-        <form id="network-server-form"><div class="network-fields"><label>このHubのIP<input id="network-ip" placeholder="例: 192.168.1.10" required autocomplete="off" spellcheck="false" /></label><label>ポート<input id="network-port" value="9471" inputmode="numeric" required /></label></div>
-        <p class="footnote">端末から接続できる、Hubを起動しているPCのIPを指定します。TLS証明書を自動で作成し、モデル接続とGatewayもまとめて開始・停止します。開始できたIPとポートを保存し、次回は起動ショートカットで再開できます。従来のモデルサーバーが稼働中の場合は先に停止してください。</p><p id="network-hosting-error" class="field-status error" role="status" hidden></p><div class="network-actions"><button id="network-start" class="primary">ネットワークを開始</button><button id="network-stop" type="button" class="danger" hidden>ネットワークを停止</button></div></form>
-        <div class="network-actions"><button id="network-copy-config" type="button" class="secondary">共通設定をコピー</button><button id="network-save-config" type="button" class="secondary">設定ファイルを保存</button><button id="network-diagnose" type="button" class="secondary">接続状態を診断</button></div>
+      <div class="network-grid"><section class="network-card"><h3>1. このHubへの接続を開始 <span id="network-server-status" class="badge gray">停止中</span></h3>
+        <form id="network-server-form"><div class="network-fields"><label>このHubのIP<input id="network-ip" placeholder="例: 192.168.1.10" required autocomplete="off" spellcheck="false" aria-describedby="network-ip-help" /></label><label>ポート<input id="network-port" value="9471" inputmode="numeric" required /></label></div>
+        <p id="network-ip-help" class="footnote">Hubを動かしているPCのLAN側IPを入力します。Windowsの「設定 → ネットワークとインターネット → プロパティ」でIPv4アドレスを確認できます。127.0.0.1は同じPC内だけの接続用です。</p>
+        <p class="footnote">一度開始できたIPとポートは保存されます。次回はStart-Hub.cmdから同じ設定で再開できます。モデル接続とGatewayもまとめて開始・停止します。</p><p id="network-hosting-error" class="field-status error" role="status" hidden></p><div class="network-actions"><button id="network-start" class="primary">ネットワークを開始</button><button id="network-stop" type="button" class="danger" hidden>ネットワークを停止</button><button id="network-diagnose" type="button" class="secondary">接続状態を診断</button></div></form>
         <section id="network-diagnostic-result" aria-label="接続診断の結果" aria-live="polite" hidden></section>
-        <p class="footnote">共通設定にはHubのURLと公開CAだけが含まれます。各Desktopの「moyAI Hub → 端末連携」で読み込みます。</p>
         <details data-details-key="network-connection-details"><summary>接続と証明書の詳細</summary><p id="network-identity" class="network-mono"></p><p id="network-ca" class="network-mono"></p>
           <form id="network-settings-form"><label>モデル通信用ポート（Gateway）<input id="network-gateway-port" inputmode="numeric" autocomplete="off" placeholder="自動" /></label><p class="footnote">空欄または0は自動です。ファイアウォールで固定ポートが必要な場合は1〜65535を指定します。稼働中の変更は次回のネットワーク開始時に適用します。</p><button type="submit" class="secondary">ポート設定を保存</button></form>
           <p id="network-gateway-bind" class="network-mono"></p>
           <p id="network-certificate-status" class="footnote" role="status"></p><dl id="network-certificate-times" class="network-certificate-times"></dl>
           <button id="network-renew-certificate" type="button" class="secondary">証明書を今すぐ更新</button><p class="footnote">HubとGatewayの証明書を更新します。新しい接続から適用し、進行中の通信は継続します。</p>
         </details></section>
-      <section class="network-card"><h3>2. 接続端末で参加を許可する</h3>
-        <p class="subtle">各Desktopへ共通設定を渡してください。Desktopから届いた申請のPC名とIPを確認し、「許可」を押すと参加できます。</p>
-        <a href="#clients" class="primary-link">接続端末・承認待ちを確認する <span id="network-pending-summary"></span> →</a>
-        <p class="footnote">端末名と所属グループは、許可した後でも編集できます。ほかの端末への依頼には、下の接続ルールを設定します。</p></section></div>
-      <div class="network-grid"><section class="network-card"><h3>グループ</h3><p class="footnote">所属は排他的ではありません。例:「開発」「GPU搭載」の両方へ同じ端末を追加できます。</p>
+      <section class="network-card"><h3>2. 接続ファイルをDesktopへ渡す</h3>
+        <p class="subtle">hub-config.tomlを保存して各端末へ渡し、Desktopの「moyAI Hub → 端末連携」で読み込みます。IPや証明書を端末ごとに入力する必要はありません。</p>
+        <div class="network-actions"><button id="network-save-config" type="button" class="primary">接続ファイルを保存</button><button id="network-copy-config" type="button" class="secondary">接続設定をコピー</button></div>
+        <p class="footnote">接続を開始すると保存・コピーできます。含まれるのはHubのURLと公開CAです。管理画面のURLや利用者のパスワードは含みません。</p>
+        <details id="network-config-preview" hidden><summary>接続設定を選択してコピー</summary><textarea id="network-config-text" readonly rows="7" aria-label="Desktopに渡す接続設定"></textarea></details>
+        <h3 class="network-next-step">3. 届いた参加申請を許可する</h3>
+        <p class="subtle">Desktopが自動で申請します。PC名とIPを確認して許可してください。名前と端末グループは後から変更できます。</p>
+        <a id="network-open-pending" href="#clients" class="primary-link">接続端末・承認待ちを確認する <span id="network-pending-summary"></span> →</a>
+        <p class="footnote">共有仕事を使う場合は、続いて<a href="#shared-administration">利用者と仕事の設定</a>でログインする人とプロジェクトを設定します。</p></section></div>
+      <div class="network-rule-introduction"><h3>PC同士で直接仕事を依頼する場合</h3><p class="subtle">端末グループと接続ルールを設定します。Hubが受け付ける共有仕事の利用者・公開先は「利用者と仕事の設定」で管理します。</p></div>
+      <div class="network-grid"><section class="network-card"><h3>端末グループ</h3><p class="footnote">PCをまとめて接続許可を設定できます。例:「開発」「GPU搭載」の両方へ同じ端末を追加できます。</p>
         <form id="network-group-form"><label>編集するグループ<select id="network-group-id"><option value="">新しいグループを追加</option></select></label><label>グループ名<input id="network-group-label" maxlength="160" required /></label><button class="secondary">グループを保存</button></form><ul id="network-group-list" class="network-group-list"></ul></section>
-      <section class="network-card"><h3>3. 方向付きの接続許可</h3><form id="network-rule-form"><div class="network-fields"><label>送信元<select id="network-rule-from" required></select></label><label>受入先<select id="network-rule-to" required></select></label></div>
+      <section class="network-card"><h3>どのPCからどのPCへ依頼できるか</h3><form id="network-rule-form"><div class="network-fields"><label>送信元<select id="network-rule-from" required></select></label><label>受入先<select id="network-rule-to" required></select></label></div>
         <div class="network-fields"><label>依頼の経路<select id="network-rule-usage"><option value="direct">直接の依頼</option><option value="delegated">再委任の宛先</option></select></label><label>扱い<select id="network-rule-effect"><option value="allow">許可する</option><option value="deny">拒否する（個別例外）</option></select></label></div>
         <label>公開対象<select id="network-rule-profile"><option value="">この宛先の公開対象すべて</option></select></label><label>最大の委任段数<select id="network-rule-depth"><option value="1">1段</option><option value="2">2段（例: 00 → 19 → 20）</option><option value="3">3段</option></select></label><button class="primary">接続ルールを追加</button></form>
         <p class="footnote">矢印は一方向です。逆向きは別に許可します。再委任には直前の端末からの直接許可と、最初の依頼元から宛先への再委任許可の両方が必要です。</p></section></div>
@@ -64,6 +69,7 @@ export function attachDeviceNetwork(host: HTMLElement, clientsHost: HTMLElement,
     let requestSerial = 0;
     let selectedClient: { kind: "request" | "device"; id: string } | null = null;
     let diagnostic: { result: NetworkDiagnostics; target: string; checkedAt: number } | null = null;
+    let copiedConfigTarget: string | null = null;
     // Compare server projection markup with its previous projection, not live
     // DOM serialization: details.open and user selections belong to the UI.
     let renderedClientRows: string | null = null;
@@ -110,6 +116,11 @@ export function attachDeviceNetwork(host: HTMLElement, clientsHost: HTMLElement,
     function render(): void {
         const snapshot = owner.snapshot;
         if (!snapshot) return;
+        const currentConfigTarget = JSON.stringify([snapshot.hub_id, snapshot.server.running, snapshot.server.bind, snapshot.ca_sha256]);
+        if (copiedConfigTarget !== currentConfigTarget) {
+            node("network-config-preview").hidden = true;
+            node<HTMLTextAreaElement>("network-config-text").value = "";
+        }
         node("network-server-status").textContent = snapshot.server.running ? "稼働中" : "停止中";
         node("network-server-status").className = `badge ${snapshot.server.running ? "green" : "gray"}`;
         node("network-start").hidden = snapshot.server.running;
@@ -249,6 +260,11 @@ export function attachDeviceNetwork(host: HTMLElement, clientsHost: HTMLElement,
     });
     node("network-search").addEventListener("input", render);
     node("network-filter").addEventListener("change", render);
+    node("network-open-pending").addEventListener("click", () => {
+        node<HTMLSelectElement>("network-filter").value = owner.snapshot?.join_requests.some(row => row.status === "pending") ? "pending" : "all";
+        node<HTMLInputElement>("network-search").value = "";
+        render();
+    });
     node("network-server-form").addEventListener("submit", event => {
         event.preventDefault(); const ip = value("network-ip").trim();
         const bind = `${ip.includes(":") ? `[${ip.replace(/^\[|\]$/g, "")}]` : ip}:${value("network-port").trim()}`;
@@ -284,7 +300,14 @@ export function attachDeviceNetwork(host: HTMLElement, clientsHost: HTMLElement,
         const args = exportArgs(); if (!args) return;
         void perform("export", "hub_network_export", args, result => {
             const text = (result as { toml: string }).toml;
-            void copyText(text).then(() => message("公開情報だけの共通設定をコピーしました。"), () => message("コピーできませんでした。設定ファイルを保存してください。", true));
+            copiedConfigTarget = JSON.stringify([owner.snapshot!.hub_id, owner.snapshot!.server.running, owner.snapshot!.server.bind, owner.snapshot!.ca_sha256]);
+            node("network-config-preview").hidden = false;
+            node<HTMLTextAreaElement>("network-config-text").value = text;
+            void copyText(text).then(() => message("接続設定をコピーしました。Desktopの「moyAI Hub → 端末連携」へ貼り付けてください。"), () => {
+                node<HTMLDetailsElement>("network-config-preview").open = true;
+                node<HTMLTextAreaElement>("network-config-text").focus(); node<HTMLTextAreaElement>("network-config-text").select();
+                message("下の接続設定を選択しました。手動でコピーするか、接続ファイルを保存してください。", true);
+            });
         });
     });
     node("network-save-config").addEventListener("click", () => {

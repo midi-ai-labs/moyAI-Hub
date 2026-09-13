@@ -150,16 +150,24 @@ test("Public config and Web URL copy through the real browser clipboard", async 
     await expect(page.locator("#network-stop")).toBeVisible();
     expect((await hub.observeNetwork()).server.running).toBe(true);
     await page.locator("#network-copy-config").click();
-    await expect(page.locator("#network-notice")).toContainText("公開情報だけの共通設定をコピーしました。");
+    await expect(page.locator("#network-notice")).toContainText("接続設定をコピーしました。");
     // Read only after this test has successfully written its own public fixture config.
     const copied = await page.evaluate(() => navigator.clipboard.readText());
     expect(copied).toContain(`https://127.0.0.1:${hub.networkPort}`);
     expect(copied).toContain("BEGIN CERTIFICATE");
     expect(copied).not.toContain("PRIVATE KEY");
+    await page.evaluate(() => Object.defineProperty(navigator, "clipboard", { configurable: true, value: undefined }));
+    await page.locator("#network-copy-config").click();
+    await expect(page.locator("#network-config-text")).toBeVisible();
+    const textareaConfig = copied.replace(/\r\n/g, "\n");
+    await expect(page.locator("#network-config-text")).toHaveValue(textareaConfig);
+    expect(await page.locator("#network-config-text").evaluate(node => [node.selectionStart, node.selectionEnd])).toEqual([0, textareaConfig.length]);
+    await testInfo.attach("public-config-manual-copy", { body: await page.locator("#device-network").screenshot(), contentType: "image/png" });
+    await page.evaluate(() => delete navigator.clipboard);
     const downloadPending = page.waitForEvent("download");
     await page.locator("#network-save-config").click();
     const download = await downloadPending;
-    const file = testInfo.outputPath("copied-hub-participation.toml");
+    const file = testInfo.outputPath("copied-hub-config.toml");
     await download.saveAs(file);
     // Windows' text clipboard normalizes line endings; TOML data and escaped CA bytes must remain identical.
     expect((await readFile(file, "utf8")).replaceAll("\r\n", "\n")).toBe(copied.replaceAll("\r\n", "\n"));

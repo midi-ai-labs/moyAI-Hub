@@ -435,7 +435,7 @@ pub async fn run_server(catalog_path: PathBuf, settings: Option<Value>) -> Resul
     if let Some(url) = web["remote_url"].as_str() {
         println!("Web public URL: {url}");
     }
-    println!("管理者ログインなし。終了は Ctrl+C または --stop を使用します。");
+    println!("Web管理には管理者ログインが必要です。終了は Ctrl+C または --stop を使用します。");
     let state = Arc::new(HostState {
         admin,
         descriptor: descriptor.clone(),

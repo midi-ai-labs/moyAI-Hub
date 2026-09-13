@@ -183,7 +183,7 @@ test("Unavailable and empty providers clear candidates, and shared model capacit
 
 test("Groups and directed rules preserve drafts and reject stale edits across two browsers", async ({ page, context, hub }, testInfo) => {
     await ready(page, hub.url);
-    await page.getByRole("link", { name: "ネットワーク設定", exact: false }).click();
+    await page.locator('nav a[href="#device-network"]').click();
     await page.locator("#network-group-label").fill("Clients");
     await page.getByRole("button", { name: "グループを保存", exact: true }).click();
     await expect(page.locator("#network-group-list")).toContainText("Clients");

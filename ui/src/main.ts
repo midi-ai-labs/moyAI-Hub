@@ -5,6 +5,7 @@ import { reconcileModelRows } from "./model_rows.ts";
 import { attachDeviceNetwork } from "./network.ts";
 import { attachHistory } from "./history.ts";
 import { attachWebManagement } from "./web_admin.ts";
+import { attachSharedAdmin } from "./shared_admin.ts";
 import "./history.css";
 import "./web_admin.css";
 import "./style.css";
@@ -48,6 +49,8 @@ function errorText(error: unknown): string {
 let snapshot: Snapshot | null = null;
 let pending: Snapshot | null = null;
 let pollInFlight = false;
+let launchNotice = window.location.hash === "#hub-already-running" ? "moyAI Hub は起動済みです。稼働中の Hub の管理画面を開きました。"
+    : window.location.hash === "#hub-started" ? "moyAI Hub を起動しました。ブラウザーを閉じても Hub は動作を続けます。" : null;
 let pointerActive = false;
 const keys = new Set<string>();
 let composing = false;
@@ -117,8 +120,6 @@ function render(next: Snapshot) {
     setText("metric-present", confirmed.present);
     setText("metric-unconfirmed", confirmed.unconfirmed);
     setText("metric-revision", next.store.revision);
-    setText("header-status", next.server.running ? "モデル接続は稼働中" : "モデル接続は停止中");
-    el("header-dot").className = `dot ${next.server.running ? "green" : "gray"}`;
     setText("server-badge", next.server.running ? "稼働中" : "停止中");
     el("server-badge").className = `badge ${next.server.running ? "green" : "gray"}`;
     button("start-server").hidden = next.server.running;
@@ -165,14 +166,25 @@ async function poll() {
     try {
         await deviceNetwork.refresh();
         await webManagement.refresh();
+        await sharedAdministration.refresh();
         const next = await invoke<Snapshot>("hub_snapshot");
+        setText("header-status", "Hub本体は稼働中");
+        el("header-dot").className = "dot green";
         setText("management-status", "Hub本体に接続中");
+        if (launchNotice) {
+            notify(launchNotice);
+            launchNotice = null;
+            if (["#hub-started", "#hub-already-running"].includes(window.location.hash))
+                window.history.replaceState(null, "", window.location.pathname + window.location.search);
+        }
         if (interactionActive())
             pending = next;
         else
             render(next);
     }
     catch (error) {
+        setText("header-status", "Hub本体の応答を確認できません");
+        el("header-dot").className = "dot gray";
         setText("management-status", "Hub本体の応答を確認できません");
         notify(errorText(error), true);
     }
@@ -430,12 +442,18 @@ button("remove-model").addEventListener("click", () => {
 });
 const history = attachHistory(el("mcp-history"));
 const webManagement = attachWebManagement();
+const sharedAdministrationHost = document.createElement("section");
+sharedAdministrationHost.id = "shared-administration";
+sharedAdministrationHost.className = "panel";
+el("device-network").before(sharedAdministrationHost);
+const sharedAdministration = attachSharedAdmin(sharedAdministrationHost);
 document.addEventListener("click", event => {
     const target = (event.target as HTMLElement).closest<HTMLButtonElement>("button[data-network-history]");
     if (target && !target.disabled) history.showDevice(target.dataset.networkHistory!);
 });
 const deviceNetwork = attachDeviceNetwork(el("device-network"), el("network-clients-management"), interactionActive, network => {
     history.updateNetwork(network);
+    sharedAdministration.updateDevices(network.devices);
     const pendingCount = network.join_requests.filter(request => request.status === "pending").length;
     setText("metric-clients", network.devices.length);
     setText("metric-clients-detail", `承認待ち ${pendingCount} 台 / オンライン ${network.devices.filter(device => device.online).length} 台`);

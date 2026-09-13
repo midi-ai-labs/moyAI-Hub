@@ -292,25 +292,25 @@ test("Legacy invitation controls and rule depth three preserve exact selected gr
 
 test.describe("Configured external Web controls", () => {
     test.use({ remoteWeb: true });
-    test("External URL is readonly and copies the server-owned URL from either actual listener", async ({ page, context, hub }, testInfo) => {
+    test("Local management copies the configured external URL and HTTP remote requires HTTPS", async ({ page, context, hub }, testInfo) => {
         const errors = await ready(page, hub);
         expect(hub.remoteUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/admin\/$/);
         expect(hub.remoteUrl).not.toBe(hub.url);
-        for (const url of [hub.url, hub.remoteUrl]) {
-            await context.grantPermissions(["clipboard-read", "clipboard-write"], { origin: new URL(url).origin });
-            await page.goto(url);
-            await expect(page.locator("#management-status")).toHaveText("Hub本体に接続中");
-            await page.locator('nav a[href="#web-management"]').click();
-            await expect(page.locator("#web-remote-url")).toHaveValue(hub.remoteUrl);
-            await expect(page.locator("#web-remote-url")).toHaveJSProperty("readOnly", true);
-            await expect(page.locator("#web-url")).toHaveValue(hub.url);
-            await page.locator("#web-copy-remote-url").click();
-            await expect(page.locator("#web-status")).toHaveText("URLをコピーしました。");
-            expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(hub.remoteUrl);
-            await page.locator("#web-copy-url").click();
-            expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(hub.url);
-        }
+        await context.grantPermissions(["clipboard-read", "clipboard-write"], { origin: new URL(hub.url).origin });
+        await page.locator('nav a[href="#web-management"]').click();
+        await expect(page.locator("#web-remote-url")).toHaveValue(hub.remoteUrl);
+        await expect(page.locator("#web-remote-url")).toHaveJSProperty("readOnly", true);
+        await expect(page.locator("#web-url")).toHaveValue(hub.url);
+        await page.locator("#web-copy-remote-url").click();
+        await expect(page.locator("#web-status")).toHaveText("URLをコピーしました。");
+        expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(hub.remoteUrl);
+        await page.locator("#web-copy-url").click();
+        expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(hub.url);
         await capture(page, testInfo, "external-web-addresses");
+        await page.goto(hub.remoteUrl);
+        await expect(page.locator("#management-app")).toBeHidden();
+        await expect(page.locator("#web-auth-help")).toContainText("HTTPSの管理URL");
+        await expect(page.locator('#web-authentication input[type="password"]')).toHaveCount(0);
         expect(errors).toEqual([]);
     });
 });

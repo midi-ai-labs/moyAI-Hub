@@ -71,7 +71,8 @@ async function withUi(invoke: (name: string, args: Record<string, unknown>) => P
     const calls: { name: string; args: Record<string, unknown> }[] = [];
     const timers = new Map<number, () => unknown>(); let nextTimer = 1;
     const values = [async (path: string, options?: RequestInit) => {
-        if (path === "/admin/session") return Response.json({ csrf: "test-csrf", epoch: "test-epoch" });
+        if (path === "/admin/session") return Response.json({ csrf: "test-csrf", epoch: "test-epoch",
+            authentication: { configured: true, bootstrap_allowed: false, login_allowed: true, session_id: "human-session", user: { user_id: "admin", display_name: "管理者", administrator: true } } });
         assert.equal(path, "/admin/command");
         const { command, args } = JSON.parse(String(options?.body)) as { command: string; args: Record<string, unknown> };
         calls.push({ name: command, args });

@@ -9,6 +9,8 @@
     </title>
   </head>
   <body>
+    <div id="web-authentication"></div>
+    <div id="management-app" hidden inert>
     <div class="shell">
       <aside class="sidebar">
         <a href="#overview" class="brand">
@@ -19,7 +21,7 @@
               Hub
             </b>
             <small>
-              モデル管理
+              共有と接続の管理
             </small>
           </span>
         </a>
@@ -27,8 +29,9 @@
           ページ内の移動
         </div>
         <nav aria-label="ページ内の移動">
-          <a href="#device-network" class="nav-link">⇄<span>ネットワーク設定</span></a>
-          <a href="#web-management" class="nav-link">↗<span>Web管理</span></a>
+          <a href="#device-network" class="nav-link">⇄<span>Desktopの接続</span></a>
+          <a href="#shared-administration" class="nav-link">▦<span>利用者と仕事の設定</span></a>
+          <a href="#web-management" class="nav-link">↗<span>管理画面のURL</span></a>
           <a href="#overview" class="nav-link">
             ◉
             <span>
@@ -80,17 +83,17 @@
               管理の概要
             </p>
             <h1>
-              モデルと端末を、ひとつの場所で。
+              みんなで使うmoyAIを、ここから。
             </h1>
             <p class="subtle">
-              端末ネットワークを開き、参加する端末・接続の許可・モデルの割当を管理します。
+              Desktopの接続、利用者と仕事の公開先、共有するモデルを管理します。
             </p>
           </div>
           <div class="header-status">
             <span class="dot" id="header-dot">
             </span>
             <span id="header-status">
-              モデル接続は停止中
+              Hub本体の接続を確認中
             </span>
           </div>
         </header>
@@ -145,13 +148,13 @@
                 はじめに
               </p>
               <h2 id="server-heading">
-                端末ネットワークから始める
+                Desktopを接続して、仕事を共有する
               </h2>
             </div>
           </div>
           <div class="network-introduction">
-            <p class="subtle">このHubのIPを指定してネットワークを開始し、共通設定をDesktopへ渡します。届いた参加申請は「接続端末」で許可します。モデル接続とGatewayもまとめて起動します。</p>
-            <a id="open-device-network" class="primary-link" href="#device-network">端末ネットワークを設定する →</a>
+            <p class="subtle">最初にHubへの接続を開始し、接続ファイルを各Desktopへ渡します。端末の参加を許可したら、利用者・プロジェクト・仕事の実行先を設定してください。</p>
+            <a id="open-device-network" class="primary-link" href="#device-network">Desktopの接続を準備する →</a>
           </div>
           <div id="gateway-summary" class="execution-summary" role="status"><h3>Hub のモデル中継</h3><p id="gateway-status">Hub のモデル中継は停止中</p><p id="gateway-detail" class="subtle">この Hub が中継する通信の状況を表示します。</p></div>
           <details class="technical-details"><summary>中継経路の詳しい説明</summary><p class="footnote">Gateway が Desktop とモデルホストの通信を中継します。同時接続数の上限はこの Hub 経由の通信に適用します。モデルのロード・生成・停止はホスト側が管理します。</p></details>
@@ -492,7 +495,8 @@
         </div>
       </form>
     </dialog>
-    <script type="module" src="/src/main.ts">
+    </div>
+    <script type="module" src="/src/web_entry.ts">
     </script>
   </body>
 </html>

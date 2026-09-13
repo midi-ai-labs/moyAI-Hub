@@ -52,6 +52,7 @@ fn executable() -> &'static Path {
 #[serde(deny_unknown_fields)]
 struct LaunchReply {
     pid: u32,
+    already_running: bool,
     web_url: String,
     network_running: bool,
     needs_setup: bool,
@@ -279,6 +280,7 @@ async fn assert_network(client: &HostClient, network: SocketAddr, gateway: Socke
 async fn launch_first_profile_reports_setup_and_keeps_web_running() {
     let profile = Profile::new();
     let reply = profile.launch(true, true).await;
+    assert!(!reply.already_running);
     assert!(reply.needs_setup);
     assert!(!reply.network_running);
     assert!(reply.network_error.is_none());
@@ -314,6 +316,10 @@ async fn launch_saved_network_restores_gateway_and_serializes_duplicate_callers(
     // Two independent public CLI callers race from a stopped saved profile.
     let (left, right) = tokio::join!(profile.launch(false, true), profile.launch(false, true));
     assert_eq!(left.pid, right.pid);
+    assert_ne!(
+        left.already_running, right.already_running,
+        "exactly one caller must start the server"
+    );
     assert_eq!(left.web_url, right.web_url);
     for reply in [&left, &right] {
         assert!(reply.network_running);
@@ -330,6 +336,7 @@ async fn launch_saved_network_restores_gateway_and_serializes_duplicate_callers(
     assert_eq!(std::fs::read(profile.hosting_path()).unwrap(), saved);
 
     let duplicate = profile.launch(false, true).await;
+    assert!(duplicate.already_running);
     let same = profile.connect().await;
     assert_eq!(same.instance_id(), restored.instance_id());
     assert_eq!(duplicate.pid, left.pid);

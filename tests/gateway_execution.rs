@@ -294,9 +294,12 @@ impl Fixture {
     ) -> (u16, Value) {
         self.post("/v1/requests/prepare",client["client_token"].as_str().unwrap(),json!({"id":client["id"],"context":context,"turn_id":turn,"request_id":request,"expected_hub_id":client["hub_id"],"reviewed_revision":client["revision"]})).await
     }
-    async fn generate(&self, ready: &Value) -> reqwest::Response {
+    fn generation_request(&self, ready: &Value) -> reqwest::RequestBuilder {
         self.client.post(format!("{}/chat/completions",ready["gateway_base_url"].as_str().unwrap())).bearer_auth(ready["request_token"].as_str().unwrap())
-            .json(&json!({"model":ready["logical_model_id"],"messages":[{"role":"user","content":"PROMPT_CANARY"}],"stream":true})).send().await.unwrap()
+            .json(&json!({"model":ready["logical_model_id"],"messages":[{"role":"user","content":"PROMPT_CANARY"}],"stream":true}))
+    }
+    async fn generate(&self, ready: &Value) -> reqwest::Response {
+        self.generation_request(ready).send().await.unwrap()
     }
     async fn wait_status(&self, accept: impl Fn(&Value) -> bool) -> Value {
         tokio::time::timeout(Duration::from_secs(3), async {
@@ -362,13 +365,49 @@ async fn companion_response_failure_does_not_require_provider_recovery_before_re
     let process = fixture.companion(directory.path()).await;
     let client = fixture.register().await;
     let ready = fixture.prepare(&client, "main", "turn", "request").await.1;
-    let _ = fixture.generate(&ready).await.bytes().await;
+    // An incomplete upstream can abort the downstream before headers are flushed,
+    // or after reqwest has returned the response. Neither may become successful EOF.
+    match fixture.generation_request(&ready).send().await {
+        Ok(response) => {
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                response.bytes().await.is_err(),
+                "truncation must fail the response"
+            );
+        }
+        Err(error) => assert!(
+            error.is_request() && !error.is_connect() && !error.is_timeout(),
+            "expected response disconnection, not failure to reach the companion: {error:?}"
+        ),
+    }
+    assert_eq!(fixture.provider.records.lock().unwrap().len(), 1);
     let status = fixture.wait_status(|s| s["running"] == 0).await;
     assert_eq!(status["quarantined_pools"], json!([]));
+    assert_eq!(
+        fixture
+            .post(
+                "/v1/turns/finish",
+                client["client_token"].as_str().unwrap(),
+                json!({"id":client["id"],"context":"main","turn_id":"turn"})
+            )
+            .await
+            .0,
+        200
+    );
+    let (status, next_request) = fixture
+        .prepare(&client, "side_chat", "next-turn", "next-request")
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        next_request["state"], "ready",
+        "the failed response must release its slot"
+    );
     assert!(process.stop().await);
+    assert!(!execution_running(directory.path()));
     assert!(!directory.path().join("gateway-uncertain.json").exists());
     let next = fixture.companion(directory.path()).await;
     assert!(next.stop().await);
+    assert_eq!(fixture.provider.records.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]

@@ -1,6 +1,6 @@
 # Hubのブラウザー試験
 
-Playwrightで実際のHubサーバーとブラウザーを起動します。Hubの管理用ネイティブアプリや、管理画面へのログイン操作は使いません。管理APIのmock、保存データの直接編集、証明書の検証無効化は行いません。モデルホストのメタデータと参加端末の応答は、明示した試験用provider・participantを使います。
+Playwrightで実際のHubサーバーとブラウザーを起動します。共有fixtureは隔離したHubの実APIで管理者を初回設定し、認証Cookieをブラウザーへ渡します。認証専用ケースはこの準備を無効にし、初回設定・ログイン・ログアウト画面から操作します。管理APIのmock、保存データの直接編集、証明書の検証無効化は行いません。モデルホストのメタデータと参加端末の応答は、明示した試験用provider・participantを使います。
 
 ## 準備と実行
 
@@ -19,7 +19,7 @@ npm run verify:gui -- --suite regression
 | suite | 実行する範囲 |
 | --- | --- |
 | `smoke` | Web起動・ネットワーク開始停止・共通config保存、モデル探索・登録・編集・削除、端末承認・名称重複検証・所属・停止・削除 |
-| `regression` | 現行の全20ケース。smokeに加え、更新競合、履歴、キーボード、clipboard、ポート競合、各種controlの追加操作 |
+| `regression` | 現行の全ケース。smokeに加え、管理者認証、更新競合、履歴、キーボード、clipboard、ポート競合、各種controlの追加操作 |
 
 単体件数をGUI件数に加算しません。GUIは0件、skip、flaky、失敗、smokeの3件不足・過剰を成功にしません。全段階が終わる前の要約は`incomplete`で、単体やビルドだけの成功を全体成功にしません。既存fixtureの終了確認に失敗した場合もPlaywrightが失敗を返します。新しいケースを追加したら、smokeへ昇格する必要があるかを判断し、通常はregressionで実行します。
 
@@ -64,7 +64,7 @@ npm run verify:gui -- --headless
 - 共通configをダウンロードし、案内先URLと公開証明書が含まれることを確認する。
 - ブラウザー操作で端末ネットワークを停止し、その後もWeb管理画面を利用できることを確認する。
 - 再接続、従来の手動サーバー開始・停止、760px幅での表示と横スクロールの有無を確認する。
-- 認証Cookieが作られないこと、JavaScriptの未処理エラーがないことを確認する。
+- 管理者の認証CookieがHttpOnly・SameSite=Strictで、JavaScriptから読み取れないことと、JavaScriptの未処理エラーがないことを確認する。
 - 四つのprovider profileでモデルを探索し、登録・編集・メンテナンス・削除・catalog revision・共有容量を確認する。空の一覧、接続失敗からの回復、接続先変更後に遅れて返る旧ホストの候補も確認する。
 - グループと方向付きルールを保存する。二つのページで同時編集した場合のrevision競合と、更新中の入力・focus・展開状態の維持を確認する。
 - ネットワークの診断、証明書更新、Gatewayポート設定の入力検証・固定値保存・ネットワーク再開と画面再読込後の実適用、および760px幅の横スクロールの有無を確認する。
@@ -81,7 +81,9 @@ npm run verify:gui -- --headless
 
 固定値の逆方向を補う同ファイルの1ケースでは、送信元を未選択へ戻す、拒否から許可へ選び直して保存、特定公開対象からすべてへ明示選択、端末の照合IDと恒久失効のdetailsを閉じて通常poll後に開き直す操作を確認します。未保存の失効checkboxは保持だけを検査し、dialog取消後に未失効を照合します。
 
-外部Web URLのケースは、共有fixtureの`remoteWeb: true`で公開CLIの`--web-settings`を指定します。専用のloopback HTTP listenerを併設するだけで、LANへの公開・FW変更・HTTPS例外設定は行いません。既定のケースとDesktop結合consumerは従来どおりlocal listenerのみです。終了時は追加listenerも同じownerが停止を確認します。互換参加コードのコピーは試験自身が発行した使い捨てコードだけを照合します。実利用者のコードや既存clipboardは読みません。traceには試験用コードを含み得るため、共有前に確認してください。
+`authentication.spec.mjs`は初回設定、確認用パスワード不一致、ログイン失敗、ログアウト、再ログイン、遅延応答の遮断、別タブでのCookie置換と旧セッション要求の拒否を実サーバーで確認します。パスワードとCookieは試験専用です。
+
+外部Web URLのケースは、共有fixtureの`remoteWeb: true`で公開CLIの`--web-settings`を指定します。専用のloopback HTTP listenerを併設するだけで、LANへの公開・FW変更・HTTPS例外設定は行いません。local管理画面から外部URLを表示・コピーし、remote HTTPページではパスワード欄がなくHTTPSを案内することを確認します。既定のケースとDesktop結合consumerは従来どおりlocal listenerのみです。終了時は追加listenerも同じownerが停止を確認します。互換参加コードのコピーは試験自身が発行した使い捨てコードだけを照合します。実利用者のコードや既存clipboardは読みません。traceには試験用認証情報を含み得るため、共有前に確認してください。
 
 `provider-fixture.mjs`はloopbackでモデル一覧だけを返すHTTPホストです。`device-fixture.mjs`は試験専用のP-256鍵・CSRを生成し、Hubの参加／mTLS／生存確認／公開申告／履歴応答プロトコルを使います。Hub管理画面では生成できない外部参加要求を準備するためのもので、Desktopアプリやエージェント実行を代替して受入済みとするものではありません。管理の変更はブラウザーから行います。
 

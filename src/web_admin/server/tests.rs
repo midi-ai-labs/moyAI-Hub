@@ -45,6 +45,16 @@ async fn local_management_is_independent_and_settings_restore_without_access() {
     assert!(started.get("key_id").is_none());
     assert_eq!(started["remote_url"], Value::Null);
     assert_eq!(client().get(&url).send().await.unwrap().status(), 200);
+    let local_session: Value = client()
+        .get(format!("{}session", url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(local_session["authentication"]["login_allowed"], true);
+    assert_eq!(local_session["authentication"]["bootstrap_allowed"], true);
     assert!(enable(&admin, WebSettings::default()).await.is_err());
     admin.dispatch("hub_network_stop", json!({})).await.unwrap();
     assert_eq!(client().get(&url).send().await.unwrap().status(), 200);
@@ -123,7 +133,7 @@ async fn proxy_listener_uses_fixed_public_origin_and_survives_network_stop() {
 }
 
 #[tokio::test]
-async fn explicit_http_listener_serves_anonymous_clients_at_its_advertised_origin() {
+async fn explicit_http_listener_serves_guidance_but_requires_safe_transport_for_management() {
     let directory = tempfile::tempdir().unwrap();
     let admin = open(&directory);
     let port = free_port().await;
@@ -152,6 +162,13 @@ async fn explicit_http_listener_serves_anonymous_clients_at_its_advertised_origi
     assert_eq!(response.status(), 200);
     assert!(response.headers().get("set-cookie").is_none());
     let session: Value = response.json().await.unwrap();
+    assert_eq!(
+        session["authentication"],
+        json!({
+            "configured":false,"user":null,"session_id":null,
+            "bootstrap_allowed":false,"login_allowed":false
+        })
+    );
     let csrf = session["csrf"].as_str().unwrap();
     let command = || {
         client()
@@ -161,7 +178,100 @@ async fn explicit_http_listener_serves_anonymous_clients_at_its_advertised_origi
             .header("x-moyai-csrf", csrf)
             .json(&json!({"command":"hub_network_snapshot","args":{}}))
     };
-    assert_eq!(command().send().await.unwrap().status(), 200);
+    assert_eq!(command().send().await.unwrap().status(), 403);
+    assert_eq!(
+        client()
+            .get(&url)
+            .header("host", &authority)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let username = "http-listener-admin";
+    let password = "Http listener administrator password";
+    let token = {
+        use crate::identity::{self, SessionAudience};
+        let store = admin.shared_work.lock().unwrap();
+        let db = store.identity_connection();
+        let now = crate::service::now_ms();
+        identity::bootstrap_admin(db, username, "Listener administrator", password, now).unwrap();
+        identity::login(db, username, password, SessionAudience::WebAdmin, None, now)
+            .unwrap()
+            .token
+    };
+    let cookie = format!("moyai_admin={token}");
+    let request_session = crate::web_admin::authentication::session_id(&token);
+    assert_eq!(
+        command()
+            .header("cookie", &cookie)
+            .header("x-moyai-session", &request_session)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    assert_eq!(
+        client()
+            .post(format!("{url}login"))
+            .header("host", &authority)
+            .header("origin", &origin)
+            .header("x-moyai-csrf", csrf)
+            .json(&json!({"username":username,"password":password}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    let protected: Value = client()
+        .get(format!("{url}session"))
+        .header("host", &authority)
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(protected["authentication"]["configured"], true);
+    assert_eq!(protected["authentication"]["login_allowed"], false);
+    assert!(protected["authentication"]["user"].is_null());
+    // The independent direct-loopback listener remains usable with human authentication.
+    let local = started["local_url"].as_str().unwrap();
+    let local_origin = reqwest::Url::parse(local)
+        .unwrap()
+        .origin()
+        .ascii_serialization();
+    let local_session: Value = client()
+        .get(format!("{local}session"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(local_session["authentication"]["login_allowed"], true);
+    let local_command = || {
+        client()
+            .post(format!("{local}command"))
+            .header("origin", &local_origin)
+            .header("x-moyai-csrf", local_session["csrf"].as_str().unwrap())
+            .json(&json!({"command":"hub_network_snapshot","args":{}}))
+    };
+    assert_eq!(local_command().send().await.unwrap().status(), 401);
+    assert_eq!(
+        local_command()
+            .header("cookie", &cookie)
+            .header("x-moyai-session", &request_session)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
     assert_eq!(client().get(&url).send().await.unwrap().status(), 403);
     let mut forged = command().build().unwrap();
     forged

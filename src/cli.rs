@@ -8,7 +8,7 @@ Usage: moyai-hub [--data-dir PATH] [--web-port PORT | --web-settings FILE]\n\
        moyai-hub --status [--data-dir PATH]\n\
        moyai-hub --stop [--data-dir PATH]\n\n\
 Starts Web management automatically. First start: http://127.0.0.1:9080/admin/\n\
-Web management currently has no administrator login. Device mTLS is separate.\n\
+Web management requires administrator login. Device mTLS is separate.\n\
 --web-port PORT       Local HTTP port (0 selects a free port); saves on success.\n\
 --web-settings FILE   JSON Web settings; see docs/web-management.md for LAN/TLS.\n\
 --data-dir PATH       Hub data directory; MOYAI_HUB_DATA_DIR also supported.\n\
@@ -16,6 +16,9 @@ Web management currently has no administrator login. Device mTLS is separate.\n\
 --no-browser          With --launch, print the result without opening a browser.\n\
 --status             Print current Web URLs and running state; never starts Hub.\n\
 --stop               Stop this data directory's Hub and its Gateway.\n\
+--backup-dir PATH    Copy a stopped Hub to a new checksummed backup directory.\n\
+--restore-from PATH  Restore a verified backup to a new --data-dir directory.\n\
+--acknowledge-runners-stopped  Required for restore after stopping all affected Runners.\n\
 Ctrl+C also stops the foreground server. Closing a browser does not stop Hub.\n";
 
 #[derive(Debug, PartialEq)]
@@ -35,6 +38,15 @@ pub enum Action {
     },
     Status(Option<PathBuf>),
     Stop(Option<PathBuf>),
+    Backup {
+        data: Option<PathBuf>,
+        destination: PathBuf,
+    },
+    Restore {
+        data: Option<PathBuf>,
+        source: PathBuf,
+        acknowledge_runners_stopped: bool,
+    },
 }
 
 pub fn parse(args: Vec<OsString>) -> Result<Action, String> {
@@ -46,9 +58,20 @@ pub fn parse(args: Vec<OsString>) -> Result<Action, String> {
     }
     let (mut data, mut port, mut settings, mut mode) = (None, None, None, None);
     let mut no_browser = false;
+    let mut maintenance_path = None;
+    let mut acknowledge_runners_stopped = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.to_str() {
+            Some("--backup-dir" | "--restore-from") if mode.is_none() => {
+                mode = arg.to_str().map(str::to_owned);
+                maintenance_path = Some(PathBuf::from(
+                    args.next().ok_or("Maintenance needs a directory path")?,
+                ));
+            }
+            Some("--acknowledge-runners-stopped") if !acknowledge_runners_stopped => {
+                acknowledge_runners_stopped = true
+            }
             Some("--data-dir") if data.is_none() => {
                 data = Some(PathBuf::from(args.next().ok_or("--data-dir needs a path")?));
             }
@@ -79,6 +102,20 @@ pub fn parse(args: Vec<OsString>) -> Result<Action, String> {
     if port.is_some() && settings.is_some() {
         return Err("Use either --web-port or --web-settings".into());
     }
+    if matches!(mode.as_deref(), Some("--backup-dir" | "--restore-from"))
+        && (port.is_some() || settings.is_some() || no_browser)
+    {
+        return Err(
+            "Backup/restore require a stopped Hub and do not accept hosting options".into(),
+        );
+    }
+    if acknowledge_runners_stopped && mode.as_deref() != Some("--restore-from") {
+        return Err("--acknowledge-runners-stopped applies only to restore".into());
+    }
+    if mode.as_deref() == Some("--restore-from") && (!acknowledge_runners_stopped || data.is_none())
+    {
+        return Err("Restore requires a new --data-dir and --acknowledge-runners-stopped".into());
+    }
     if matches!(mode.as_deref(), Some("--status" | "--stop"))
         && (port.is_some() || settings.is_some())
     {
@@ -88,6 +125,15 @@ pub fn parse(args: Vec<OsString>) -> Result<Action, String> {
         return Err("--no-browser applies only with --launch".into());
     }
     match mode.as_deref() {
+        Some("--backup-dir") => Ok(Action::Backup {
+            data,
+            destination: maintenance_path.expect("parsed path"),
+        }),
+        Some("--restore-from") => Ok(Action::Restore {
+            data,
+            source: maintenance_path.expect("parsed path"),
+            acknowledge_runners_stopped,
+        }),
         Some("--status") => Ok(Action::Status(data)),
         Some("--stop") => Ok(Action::Stop(data)),
         Some("--launch") => Ok(Action::Launch {
@@ -164,6 +210,38 @@ fn web_settings(port: Option<u16>, settings: Option<PathBuf>) -> Result<Option<V
 pub async fn run(action: Action) -> Result<(), String> {
     match action {
         Action::Help => Ok(()),
+        Action::Backup { data, destination } => {
+            let catalog = catalog(data)?;
+            let manifest = moyai_hub::backup::backup(
+                catalog.parent().ok_or("Hub directory missing")?,
+                &destination,
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string(&manifest).map_err(|e| e.to_string())?
+            );
+            Ok(())
+        }
+        Action::Restore {
+            data,
+            source,
+            acknowledge_runners_stopped,
+        } => {
+            let catalog = catalog(data)?;
+            let manifest = moyai_hub::backup::restore(
+                &source,
+                catalog.parent().ok_or("Hub directory missing")?,
+                acknowledge_runners_stopped,
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string(&manifest).map_err(|e| e.to_string())?
+            );
+            eprintln!(
+                "Restored with devices and shared environments paused. Reconcile earlier execution, then explicitly resume from administration."
+            );
+            Ok(())
+        }
         Action::Gateway => moyai_hub::gateway_process::run_companion()
             .await
             .map_err(|error| error.to_string()),
@@ -198,8 +276,17 @@ pub async fn run(action: Action) -> Result<(), String> {
                 "{}",
                 serde_json::to_string(&report).map_err(|e| e.to_string())?
             );
+            eprintln!(
+                "{} (PID {})",
+                if report.already_running {
+                    "moyAI Hub は起動済みです。同じ Hub を利用します。"
+                } else {
+                    "moyAI Hub を起動しました。"
+                },
+                report.pid
+            );
             if !no_browser {
-                host_process::launch::open_browser(&report.web_url)?;
+                host_process::launch::open_browser(&report.web_url, report.already_running)?;
             }
             if let Some(error) = report.network_error {
                 return Err(format!(
@@ -300,6 +387,40 @@ mod tests {
                 no_browser: true
             }
         );
+    }
+    #[test]
+    fn maintenance_requires_explicit_restore_destination_and_stopped_runners() {
+        assert_eq!(
+            parse(args(&["--backup-dir", "saved", "--data-dir", "profile"])).unwrap(),
+            Action::Backup {
+                data: Some("profile".into()),
+                destination: "saved".into()
+            }
+        );
+        assert_eq!(
+            parse(args(&[
+                "--restore-from",
+                "saved",
+                "--data-dir",
+                "new profile",
+                "--acknowledge-runners-stopped"
+            ]))
+            .unwrap(),
+            Action::Restore {
+                data: Some("new profile".into()),
+                source: "saved".into(),
+                acknowledge_runners_stopped: true
+            }
+        );
+        for invalid in [
+            vec!["--restore-from", "saved", "--data-dir", "new"],
+            vec!["--restore-from", "saved", "--acknowledge-runners-stopped"],
+            vec!["--backup-dir", "saved", "--acknowledge-runners-stopped"],
+            vec!["--backup-dir", "saved", "--web-port", "0"],
+            vec!["--backup-dir", "saved", "--restore-from", "saved"],
+        ] {
+            assert!(parse(args(&invalid)).is_err(), "{invalid:?}");
+        }
     }
     #[test]
     fn settings_file_is_bounded_and_requires_an_object() {

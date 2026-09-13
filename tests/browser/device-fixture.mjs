@@ -32,14 +32,14 @@ export async function createDeviceParticipant(network, label) {
     const keys = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
     const key = keys.privateKey.export({ type: "pkcs8", format: "pem" });
     let certificate = null;
-    async function request(path, body, authenticated = true) {
+    async function request(path, body, authenticated = true, sharedToken = null, namespace = "network") {
         const data = body === undefined ? null : Buffer.from(JSON.stringify(body));
         return new Promise((resolve, reject) => {
-            const req = httpsRequest(new URL(`/v1/network/${path}`, network.server.bind), {
+            const req = httpsRequest(new URL(`/v1/${namespace}/${path}`, network.server.bind), {
                 method: data ? "POST" : "GET", ca: network.ca_certificate_pem,
                 ...(authenticated && certificate ? { key, cert: certificate.certificate_pem } : {}),
                 agent: false, timeout: 5000,
-                headers: data ? { "content-type": "application/json", "content-length": data.length } : {},
+                headers: { ...(data ? { "content-type": "application/json", "content-length": data.length } : {}), ...(sharedToken ? { authorization: `Bearer ${sharedToken}` } : {}) },
             }, response => {
                 const chunks = [];
                 response.on("data", chunk => chunks.push(chunk));
@@ -57,6 +57,7 @@ export async function createDeviceParticipant(network, label) {
     }
     const receipt = await request("join/request", { label, csr_pem: csr(keys, "Browser test participant") }, false);
     const proof = csr(keys, `moyAI join ${receipt.hub_id} ${receipt.request_id} ${receipt.challenge}`);
+    let humanToken = null;
     return {
         requestId: receipt.request_id,
         async collectApproval() {
@@ -65,6 +66,23 @@ export async function createDeviceParticipant(network, label) {
             return { status: result.status, deviceId: certificate?.device_id };
         },
         presence: () => request("presence", {}),
+        async sharedLogin(username, password) {
+            if (!certificate) throw new Error("Shared fixture login requires an enrolled device");
+            const session = await request("login", { username, password }, true, null, "shared");
+            humanToken = session.token;
+            return { principal: session.principal, expires_at_ms: session.expires_at_ms };
+        },
+        async sharedCall(operation, body) {
+            const routes = { createUser: "admin/users", createProject: "admin/projects", membership: "admin/memberships", environment: "admin/environments", projects: "projects", submit: "jobs", claim: "runner/claim", report: "runner/report" };
+            if (!Object.hasOwn(routes, operation) || !humanToken) throw new Error("Unknown or unauthenticated shared fixture operation");
+            return request(routes[operation], body, true, humanToken, "shared");
+        },
+        sharedAssignments(environmentIds) {
+            if (!certificate || !Array.isArray(environmentIds) || environmentIds.length === 0 || environmentIds.length > 32 || environmentIds.some(id => typeof id !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(id))) throw new Error("Assignments require an enrolled runner and bounded environment IDs");
+            return request(`runner/assignments?environment_ids=${encodeURIComponent(environmentIds.join(","))}`, undefined, true, null, "shared");
+        },
+        sharedTemplates: templates => request("runner/templates", { templates }, true, null, "shared"),
+        sharedProvisioning: () => request("runner/provisioning", undefined, true, null, "shared"),
         publish: publication => request("publish", publication),
         historyRequests: async () => (await request("history/requests")).requests,
         submitHistory: (requestId, response, error = null) => request("history/results", { request_id: requestId, response, error }),

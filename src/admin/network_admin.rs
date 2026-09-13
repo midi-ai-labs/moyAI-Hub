@@ -379,7 +379,11 @@ async fn start_network(
         admin.network.clone(),
         Some(gateway_control),
         runtime.clone(),
-    );
+    )
+    .merge(crate::shared_work::api::router(
+        admin.shared_work.clone(),
+        admin.network.clone(),
+    ));
     let listener = network::tls::NetworkListener::new(listener, acceptor)
         .with_identity(identity)
         .with_authority(SocketAddr::new(public_ip, address.port()).to_string());

@@ -275,7 +275,7 @@ impl Manager {
             .epoch()
             .ok_or("Web管理の起動状態を確認できません。")?;
         let policies = (|| {
-            let local = WebPolicy::new(&local_origin, access_id.clone())?.loopback_only();
+            let local = WebPolicy::new(&local_origin, access_id.clone())?.local_management();
             let remote = remote
                 .as_ref()
                 .map(|(_, origin)| {

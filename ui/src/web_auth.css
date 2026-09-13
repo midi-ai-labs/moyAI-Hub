@@ -1,0 +1,17 @@
+.web-auth-gate { min-height: 100vh; display: grid; place-items: center; padding: 32px 20px; }
+.web-auth-card { width: min(100%, 440px); padding: 36px; background: white; border: 1px solid var(--line); border-radius: 16px; box-shadow: 0 16px 48px #1423390a; }
+.web-auth-card h1 { margin: 12px 0 16px; font-size: 25px; line-height: 1.4; }
+.web-auth-card form { display: grid; gap: 18px; margin-block: 24px; }
+.web-auth-card label { display: grid; gap: 8px; font-weight: 600; }
+.web-auth-card input { width: 100%; min-width: 0; }
+.web-auth-card .subtle, .web-auth-footnote { line-height: 1.8; }
+.web-auth-footnote { color: var(--muted); margin-bottom: 0; font-size: 12px; }
+.web-auth-error, #web-auth-error { color: #9b2c34; line-height: 1.7; overflow-wrap: anywhere; }
+.web-auth-account { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 16px; padding: 12px 32px; border-bottom: 1px solid var(--line); background: white; }
+.web-auth-account-name { display: flex; align-items: center; gap: 10px; overflow-wrap: anywhere; }
+.web-auth-account-name span { color: var(--muted); font-size: 12px; }
+.web-auth-account #web-auth-error { margin: 0; }
+@media (max-width: 640px) {
+    .web-auth-card { padding: 28px 22px; }
+    .web-auth-account { padding: 12px 16px; }
+}

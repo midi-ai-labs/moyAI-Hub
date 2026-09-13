@@ -1,22 +1,23 @@
 import { readFile } from "node:fs/promises";
 import { test, expect } from "./fixture.mjs";
 
-test("Browser manages the real Hub without a native app or login", { tag: "@smoke" }, async ({ page, hub }, testInfo) => {
+test("Authenticated browser manages the real Hub without a native app", { tag: "@smoke" }, async ({ page, hub }, testInfo) => {
     const pageErrors = [];
     page.on("pageerror", error => pageErrors.push(error.message));
     await page.goto(hub.url);
     await expect(page).toHaveURL(hub.url);
     await expect(page.getByRole("button", { name: "ログイン", exact: true })).toHaveCount(0);
     await expect(page.getByLabel("管理キー", { exact: true })).toHaveCount(0);
-    expect(await page.context().cookies(hub.url)).toEqual([]);
+    await expect(page.getByRole("button", { name: "ログアウト", exact: true })).toBeVisible();
+    expect((await page.context().cookies(hub.url)).every(cookie => cookie.httpOnly && cookie.sameSite === "Strict")).toBe(true);
 
-    await page.getByRole("link", { name: "ネットワーク設定", exact: false }).click();
+    await page.locator('nav a[href="#device-network"]').click();
     await expect(page.getByRole("button", { name: "ネットワークを開始", exact: true })).toBeVisible();
     await page.getByLabel("このHubのIP", { exact: true }).fill("127.0.0.1");
     await page.locator("#network-port").fill(String(hub.networkPort));
     await page.getByRole("button", { name: "ネットワークを開始", exact: true }).click();
     await expect(page.getByRole("button", { name: "ネットワークを停止", exact: true })).toBeVisible();
-    await expect(page.getByRole("button", { name: "設定ファイルを保存", exact: true })).toBeEnabled();
+    await expect(page.getByRole("button", { name: "接続ファイルを保存", exact: true })).toBeEnabled();
     const network = await hub.observeNetwork();
     expect(network.server.running).toBe(true);
     expect(network.server.bind).toBe(`https://127.0.0.1:${hub.networkPort}`);
@@ -32,9 +33,9 @@ test("Browser manages the real Hub without a native app or login", { tag: "@smok
     await expect(page.locator("#network-group-list")).toContainText(group);
 
     const downloadPending = page.waitForEvent("download");
-    await page.getByRole("button", { name: "設定ファイルを保存", exact: true }).click();
+    await page.getByRole("button", { name: "接続ファイルを保存", exact: true }).click();
     const download = await downloadPending;
-    expect(download.suggestedFilename()).toBe("hub-participation.toml");
+    expect(download.suggestedFilename()).toBe("hub-config.toml");
     const downloaded = testInfo.outputPath(download.suggestedFilename());
     await download.saveAs(downloaded);
     const config = await readFile(downloaded, "utf8");
@@ -49,7 +50,7 @@ test("Browser manages the real Hub without a native app or login", { tag: "@smok
     await page.reload();
     await expect(page.locator("#network-group-list")).toContainText(group);
     await expect(page.getByRole("button", { name: "ネットワークを開始", exact: true })).toBeVisible();
-    await expect(page.getByRole("button", { name: "設定ファイルを保存", exact: true })).toBeDisabled();
+    await expect(page.getByRole("button", { name: "接続ファイルを保存", exact: true })).toBeDisabled();
     expect((await hub.command("hub_web_status")).enabled).toBe(true);
 
     await page.getByRole("button", { name: "Hub本体へ再接続", exact: true }).click();
@@ -63,13 +64,13 @@ test("Browser manages the real Hub without a native app or login", { tag: "@smok
     await page.locator("#stop-server").click();
     await expect(page.locator("#start-server")).toBeEnabled();
     expect((await hub.command("hub_snapshot")).server.running).toBe(false);
-    await page.getByRole("link", { name: "ネットワーク設定", exact: false }).click();
+    await page.locator('nav a[href="#device-network"]').click();
     await testInfo.attach("web-network-viewport", { body: await page.screenshot(), contentType: "image/png" });
     await page.setViewportSize({ width: 760, height: 1000 });
-    await page.getByRole("link", { name: "Web管理", exact: false }).click();
+    await page.getByRole("link", { name: "管理画面のURL", exact: false }).click();
     await expect(page.locator("#web-enabled-state")).toContainText("稼働中");
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
     await testInfo.attach("web-narrow-viewport", { body: await page.screenshot(), contentType: "image/png" });
-    expect(await page.context().cookies(hub.url)).toEqual([]);
+    expect(await page.evaluate(() => document.cookie)).toBe("");
     expect(pageErrors).toEqual([]);
 });

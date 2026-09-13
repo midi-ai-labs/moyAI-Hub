@@ -1,6 +1,6 @@
 //! Browser management on independent HTTP and optional HTTPS/proxy listeners.
-//! There is currently no administrator authentication. Reachable clients use
-//! the shared Admin owner; fixed origins and CSRF protect browser mutations.
+//! Human administrator sessions protect management operations. Origin and CSRF
+//! checks remain independent of the authenticated identity.
 use crate::{admin::Admin, network::tls::TlsPeer};
 use axum::{
     Json, Router,
@@ -25,7 +25,9 @@ pub(crate) fn assets_ready() -> bool {
     bundled_asset("index.html").is_some()
 }
 
+mod authentication;
 pub(crate) mod server;
+mod shared;
 
 /// Server-configured origin and access generation. Request headers never select a policy.
 #[derive(Clone, Debug)]
@@ -35,6 +37,7 @@ pub(crate) struct WebPolicy {
     access_id: String,
     secure: bool,
     loopback_only: bool,
+    local_management: bool,
 }
 impl WebPolicy {
     pub(crate) fn new(origin: &str, access_id: String) -> Result<Self, String> {
@@ -66,10 +69,16 @@ impl WebPolicy {
             access_id,
             secure,
             loopback_only: false,
+            local_management: false,
         })
     }
     fn loopback_only(mut self) -> Self {
         self.loopback_only = true;
+        self
+    }
+    fn local_management(mut self) -> Self {
+        self.loopback_only = true;
+        self.local_management = true;
         self
     }
 }
@@ -83,12 +92,14 @@ struct AccessState {
 pub(crate) struct WebAccess {
     state: Mutex<AccessState>,
     slots: Arc<tokio::sync::Semaphore>,
+    login_slots: Arc<tokio::sync::Semaphore>,
 }
 impl Default for WebAccess {
     fn default() -> Self {
         Self {
             state: Mutex::new(AccessState::default()),
             slots: Arc::new(tokio::sync::Semaphore::new(8)),
+            login_slots: Arc::new(tokio::sync::Semaphore::new(2)),
         }
     }
 }
@@ -163,6 +174,7 @@ struct WebState {
 fn failure(code: StatusCode) -> Response {
     let message = match code {
         StatusCode::FORBIDDEN => "このWeb管理操作は許可されていません。",
+        StatusCode::UNAUTHORIZED => "管理者としてログインしてください。",
         StatusCode::TOO_MANY_REQUESTS => {
             "処理中の操作があります。少し待ってから再試行してください。"
         }
@@ -215,7 +227,7 @@ fn origin_allowed(headers: &HeaderMap, policy: &WebPolicy, method: &Method) -> b
             .and_then(|v| v.to_str().ok())
             .is_none_or(|v| matches!(v, "same-origin" | "none") || navigation)
 }
-async fn guard(State(state): State<WebState>, request: Request, next: Next) -> Response {
+async fn guard(State(state): State<WebState>, mut request: Request, next: Next) -> Response {
     let Some(admin) = state.admin.upgrade() else {
         return secured(failure(StatusCode::SERVICE_UNAVAILABLE));
     };
@@ -236,6 +248,22 @@ async fn guard(State(state): State<WebState>, request: Request, next: Next) -> R
     if !origin_allowed(request.headers(), &state.policy, request.method()) {
         return secured(failure(StatusCode::FORBIDDEN));
     }
+    let direct_local = _peer.ip().is_loopback()
+        && state.policy.local_management
+        && reqwest::Url::parse(&state.policy.origin).is_ok_and(|url| {
+            url.host_str().is_some_and(|host| {
+                host == "localhost"
+                    || host
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|ip| ip.is_loopback())
+            })
+        })
+        && !request.headers().contains_key("forwarded")
+        && !request.headers().contains_key("x-forwarded-for")
+        && !request.headers().contains_key("x-forwarded-host");
+    request
+        .extensions_mut()
+        .insert(authentication::BootstrapAccess(direct_local));
     if request.method() == Method::POST
         && (request
             .headers()
@@ -265,6 +293,9 @@ pub(crate) fn router(admin: Weak<Admin>, policy: WebPolicy) -> Router {
         .route("/admin/", get(index))
         .route("/admin/assets/{*path}", get(asset))
         .route("/admin/session", get(session))
+        .route("/admin/login", post(authentication::login))
+        .route("/admin/logout", post(authentication::logout))
+        .route("/admin/bootstrap", post(authentication::bootstrap))
         .route("/admin/command", post(command))
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
@@ -282,14 +313,12 @@ fn asset_response(path: &str) -> Response {
 async fn asset(Path(path): Path<String>) -> Response {
     asset_response(&format!("assets/{path}"))
 }
-async fn session(State(state): State<WebState>, headers: HeaderMap) -> Response {
-    let Some(admin) = state.admin.upgrade() else {
-        return failure(StatusCode::SERVICE_UNAVAILABLE);
-    };
-    match admin.web_access.session(&headers, false, &state.policy) {
-        Ok(csrf) => Json(json!({"csrf": csrf, "epoch": state.policy.access_id})).into_response(),
-        Err(code) => failure(code),
-    }
+async fn session(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    axum::Extension(local): axum::Extension<authentication::BootstrapAccess>,
+) -> Response {
+    authentication::session_response(&state, &headers, local.0, None)
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -329,17 +358,28 @@ fn browser_command(command: &str) -> bool {
             | "hub_network_export"
             | "hub_history_request"
             | "hub_history_result"
+            | "hub_shared_snapshot"
+            | "hub_shared_command"
+            | "hub_shared_retention_preview"
+            | "hub_shared_maintenance"
     )
 }
 async fn command(
     State(state): State<WebState>,
     headers: HeaderMap,
+    axum::Extension(local): axum::Extension<authentication::BootstrapAccess>,
     Json(input): Json<Command>,
 ) -> Response {
+    if !authentication::login_allowed(&state, local.0) {
+        return failure(StatusCode::FORBIDDEN);
+    }
     let Some(admin) = state.admin.upgrade() else {
         return failure(StatusCode::SERVICE_UNAVAILABLE);
     };
     if let Err(code) = admin.web_access.session(&headers, true, &state.policy) {
+        return failure(code);
+    }
+    if let Err(code) = authentication::principal(&admin, &headers) {
         return failure(code);
     }
     if !browser_command(&input.command) || !input.args.is_object() {
@@ -348,6 +388,19 @@ async fn command(
     let Ok(permit) = admin.web_access.slots.clone().try_acquire_owned() else {
         return failure(StatusCode::TOO_MANY_REQUESTS);
     };
+    if matches!(
+        input.command.as_str(),
+        "hub_shared_snapshot"
+            | "hub_shared_command"
+            | "hub_shared_retention_preview"
+            | "hub_shared_maintenance"
+    ) {
+        let token = match authentication::request_token(&headers) {
+            Ok(token) => token,
+            Err(code) => return failure(code),
+        };
+        return shared::command(admin, input, token, permit).await;
+    }
     // Dispatch can own blocking filesystem work. A caller timeout/disconnect must not
     // release its concurrency slot while that actual work is still running.
     let operation = tokio::spawn(async move {

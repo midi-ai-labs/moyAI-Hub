@@ -10,10 +10,11 @@ export function attachWebManagement(): { refresh: () => Promise<void> } {
     const host = document.createElement("section");
     host.className = "panel web-management"; host.id = "web-management";
     document.getElementById("device-network")!.before(host);
-    host.innerHTML = `<div class="section-title"><h2>Web管理画面</h2><span id="web-enabled-state" class="badge">接続を確認中</span></div>
-        <p>モデル・端末・接続許可をこのブラウザーで管理できます。現在はログイン不要で、このURLへ接続できる方が操作できます。</p>
+    host.innerHTML = `<div class="section-title"><h2>管理画面のURL</h2><span id="web-enabled-state" class="badge">接続を確認中</span></div>
+        <p>管理者としてログインしたブラウザーから、利用者・仕事の実行先・モデル・端末を管理できます。このURLは管理者用です。</p>
+        <p>Desktopを接続する場合は<a href="#device-network">「Desktopの接続」で接続ファイルを保存</a>してください。管理画面のURLをDesktopに入力する必要はありません。</p>
         <div id="web-address" class="web-address" hidden><label>Hubと同じPCで開くURL<input id="web-url" readonly></label><button id="web-copy-url" type="button" class="secondary" disabled>URLをコピー</button></div>
-        <div id="web-remote-address" class="web-address" hidden><label>他の端末から開くURL<input id="web-remote-url" readonly></label><button id="web-copy-remote-url" type="button" class="secondary" disabled>外部公開URLをコピー</button></div>
+        <div id="web-remote-address" class="web-address" hidden><label>別のPCで管理者が開くURL<input id="web-remote-url" readonly></label><button id="web-copy-remote-url" type="button" class="secondary" disabled>管理用URLをコピー</button></div>
         <p id="web-status" role="status">Web管理の接続情報を取得しています。</p><p id="web-settings-error" role="alert" hidden></p>
         <p>Web管理のURLとポートはHubの起動設定で指定します。ブラウザーを閉じてもHubは動作を続けます。</p>`;
     const node = <T extends HTMLElement>(id: string) => host.querySelector<T>(`#${id}`)!;
@@ -41,7 +42,9 @@ export function attachWebManagement(): { refresh: () => Promise<void> } {
             }
             node("web-settings-error").hidden = !status.settings_error;
             node("web-settings-error").textContent = status.settings_error ?? "";
-            node("web-status").textContent = feedback ?? (!status.enabled ? "Web管理は停止中です。Hubの起動状態を確認してください。" : status.remote_url ? "他の端末からもWeb管理を利用できます。" : "Web管理はHubと同じPCから利用できます。");
+            node("web-status").textContent = feedback ?? (!status.enabled ? "Web管理は停止中です。Hubの起動状態を確認してください。"
+                : status.remote_url?.startsWith("http:") ? "他の端末からのログインにはHTTPSの管理URLが必要です。現在の外部公開URLはログインに使用できません。"
+                : status.remote_url ? "他の端末からもWeb管理を利用できます。" : "Web管理はHubと同じPCから利用できます。");
         } catch {
             node("web-enabled-state").textContent = "応答を確認できません";
             node("web-status").textContent = "Hub本体への接続を確認し、画面下部の「Hub本体へ再接続」を押してください。";

@@ -46,6 +46,7 @@ struct Evidence {
     observed_at_ms: u64,
 }
 pub struct Admin {
+    pub(crate) shared_work: crate::shared_work::SharedStore,
     pub(crate) web_access: crate::web_admin::WebAccess,
     pub(crate) web_server: tokio::sync::Mutex<crate::web_admin::server::Manager>,
     core: SharedCore,
@@ -55,7 +56,7 @@ pub struct Admin {
     evidence: Mutex<Option<Evidence>>,
     discovery_generation: AtomicU64,
     refresh_running: std::sync::atomic::AtomicBool,
-    network: crate::network::SharedNetwork,
+    pub(crate) network: crate::network::SharedNetwork,
     network_server: tokio::sync::Mutex<Option<network_admin::NetworkServer>>,
     network_hosting: Mutex<network_hosting::Store>,
 }
@@ -78,6 +79,13 @@ impl Admin {
             .map_err(|error| error.to_string())?;
         lock.try_lock_exclusive()
             .map_err(|_| "このデータフォルダーの moyAI Hub は起動済みです。")?;
+        if directory
+            .join(crate::backup::RESTORE_INCOMPLETE)
+            .try_exists()
+            .map_err(|e| e.to_string())?
+        {
+            return Err("バックアップ復元が完了していません。元のバックアップを別の新しいデータフォルダーへ復元してください。".into());
+        }
         let mut store = if path.exists() {
             if std::fs::metadata(&path)
                 .map_err(|error| error.to_string())?
@@ -105,7 +113,11 @@ impl Admin {
         let web_server =
             crate::web_admin::server::Manager::open(directory.join("web-management.json"));
         let network_hosting = network_hosting::Store::open(directory.join("network-hosting.json"));
+        let shared_work =
+            crate::shared_work::SharedWork::open(&directory.join("shared-work.sqlite3"))
+                .map_err(|error| error.to_string())?;
         Ok(Arc::new(Self {
+            shared_work: Arc::new(Mutex::new(shared_work)),
             web_access: Default::default(),
             web_server: tokio::sync::Mutex::new(web_server),
             core: Arc::new(Mutex::new(

@@ -155,7 +155,7 @@ export async function startHubServer({ dataDirectory, binary: explicitBinary = p
         const networkPort = await freePort();
         requireValue((await observeNetwork()).server.running === false, "Hub fixture must not implicitly start the device network");
         await record("hub-build", { binary, sha256: await binaryHash(binary), pid: child.pid, local_url: web.local_url, remote_url: web.remote_url });
-        return Object.freeze({ url: web.local_url, remoteUrl: web.remote_url, command, networkPort, observeNetwork, close });
+        return Object.freeze({ binary, dataDirectory: data, pid: child.pid, url: web.local_url, remoteUrl: web.remote_url, command, networkPort, observeNetwork, close });
     } catch (error) {
         try { await close(); } catch (cleanupError) { throw new AggregateError([error, cleanupError], "Hub fixture setup and cleanup failed"); }
         throw error;

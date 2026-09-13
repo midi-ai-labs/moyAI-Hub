@@ -300,9 +300,13 @@ pub async fn guard(
             .lock()
             .map_err(|_| NetworkError::Unavailable)
             .and_then(|n| {
-                if path == "/v1/network/jobs/settled"
-                    && request.method() == axum::http::Method::POST
+                if matches!(
+                    path,
+                    "/v1/network/jobs/settled" | "/v1/shared/runner/report"
+                ) && request.method() == axum::http::Method::POST
                 {
+                    // Shared reports still reject Started/Yield through current admission.
+                    // Only a known attempt's terminal settlement can use a revoked key.
                     n.authenticate_settlement(&cert, crate::service::now_ms())
                 } else {
                     n.authenticate(&cert, crate::service::now_ms())

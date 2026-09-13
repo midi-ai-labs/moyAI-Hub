@@ -13,6 +13,7 @@ use std::{
 #[derive(Debug, Serialize)]
 pub struct LaunchReport {
     pub pid: u32,
+    pub already_running: bool,
     pub web_url: String,
     pub network_running: bool,
     pub needs_setup: bool,
@@ -183,7 +184,7 @@ pub async fn launch_server(
     let catalog = canonical_catalog(catalog_path, true)?;
     let directory = catalog.parent().ok_or("Hub の保存先が無効です。")?;
     let _launch_lock = launch_lock(directory).await?;
-    let client = match HostClient::connect(&catalog).await {
+    let (client, already_running) = match HostClient::connect(&catalog).await {
         Ok(client) => {
             if !web_args.is_empty() {
                 return Err(
@@ -191,7 +192,7 @@ pub async fn launch_server(
                         .into(),
                 );
             }
-            client
+            (client, true)
         }
         Err(error) => {
             if profile_busy(&catalog)? {
@@ -199,13 +200,14 @@ pub async fn launch_server(
                     "起動中の Hub に接続できません。別の Hub は起動していません。{error}"
                 ));
             }
-            start_server(executable, &catalog, web_args).await?
+            (start_server(executable, &catalog, web_args).await?, false)
         }
     };
     let web = client.dispatch("hub_web_status", json!({})).await?;
     let web_url = local_management_url(web["local_url"].as_str().unwrap_or(""))?;
     let mut report = LaunchReport {
         pid: client.pid(),
+        already_running,
         web_url,
         network_running: false,
         needs_setup: false,
@@ -260,8 +262,20 @@ pub async fn launch_server(
     Ok(report)
 }
 
-pub fn open_browser(url: &str) -> Result<(), String> {
+pub fn browser_launch_url(url: &str, already_running: bool) -> Result<String, String> {
     let url = local_management_url(url)?;
+    Ok(format!(
+        "{url}#{}",
+        if already_running {
+            "hub-already-running"
+        } else {
+            "hub-started"
+        }
+    ))
+}
+
+pub fn open_browser(url: &str, already_running: bool) -> Result<(), String> {
+    let url = browser_launch_url(url, already_running)?;
     #[cfg(windows)]
     let mut command = {
         let windows = std::env::var_os("WINDIR").ok_or("Windowsの場所を確認できません。")?;
@@ -303,5 +317,20 @@ mod tests {
         ] {
             assert!(local_management_url(value).is_err(), "{value}");
         }
+    }
+
+    #[test]
+    fn browser_launch_notice_keeps_the_validated_local_origin() {
+        let url = "http://127.0.0.1:9081/admin/";
+        assert_eq!(
+            browser_launch_url(url, true).unwrap(),
+            format!("{url}#hub-already-running")
+        );
+        assert_eq!(
+            browser_launch_url(url, false).unwrap(),
+            format!("{url}#hub-started")
+        );
+        assert!(browser_launch_url("http://example.com/admin/", true).is_err());
+        assert!(browser_launch_url("http://127.0.0.1:9081/admin/#other", true).is_err());
     }
 }

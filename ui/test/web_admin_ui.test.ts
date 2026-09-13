@@ -43,7 +43,8 @@ async function withUi(status: () => Promise<WebStatus>, run: (value: {
     let host: NodeFixture | null = null;
     const navigator = { clipboard: { writeText: async (text: string) => { copied.push(text); } } as unknown };
     const values = [async (path: string, options?: RequestInit) => {
-        if (path === "/admin/session") return Response.json({ csrf: "fixture-csrf", epoch: "fixture-epoch" });
+        if (path === "/admin/session") return Response.json({ csrf: "fixture-csrf", epoch: "fixture-epoch",
+            authentication: { configured: true, bootstrap_allowed: false, login_allowed: true, session_id: "human-session", user: { user_id: "admin", display_name: "管理者", administrator: true } } });
         assert.equal(path, "/admin/command");
         const { command, args } = JSON.parse(String(options?.body));
         assert.equal(command, "hub_web_status"); assert.deepEqual(args, {}); calls.push(command);
@@ -59,9 +60,9 @@ async function withUi(status: () => Promise<WebStatus>, run: (value: {
     }); }
 }
 
-test("browser shows server-owned URLs without login, keys or listener lifecycle controls", async () => {
+test("authenticated browser shows server-owned URLs without keys or listener lifecycle controls", async () => {
     await withUi(async () => running, async ({ node, ui, host, copied }) => {
-        assert.match(host().innerHTML, /現在はログイン不要/);
+        assert.match(host().innerHTML, /管理者としてログインしたブラウザー/);
         for (const id of ["web-enable", "web-disable", "web-key", "web-logout", "web-open"]) assert.equal(node(id), undefined);
         await ui.refresh(); assert.equal(node("web-enabled-state").textContent, "稼働中");
         assert.equal(node("web-url").value, running.local_url);
