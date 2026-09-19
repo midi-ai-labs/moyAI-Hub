@@ -181,66 +181,33 @@ test("Unavailable and empty providers clear candidates, and shared model capacit
     } finally { await provider.close(); }
 });
 
-test("Groups and directed rules preserve drafts and reject stale edits across two browsers", async ({ page, context, hub }, testInfo) => {
+test("Project drafts preserve focused input across polling and reject another browser's save", async ({ page, context, hub }, testInfo) => {
     await ready(page, hub.url);
-    await page.locator('nav a[href="#device-network"]').click();
-    await page.locator("#network-group-label").fill("Clients");
-    await page.getByRole("button", { name: "グループを保存", exact: true }).click();
-    await expect(page.locator("#network-group-list")).toContainText("Clients");
+    await page.locator('nav a[href="#shared-administration"]').click();
+    await page.locator('[data-sa-operation="save_project"]').first().click();
+    await page.locator("#shared-admin-label").fill("入力を保持するプロジェクト");
     const other = await context.newPage();
     try {
         await ready(other, hub.url);
-        const clients = (await hub.command("hub_network_snapshot")).groups[0];
-        await page.locator("#network-group-id").selectOption(clients.id);
-        await page.locator("#network-group-label").fill("Clients revised");
-        await other.locator("#network-group-label").fill("Servers");
-        await other.getByRole("button", { name: "グループを保存", exact: true }).click();
-        await expect(other.locator("#network-group-list")).toContainText("Servers");
+        await other.locator('nav a[href="#shared-administration"]').click();
+        await other.locator('[data-sa-operation="save_project"]').first().click();
+        await other.locator("#shared-admin-label").fill("別画面のプロジェクト");
+        await other.locator("#shared-admin-save").click();
+        await expect(other.locator("#shared-admin-notice")).toHaveText("設定を保存しました。");
         await polls(page);
-        await expect(page.locator("#network-group-label")).toHaveValue("Clients revised");
-        await expect(page.locator("#network-group-label")).toBeFocused();
-        await page.getByRole("button", { name: "グループを保存", exact: true }).click();
-        await expect(page.locator("#network-notice")).toContainText("端末設定が変更されました");
-        await expect(page.locator("#network-group-label")).toHaveValue("Clients revised");
-        await screenshot(page, testInfo, "group-stale-revision");
-        await page.locator("#network-refresh").click();
-        await expect(page.locator("#network-notice")).toContainText("入力中の内容は保持");
-        await page.getByRole("button", { name: "グループを保存", exact: true }).click();
-        await expect(page.locator("#network-group-list")).toContainText("Clients revised");
-        const snapshot = await hub.command("hub_network_snapshot");
-        const servers = snapshot.groups.find(group => group.label === "Servers");
-        await page.locator("#network-rule-from").selectOption(`group:${clients.id}`);
-        await page.locator("#network-rule-to").selectOption(`group:${servers.id}`);
-        await page.locator("#network-rule-usage").selectOption("delegated");
-        await page.locator("#network-rule-depth").selectOption("2");
-        await page.getByRole("button", { name: "接続ルールを追加", exact: true }).click();
-        await expect(page.locator("#network-rule-list")).toContainText("Clients revised → グループ: Servers");
-        await expect(page.locator("#network-rule-list")).toContainText("再委任の宛先");
-        await expect(page.locator("#network-rule-list")).toContainText("最大2段");
-        const rule = (await hub.command("hub_network_snapshot")).rules[0];
-        expect(rule.from).toEqual({ kind: "group", id: clients.id });
-        expect(rule.to).toEqual({ kind: "group", id: servers.id });
-        expect(rule.usage).toBe("delegated"); expect(rule.effect).toBe("allow");
-        await page.locator("#network-rule-effect").selectOption("deny");
-        await page.locator("#network-rule-usage").selectOption("direct");
-        await page.locator("#network-rule-depth").selectOption("1");
-        await page.getByRole("button", { name: "接続ルールを追加", exact: true }).click();
-        await expect(page.locator("#network-rule-list .network-rule")).toHaveCount(2);
-        await screenshot(page, testInfo, "directed-rules");
-        await page.locator(`#network-rule-list button[data-network-delete-rule="${rule.id}"]`).click();
-        await expect(page.locator("#network-rule-list .network-rule")).toHaveCount(1);
-        await page.reload();
-        await expect(page.locator("#network-rule-list .network-rule")).toHaveCount(1);
-        await expect(page.locator("#network-rule-list")).toContainText("拒否");
+        await expect(page.locator("#shared-admin-label")).toHaveValue("入力を保持するプロジェクト");
+        await expect(page.locator("#shared-admin-label")).toBeFocused();
+        await page.locator("#shared-admin-save").click();
+        await expect(page.locator("#shared-admin-form-error")).toContainText("設定が変更されています");
+        await screenshot(page,testInfo,"project-stale-revision");
+        await page.locator("#shared-admin-close").click(); await page.locator("#shared-admin-refresh").click();
+        await expect(page.locator("#shared-admin-content")).toContainText("別画面のプロジェクト");
         await page.getByRole("link", { name: "接続端末", exact: false }).first().click();
         await page.locator("#network-filter").selectOption("pending");
         await expect(page.locator("#network-devices-empty")).toContainText("条件に一致する承認待ち");
-        await page.locator("#network-search").fill("no-such-device");
-        await polls(page);
-        await expect(page.locator("#network-search")).toHaveValue("no-such-device");
-        await expect(page.locator("#network-search")).toBeFocused();
-        await page.locator('nav a[href="#mcp-history"]').click();
-        await expect(page.locator("#history-request")).toBeDisabled();
+        await page.locator("#network-search").fill("no-such-device"); await polls(page);
+        await expect(page.locator("#network-search")).toHaveValue("no-such-device"); await expect(page.locator("#network-search")).toBeFocused();
+        await page.locator('nav a[href="#mcp-history"]').click(); await expect(page.locator("#history-request")).toBeDisabled();
     } finally { await other.close(); }
 });
 

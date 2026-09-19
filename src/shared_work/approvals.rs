@@ -38,6 +38,18 @@ pub struct ApprovalAnswer {
     pub decision: ApprovalDecision,
 }
 
+/// An invalidated answer is never delivered as a human decision. A still-paused
+/// Runner may replace that exact request with a new approval ID instead.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ApprovalConsumeResult {
+    Answer(ApprovalAnswer),
+    ReconfirmationRequired {
+        approval_id: String,
+        reconfirmation_required: bool,
+    },
+}
+
 struct Record {
     id: String,
     attempt_id: String,
@@ -69,14 +81,11 @@ fn may_decide(db: &Connection, actor: &str, job: &Job) -> Result<()> {
     Ok(())
 }
 
-fn live(db: &Connection, record: &Record, now: u64) -> Result<Job> {
-    if record.expires <= now || record.invalidated_at.is_some() {
-        return Err(WorkError::Conflict);
-    }
-    let (job_id, state, uncertainty): (String, String, Option<String>) = db.query_row(
-        "SELECT job_id,state,uncertainty_reason FROM shared_attempts WHERE id=?1",
+fn running_job(db: &Connection, record: &Record) -> Result<Job> {
+    let (job_id, state, uncertainty, authority): (String, String, Option<String>, u64) = db.query_row(
+        "SELECT job_id,state,uncertainty_reason,authority_generation FROM shared_attempts WHERE id=?1",
         [&record.attempt_id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
     )?;
     let job = super::store::load(db, &job_id)?;
     let root = super::store::load(db, &job.root_id)?;
@@ -85,10 +94,19 @@ fn live(db: &Connection, record: &Record, now: u64) -> Result<Job> {
         || job.state != JobState::Running
         || root.state.terminal()
         || root.state == JobState::Cancelling
+        || record.authority_generation != authority
         || record.authority_generation != job.authority_generation
     {
         return Err(WorkError::Conflict);
     }
+    Ok(job)
+}
+
+fn live(db: &Connection, record: &Record, now: u64) -> Result<Job> {
+    if record.expires <= now || record.invalidated_at.is_some() {
+        return Err(WorkError::Conflict);
+    }
+    let job = running_job(db, record)?;
     if let Some(decider) = &record.decided_by {
         let current:Option<(u64,u64)>=db.query_row("SELECT credential_generation,authorization_generation FROM identity_users WHERE id=?1 AND disabled=0",[decider],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
         if current
@@ -256,7 +274,7 @@ impl SharedWork {
         attempt_id: &str,
         generation: u64,
         now: u64,
-    ) -> Result<Option<ApprovalAnswer>> {
+    ) -> Result<Option<ApprovalConsumeResult>> {
         super::store::timestamp(now)?;
         let tx = self
             .db
@@ -275,6 +293,19 @@ impl SharedWork {
         }
         if actual_generation != generation {
             return Err(WorkError::Conflict);
+        }
+        if record.invalidated_at.is_some() {
+            if record.expires <= now {
+                return Err(WorkError::Conflict);
+            }
+            let job = running_job(&tx, &record)?;
+            super::handover::may_continue(&tx, &job, &job.environment_id)?;
+            // This read changes neither the invalidated record nor execution
+            // ownership/capacity. It is not permission to replay any effect.
+            return Ok(Some(ApprovalConsumeResult::ReconfirmationRequired {
+                approval_id: id.into(),
+                reconfirmation_required: true,
+            }));
         }
         let job = live(&tx, &record, now)?;
         let Some(decision) = record.decision else {
@@ -297,9 +328,9 @@ impl SharedWork {
             )?;
         }
         tx.commit()?;
-        Ok(Some(ApprovalAnswer {
+        Ok(Some(ApprovalConsumeResult::Answer(ApprovalAnswer {
             approval_id: id.into(),
             decision,
-        }))
+        })))
     }
 }

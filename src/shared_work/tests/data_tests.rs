@@ -599,6 +599,7 @@ fn data_v8_blob_migrates_only_after_verified_file_persistence_and_failed_migrati
                 rusqlite::params![asset.id, bytes.as_slice()],
             )
             .unwrap();
+        f.remove_post_v10_fixture_schema();
         f.work
             .db
             .execute_batch("DROP INDEX shared_jobs_start_deadline; ALTER TABLE shared_jobs DROP COLUMN start_before_ms; DROP INDEX shared_assets_retained_hash; PRAGMA user_version=8;")
@@ -637,7 +638,7 @@ fn data_v8_blob_migrates_only_after_verified_file_persistence_and_failed_migrati
                     .db
                     .pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
                     .unwrap(),
-                10
+                12
             );
             assert_eq!(
                 f.work

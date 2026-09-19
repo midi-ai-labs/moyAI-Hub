@@ -15,3 +15,6 @@
 .shared-admin-check input { width:auto; margin:0; }
 #shared-admin-editor textarea { width:100%; resize:vertical; font:inherit; border:1px solid #cad4c5; border-radius:7px; padding:10px; }
 @media(max-width:900px) { .shared-admin-columns { grid-template-columns:1fr; } }
+.shared-admin-pc-table { width: 100%; border-collapse: collapse; margin-block: 12px; }
+.shared-admin-pc-table th, .shared-admin-pc-table td { padding: 10px; text-align: left; border-bottom: 1px solid var(--border); }
+.shared-admin-pc-table input { width: auto; }

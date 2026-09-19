@@ -5,7 +5,8 @@ export interface SharedAdminSnapshot {
   users: SharedAdminUser[];
   groups: { id: string; label: string; disabled: boolean }[];
   group_memberships: { group_id: string; user_id: string }[];
-  projects: { id: string; label: string; archived: boolean }[];
+  projects: { id: string; label: string; archived: boolean; legacy_devices_unrestricted?: boolean }[];
+  project_devices?: { project_id: string; device_id: string; can_control: boolean; can_execute: boolean; environment_id: string | null; preparation_state: string; error: string | null }[];
   project_memberships: { project_id: string; user_id: string; role: ProjectRole }[];
   group_project_roles: { project_id: string; group_id: string; role: ProjectRole }[];
   environments: { id: string; label: string; resource_id: string; runner_id: string; enabled: boolean; project_ids: string[] }[];
@@ -19,14 +20,17 @@ export interface SharedAdminSnapshot {
 }
 export type SharedAdminTab = "users" | "groups" | "projects" | "environments" | "resources" | "maintenance" | "storage";
 export const adminTabs: [SharedAdminTab, string][] = [
-  ["users", "利用者"], ["groups", "利用者グループ"], ["projects", "プロジェクト"],
-  ["environments", "仕事の実行先"], ["resources", "同時利用の枠"], ["maintenance", "停止状態の確認"], ["storage", "保存と保守"],
+  ["projects", "プロジェクト"], ["users", "人"], ["maintenance", "停止状態の確認"], ["storage", "保存と保守"],
 ];
 export type AdminOperation = "create_user" | "update_user" | "set_password" | "delete_user"
+  | "save_project" | "retry_project_device"
   | "create_group" | "update_group" | "delete_group" | "group_member"
   | "create_project" | "update_project" | "delete_project" | "project_member" | "group_project_role"
   | "create_environment" | "update_environment" | "delete_environment" | "set_resource" | "delete_resource" | "settle_attempt" | "request_provision" | "prune_shared_data";
 export type AdminDraft = Record<string, string | boolean | string[] | number>;
+export function projectPCSelection(data: Pick<FormData, "getAll">): Pick<AdminDraft, "controller_device_ids" | "runner_device_ids"> {
+  return { controller_device_ids: data.getAll("controller_device_ids").map(String), runner_device_ids: data.getAll("runner_device_ids").map(String) };
+}
 /** Suggest the existing physical pool only when the selected Runner has one unambiguous pool. */
 export function environmentDefaults(snapshot: Pick<SharedAdminSnapshot, "environments" | "resources">, runnerId: string, newResourceId: string): AdminDraft {
   const ids = [...new Set(snapshot.environments.filter(row => row.runner_id === runnerId).map(row => row.resource_id))];
@@ -34,6 +38,7 @@ export function environmentDefaults(snapshot: Pick<SharedAdminSnapshot, "environ
   return { runner_id: runnerId, resource_id: resource?.id ?? (ids.length === 0 ? newResourceId : ""), capacity: String(resource?.capacity ?? 1), template_id: "" };
 }
 export const operationLabels: Record<AdminOperation, string> = {
+  save_project: "プロジェクトを保存", retry_project_device: "実行するPCの準備を再試行",
   create_user: "利用者を追加", update_user: "利用者を編集", set_password: "パスワードを再設定", delete_user: "利用者を削除",
   create_group: "グループを追加", update_group: "グループを編集", delete_group: "グループを削除", group_member: "グループの所属を設定",
   create_project: "プロジェクトを追加", update_project: "プロジェクトを編集", delete_project: "プロジェクトを削除",
@@ -69,6 +74,15 @@ export function adminRequest(kind: AdminOperation, draft: AdminDraft): Record<st
   const id = () => required(draft, "id");
   const user_id = () => required(draft, "user_id");
   switch (kind) {
+    case "save_project": {
+      const members = Object.entries(draft).filter(([key,value]) => key.startsWith("participant:") && value !== "").map(([key,value]) => {
+        if (!["reader","contributor","manager"].includes(String(value))) throw "参加者の役割を確認してください。";
+        return { user_id:key.slice("participant:".length), role:String(value) };
+      });
+      const selected = (key:string) => Array.isArray(draft[key]) ? [...new Set(draft[key] as string[])] : [];
+      return { kind,id:id(),label:required(draft,"label"),archived:flag(draft,"archived"),members,controller_device_ids:selected("controller_device_ids"),runner_device_ids:selected("runner_device_ids") };
+    }
+    case "retry_project_device": return {kind,project_id:required(draft,"project_id"),device_id:required(draft,"device_id")};
     case "create_user": return { kind, username: required(draft, "username"), display_name: required(draft, "display_name"), password: password(draft), administrator: flag(draft, "administrator") };
     case "update_user": return { kind, user_id: user_id(), display_name: required(draft, "display_name"), administrator: flag(draft, "administrator"), disabled: flag(draft, "disabled") };
     case "set_password": return { kind, user_id: user_id(), password: password(draft) };

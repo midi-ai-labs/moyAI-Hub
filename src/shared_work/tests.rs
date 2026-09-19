@@ -123,6 +123,23 @@ impl Fixture {
     fn reopen(&mut self) {
         self.work = SharedWork::open(&self.dir.path().join("shared.sqlite3")).unwrap();
     }
+    fn remove_post_v10_fixture_schema(&self) {
+        // Old-format fixtures keep their jobs and identities, but cannot retain
+        // later migrations while moving the schema version marker backwards.
+        self.work
+            .db
+            .execute_batch(
+                "
+            DROP TABLE shared_project_devices;
+            ALTER TABLE shared_projects DROP COLUMN legacy_devices_unrestricted;
+            DROP TRIGGER identity_refresh_credentials_changed;
+            DROP INDEX identity_sessions_refresh;
+            ALTER TABLE identity_sessions DROP COLUMN refresh_hash;
+            DROP TABLE identity_refresh_sessions;
+        ",
+            )
+            .unwrap();
+    }
 }
 fn finished() -> ReportOutcome {
     ReportOutcome::Finished {
@@ -523,6 +540,9 @@ fn shared_approval_is_exact_authorized_durable_and_delivered_without_replacing_t
             )
             .unwrap()
             .unwrap();
+        let ApprovalConsumeResult::Answer(answer) = answer else {
+            panic!("A live approval must deliver the recorded decision");
+        };
         assert_eq!(answer.approval_id, "approval-one");
         assert_eq!(answer.decision, ApprovalDecision::Approve);
     }
@@ -1030,8 +1050,11 @@ fn runner_admission_keeps_every_active_attempt_reachable_for_stop() {
     );
 }
 
+mod approval_reconfirmation;
 mod completion;
+mod controller_projection;
 mod data_tests;
 mod deadlines;
 mod participation;
+mod project_setup;
 mod runner_contact;

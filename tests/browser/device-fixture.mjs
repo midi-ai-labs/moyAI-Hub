@@ -73,7 +73,7 @@ export async function createDeviceParticipant(network, label) {
             return { principal: session.principal, expires_at_ms: session.expires_at_ms };
         },
         async sharedCall(operation, body) {
-            const routes = { createUser: "admin/users", createProject: "admin/projects", membership: "admin/memberships", environment: "admin/environments", projects: "projects", submit: "jobs", claim: "runner/claim", report: "runner/report" };
+            const routes = { snapshot: "admin/snapshot", createUser: "admin/users", createProject: "admin/projects", membership: "admin/memberships", environment: "admin/environments", projects: "projects", submit: "jobs", claim: "runner/claim", report: "runner/report" };
             if (!Object.hasOwn(routes, operation) || !humanToken) throw new Error("Unknown or unauthenticated shared fixture operation");
             return request(routes[operation], body, true, humanToken, "shared");
         },
@@ -83,6 +83,8 @@ export async function createDeviceParticipant(network, label) {
         },
         sharedTemplates: templates => request("runner/templates", { templates }, true, null, "shared"),
         sharedProvisioning: () => request("runner/provisioning", undefined, true, null, "shared"),
+        sharedProvisionReceipt: receipt => request("runner/provisioning", receipt, true, null, "shared"),
+        sharedDeviceProjects: () => request("device-projects", undefined, true, null, "shared"),
         publish: publication => request("publish", publication),
         historyRequests: async () => (await request("history/requests")).requests,
         submitHistory: (requestId, response, error = null) => request("history/results", { request_id: requestId, response, error }),

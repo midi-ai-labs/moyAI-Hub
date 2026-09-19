@@ -1,6 +1,22 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { adminRequest, environmentDefaults } from "../src/shared_admin_state.ts";
+import { adminRequest, adminTabs, environmentDefaults, projectPCSelection } from "../src/shared_admin_state.ts";
+
+test("project form with no PC checkboxes clears both previous purposes before command construction", () => {
+  const draft={id:"project",label:"PCの再登録待ち",controller_device_ids:["deleted-pc"],runner_device_ids:["deleted-pc"]};
+  const form=new FormData();
+  Object.assign(draft,projectPCSelection(form));
+  assert.deepEqual(adminRequest("save_project",draft),{kind:"save_project",id:"project",label:"PCの再登録待ち",archived:false,members:[],controller_device_ids:[],runner_device_ids:[]});
+  form.append("controller_device_ids","WinA"); form.append("runner_device_ids","WinB");
+  assert.deepEqual(projectPCSelection(form),{controller_device_ids:["WinA"],runner_device_ids:["WinB"]});
+});
+
+test("a project saves people and both PC purposes in one request without environment or pool inputs", () => {
+  const request=adminRequest("save_project",{id:"project-one",label:"  解析  ","participant:alice":"contributor","participant:bob":"",controller_device_ids:["WinA","WinB","WinA"],runner_device_ids:["WinB","WinC"],template_id:"ignored",capacity:128});
+  assert.deepEqual(request,{kind:"save_project",id:"project-one",label:"解析",archived:false,members:[{user_id:"alice",role:"contributor"}],controller_device_ids:["WinA","WinB"],runner_device_ids:["WinB","WinC"]});
+  assert.throws(()=>adminRequest("save_project",{id:"project",label:"解析","participant:alice":"admin"}));
+  assert.deepEqual(adminTabs.map(([id])=>id),["projects","users","maintenance","storage"]);
+});
 
 test("an environment reuses the selected Runner's one existing pool and exact capacity without granting projects", () => {
   const environment = { id: "a", label: "解析", runner_id: "runner-a", resource_id: "shared-pc", enabled: false, project_ids: ["private"] };

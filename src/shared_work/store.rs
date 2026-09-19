@@ -95,6 +95,14 @@ pub(super) fn may_use(db: &Connection, user: &str, project: &str, environment: &
     if !enabled {
         return Err(WorkError::Forbidden);
     }
+    let runner: String = db.query_row(
+        "SELECT runner_id FROM shared_environments WHERE id=?1",
+        [environment],
+        |r| r.get(0),
+    )?;
+    if !super::project_setup::environment_matches_project(db, project, environment, &runner)? {
+        return Err(WorkError::Forbidden);
+    }
     Ok(())
 }
 fn open_root(db: &Connection, root_id: &str) -> Result<Job> {
@@ -228,7 +236,7 @@ impl SharedWork {
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.pragma_update(None, "synchronous", "FULL")?;
         let version: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 10 {
+        if version > 12 {
             return Err(WorkError::Conflict);
         }
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -273,7 +281,15 @@ impl SharedWork {
                 "../../migrations/V10__shared_start_deadlines.sql"
             ))?;
         }
-        tx.pragma_update(None, "user_version", 10)?;
+        if version < 11 {
+            tx.execute_batch(include_str!(
+                "../../migrations/V11__remembered_human_sessions.sql"
+            ))?;
+        }
+        if version < 12 {
+            tx.execute_batch(include_str!("../../migrations/V12__project_devices.sql"))?;
+        }
+        tx.pragma_update(None, "user_version", 12)?;
         tx.commit()?;
         let check: String = db.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
         if check != "ok" {
@@ -347,6 +363,17 @@ impl SharedWork {
             |r| r.get::<_, bool>(0),
         )? {
             return Err(WorkError::Conflict);
+        }
+        for project in &env.project_ids {
+            id(project)?;
+            if !super::project_setup::environment_matches_project(
+                &tx,
+                project,
+                &env.id,
+                &env.runner_id,
+            )? {
+                return Err(WorkError::Conflict);
+            }
         }
         tx.execute(
             "INSERT OR IGNORE INTO shared_resources(id,capacity) VALUES(?1,?2)",

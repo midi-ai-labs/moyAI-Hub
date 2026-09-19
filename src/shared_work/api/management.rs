@@ -35,15 +35,36 @@ pub(crate) fn environment_target(command: &ManagementCommand) -> Option<String> 
         _ => None,
     }
 }
+pub(crate) fn project_device_targets(command: &ManagementCommand) -> Option<Vec<String>> {
+    match &command.request {
+        ManagementRequest::SaveProject {
+            controller_device_ids,
+            runner_device_ids,
+            ..
+        } => Some(
+            controller_device_ids
+                .iter()
+                .chain(runner_device_ids)
+                .cloned()
+                .collect(),
+        ),
+        ManagementRequest::RetryProjectDevice { device_id, .. } => Some(vec![device_id.clone()]),
+        _ => None,
+    }
+}
 async fn command(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Extension(device): Extension<DeviceIdentity>,
     Json(input): Json<ManagementCommand>,
 ) -> ApiResult<Value> {
-    let access = environment_target(&input)
-        .map(DeviceAccess::Environment)
-        .unwrap_or(DeviceAccess::Current);
+    let access = project_device_targets(&input)
+        .map(DeviceAccess::ProjectDevices)
+        .unwrap_or_else(|| {
+            environment_target(&input)
+                .map(DeviceAccess::Environment)
+                .unwrap_or(DeviceAccess::Current)
+        });
     authenticated(state, headers, device, access, move |store, actor| {
         store.manage(&actor, &input, crate::service::now_ms())
     })
@@ -59,7 +80,10 @@ async fn handover_view(
         state,
         headers,
         device,
-        DeviceAccess::Current,
+        DeviceAccess::Controller {
+            target: ControllerTarget::Job(id.clone()),
+            new_usage: false,
+        },
         move |store, actor| store.handover_view(&actor, &id),
     )
     .await
@@ -75,7 +99,10 @@ async fn handover(
         state,
         headers,
         device,
-        DeviceAccess::Current,
+        DeviceAccess::Controller {
+            target: ControllerTarget::Job(id.clone()),
+            new_usage: false,
+        },
         move |store, actor| store.handover(&actor, &id, &input, crate::service::now_ms()),
     )
     .await
@@ -91,7 +118,10 @@ async fn continue_job(
         state,
         headers,
         device,
-        DeviceAccess::NewUsage,
+        DeviceAccess::Controller {
+            target: ControllerTarget::Job(id.clone()),
+            new_usage: true,
+        },
         move |store, actor| store.continue_job(&actor, &id, &input, crate::service::now_ms()),
     )
     .await
@@ -125,17 +155,19 @@ async fn inbox(
     Extension(device): Extension<DeviceIdentity>,
     Query(page): Query<Page>,
 ) -> ApiResult<Value> {
+    let caller = device.device_id.clone();
     authenticated(
         state,
         headers,
         device,
         DeviceAccess::Current,
         move |store, actor| {
-            store.inbox(
+            store.inbox_for_device(
                 &actor,
                 page.before.as_deref(),
                 page.limit.unwrap_or(50),
                 crate::service::now_ms(),
+                Some(&caller),
             )
         },
     )
@@ -147,12 +179,15 @@ async fn read_inbox(
     Extension(device): Extension<DeviceIdentity>,
     Path(id): Path<String>,
 ) -> ApiResult<Value> {
+    let caller = device.device_id.clone();
     authenticated(
         state,
         headers,
         device,
         DeviceAccess::Current,
-        move |store, actor| store.read_inbox(&actor, &id, crate::service::now_ms()),
+        move |store, actor| {
+            store.read_inbox_for_device(&actor, &id, crate::service::now_ms(), Some(&caller))
+        },
     )
     .await
 }

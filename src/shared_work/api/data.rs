@@ -52,7 +52,10 @@ async fn upload_input(
         state,
         headers,
         device,
-        DeviceAccess::NewUsage,
+        DeviceAccess::Controller {
+            target: ControllerTarget::Project(id.clone()),
+            new_usage: true,
+        },
         move |store, actor| store.upload_input(&actor, &id, &upload, crate::service::now_ms()),
     )
     .await
@@ -67,7 +70,10 @@ async fn job_assets(
         state,
         headers,
         device,
-        DeviceAccess::Current,
+        DeviceAccess::Controller {
+            target: ControllerTarget::Job(id.clone()),
+            new_usage: false,
+        },
         move |store, actor| store.job_assets(&actor, &id),
     )
     .await
@@ -82,7 +88,10 @@ async fn asset(
         state,
         headers,
         device,
-        DeviceAccess::Current,
+        DeviceAccess::Controller {
+            target: ControllerTarget::Asset(id.clone()),
+            new_usage: false,
+        },
         move |store, actor| store.asset(&actor, &id),
     )
     .await
@@ -108,7 +117,10 @@ async fn transcript(
         state,
         headers,
         device,
-        DeviceAccess::Current,
+        DeviceAccess::Controller {
+            target: ControllerTarget::Job(id.clone()),
+            new_usage: false,
+        },
         move |store, actor| store.transcript(&actor, &id, page.after, page.limit),
     )
     .await

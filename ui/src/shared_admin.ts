@@ -1,5 +1,5 @@
 import { invokeSharedAdmin, ManagementFailure, onAuthenticationChange } from "./management.ts";
-import { adminRequest, adminTabs, environmentDefaults, operationLabels, roleLabel, type AdminDraft, type AdminOperation, type SharedAdminSnapshot, type SharedAdminTab } from "./shared_admin_state.ts";
+import { adminRequest, adminTabs, environmentDefaults, operationLabels, projectPCSelection, roleLabel, type AdminDraft, type AdminOperation, type SharedAdminSnapshot, type SharedAdminTab } from "./shared_admin_state.ts";
 import "./shared_admin.css";
 
 const esc = (value: unknown) => String(value ?? "").replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]!);
@@ -11,14 +11,14 @@ interface Pending { request_id: string; expected_revision: string; request: Reco
 export function attachSharedAdmin(host: HTMLElement): { refresh: () => Promise<void>; updateDevices: (devices: SharedAdminDevice[]) => void } {
   let snapshot: SharedAdminSnapshot | null = null;
   let devices: SharedAdminDevice[] = [];
-  let tab: SharedAdminTab = "users";
+  let tab: SharedAdminTab = "projects";
   let editor: Editor | null = null;
   let pending: Pending | null = null;
   let maintenanceBefore: string | null = null;
   let busy = false, polling = false, serial = 0, disposed = false;
-  host.innerHTML = `<div class="section-title"><div><p class="eyebrow">共有する仕事の準備</p><h2>利用者と仕事の設定</h2></div><button id="shared-admin-refresh" type="button" class="secondary">最新情報を取得</button></div>
-    <p class="subtle">利用者を登録し、プロジェクトでの役割と仕事の実行先を決めます。一般利用者はDesktopでログインします。Hub管理者にしても、仕事の閲覧にはプロジェクトへの所属が必要です。</p>
-    <p class="footnote">準備の順序：利用者 → プロジェクトと役割 → 仕事の実行先。利用者グループで役割をまとめて設定することもできます。PC同士の接続をまとめる「端末グループ」とは別です。</p>
+  host.innerHTML = `<div class="section-title"><div><p class="eyebrow">共有する仕事の準備</p><h2>プロジェクトと人</h2></div><button id="shared-admin-refresh" type="button" class="secondary">最新情報を取得</button></div>
+    <p class="subtle">参加する人とPCをプロジェクトでまとめて設定します。PCの参加を許可したら、プロジェクト名を付け、操作に使うPCと仕事を実行するPCを選んでください。</p>
+    <p class="footnote">同じPCを両方の用途や複数のプロジェクトで使えます。人の登録は「人」から一度行います。Hub管理者も仕事の閲覧にはプロジェクトへの参加が必要です。</p>
     <p id="shared-admin-notice" role="status" aria-live="polite"></p>
     <div class="shared-admin-tabs" role="tablist" aria-label="共同利用の管理">${adminTabs.map(([id, label]) => `<button type="button" role="tab" data-sa-tab="${id}" aria-selected="${id === tab}" aria-controls="shared-admin-content">${label}</button>`).join("")}</div>
     <div class="shared-admin-columns"><section id="shared-admin-content" role="tabpanel" tabindex="-1"></section><section id="shared-admin-editor" aria-label="設定の編集"></section></div>`;
@@ -38,7 +38,6 @@ export function attachSharedAdmin(host: HTMLElement): { refresh: () => Promise<v
     renderRows(); lock();
   }
   const user = (id: string) => snapshot?.users.find(row => row.user_id === id)?.display_name ?? id;
-  const group = (id: string) => snapshot?.groups.find(row => row.id === id)?.label ?? id;
   const runner = (id: string) => devices.find(row => row.device_id === id)?.label ?? id;
   function renderRows() {
     if (disposed) return;
@@ -49,7 +48,13 @@ export function attachSharedAdmin(host: HTMLElement): { refresh: () => Promise<v
       switch (tab) {
         case "users": return action("create_user") + s.users.map(row => card(row.display_name, `<p>${esc(row.username)} · ${row.administrator ? "Hub管理者" : "利用者"} · ${row.disabled ? "利用停止" : "有効"}</p>`, action("update_user", "編集", row.user_id) + action("set_password", "パスワード再設定", row.user_id) + action("delete_user", "削除", row.user_id))).join("");
         case "groups": return action("create_group") + s.groups.map(row => card(row.label, `<p>${row.disabled ? "利用停止" : "有効"}</p><p>所属: ${s.group_memberships.filter(m => m.group_id === row.id).map(m => esc(user(m.user_id))).join("、") || "なし"}</p>`, action("update_group", "編集", row.id) + action("group_member", "所属を設定", row.id) + action("delete_group", "削除", row.id))).join("");
-        case "projects": return action("create_project") + s.projects.map(row => card(row.label, `<p>${row.archived ? "保管中" : "利用中"}</p>${s.project_memberships.filter(m => m.project_id === row.id).map(m => `<p>${esc(user(m.user_id))}: ${roleLabel(m.role)}</p>`).join("")}${s.group_project_roles.filter(m => m.project_id === row.id).map(m => `<p>グループ ${esc(group(m.group_id))}: ${roleLabel(m.role)}</p>`).join("")}`, action("update_project", "編集", row.id) + action("project_member", "利用者の役割", row.id) + action("group_project_role", "グループの役割", row.id) + action("delete_project", "削除", row.id))).join("");
+        case "projects": return action("save_project", "プロジェクトを追加") + s.projects.map(row => {
+          const assignments=(s.project_devices ?? []).filter(d=>d.project_id===row.id);
+          const state=(value:string)=>({waiting_setup:"このPCの実行設定待ち",pending:"作業フォルダを準備中",ready:"利用可能",failed:"準備できません",not_selected:"実行しない"})[value] ?? value;
+          const controls=row.legacy_devices_unrestricted ? "従来の設定（登録したPCから操作可）" : assignments.filter(d=>d.can_control).map(d=>runner(d.device_id)).join("、") || "未選択";
+          const executors=assignments.filter(d=>d.can_execute).map(d=>`<p>${esc(runner(d.device_id))}: ${esc(state(d.preparation_state))}${d.error ? ` — ${esc(d.error)}` : ""}${d.preparation_state==="failed" ? `<button type="button" class="secondary" data-sa-retry-project="${esc(row.id)}" data-sa-device="${esc(d.device_id)}">準備を再試行</button>` : ""}</p>`).join("") || "<p>未選択</p>";
+          return card(row.label, `<p>${row.archived ? "保管中" : "利用中"}</p><p>参加者: ${s.project_memberships.filter(m=>m.project_id===row.id).map(m=>`${esc(user(m.user_id))}（${roleLabel(m.role)}）`).join("、") || "未選択"}</p><p>操作に使うPC: ${esc(controls)}</p><div>仕事を実行するPC${executors}</div>`, action("save_project","設定を編集",row.id)+action("delete_project","削除",row.id));
+        }).join("");
         case "environments": return `<h3>作業フォルダのひな形から追加</h3><p>端末とひな形を引き継いで、名前と公開先を設定できます。保存すると、登録とフォルダ作成をまとめて依頼します。</p>${s.templates.map(t => card(t.label, `<p>${esc(runner(t.runner_id))}</p>`, `<button type="button" class="secondary" data-sa-template="${esc(t.id)}" data-sa-runner="${esc(t.runner_id)}">このひな形で追加</button>`)).join("") || '<p>提供側のDesktopで「このPCで仕事を受け付ける」から作業フォルダのひな形を公開してください。</p>'}<p>${action("create_environment", "実行先を指定して追加")}</p><h3>登録した仕事の実行先</h3>` + s.environments.map(row => card(row.label, `<p>${esc(runner(row.runner_id))} · ${row.enabled ? "受付対象" : "新規受付停止"}</p><p>共有枠: ${esc(row.resource_id)} / 公開先: ${row.project_ids.map(id => esc(s.projects.find(p => p.id === id)?.label ?? id)).join("、")}</p>`, action("update_environment", "編集", row.id) + action("request_provision", "フォルダ作成・再試行", row.id) + action("delete_environment", "削除", row.id) + `<p>${s.provisioning.filter(v => v.environment_id === row.id).map(v => `${esc(({ pending: "フォルダ作成待ち", ready: "フォルダの準備完了", failed: "フォルダ作成に失敗" } as Record<string, string>)[v.state] ?? v.state)} ${esc(v.error ?? "")}`).join("")}</p>`)).join("");
         case "resources": return `<p>同じ実体を使う環境は、同じ共有資源を選んでください。ソフトウェアの利用契約は別途確認してください。</p>${action("set_resource")}` + s.resources.map(row => card(row.id, `<p>同時利用上限: ${row.capacity}</p><p>${s.environments.filter(e => e.resource_id === row.id).map(e => esc(e.label)).join("、") || "利用環境なし"}</p>`, action("set_resource", "枠を変更", row.id) + action("delete_resource", "削除", row.id))).join("");
         case "maintenance": return `<p>実行状態が不明な枠は、停止を確認するまで再利用しません。対象端末の処理と外部ジョブを確認してください。</p>` + (s.maintenance.map(row => card(runner(row.runner_id), `<p>状態: ${esc(row.state)}</p><p>${esc(row.uncertainty_reason ?? "")}</p><p class="shared-admin-mono">仕事 ${esc(row.job_id)}<br>試行 ${esc(row.attempt_id)}</p>`, action("settle_attempt", "停止確認を記録", row.attempt_id))).join("") || "<p>復旧の確認が必要な試行はありません。</p>");
@@ -65,6 +70,13 @@ export function attachSharedAdmin(host: HTMLElement): { refresh: () => Promise<v
   function open(kind: AdminOperation, id: string, template?: { runner_id: string; id: string }) {
     if (!snapshot || busy || pending) return;
     let draft: AdminDraft = { id, user_id: id, capacity: "1", enabled: true, member: true, role: "contributor" };
+    if (kind === "save_project") {
+      const project=snapshot.projects.find(row=>row.id===id);
+      draft={ id:project?.id ?? `project-${crypto.randomUUID()}`, label:project?.label ?? "", archived:project?.archived ?? false,
+        controller_device_ids:project?.legacy_devices_unrestricted ? devices.filter(d=>!d.revoked).map(d=>d.device_id) : (snapshot.project_devices ?? []).filter(d=>d.project_id===id&&d.can_control).map(d=>d.device_id),
+        runner_device_ids:(snapshot.project_devices ?? []).filter(d=>d.project_id===id&&d.can_execute).map(d=>d.device_id) };
+      for(const member of snapshot.project_memberships.filter(m=>m.project_id===id)) draft[`participant:${member.user_id}`]=member.role;
+    }
     if (["create_group", "create_project", "create_environment"].includes(kind)) draft.id = `${kind.slice(7)}-${crypto.randomUUID()}`;
     if (template) {
       const current = snapshot.templates.find(t => t.id === template.id && t.runner_id === template.runner_id);
@@ -113,6 +125,13 @@ export function attachSharedAdmin(host: HTMLElement): { refresh: () => Promise<v
     };
     const fields = (() => {
       switch (kind) {
+        case "save_project": {
+          const selected=(key:string,id:string)=>Array.isArray(d[key])&&(d[key] as string[]).includes(id);
+          const pcRows=devices.filter(pc=>!pc.revoked || selected("controller_device_ids",pc.device_id)||selected("runner_device_ids",pc.device_id)).map(pc=>`<tr><th scope="row">${esc(pc.label)}${pc.revoked ? "（登録失効）" : ""}</th><td><input type="checkbox" name="controller_device_ids" value="${esc(pc.device_id)}" aria-label="${esc(pc.label)}を操作に使う" ${selected("controller_device_ids",pc.device_id)?"checked":""}></td><td><input type="checkbox" name="runner_device_ids" value="${esc(pc.device_id)}" aria-label="${esc(pc.label)}で仕事を実行する" ${selected("runner_device_ids",pc.device_id)?"checked":""}></td></tr>`).join("");
+          return field("label","プロジェクト名")+`<fieldset><legend>参加する人</legend>${snapshot!.users.map(person=>select(`participant:${person.user_id}`,`${person.display_name}${person.disabled?"（利用停止）":""}`,roles,"参加しない")).join("") || '<p>「人」で利用者を追加してください。</p>'}</fieldset><fieldset><legend>使うPC</legend><p>同じPCを両方に選べます。実行するPCでは初回だけ保存先と権限の確認が必要です。</p><table class="shared-admin-pc-table"><thead><tr><th>PC</th><th>操作に使う</th><th>仕事を実行する</th></tr></thead><tbody>${pcRows}</tbody></table>${!pcRows?'<p>「接続端末」でPCの参加申請を許可してください。</p>':""}</fieldset><p>保存すると選択したPCへ反映します。準備中や接続確認待ちはプロジェクトに表示されます。</p>`+check("archived","プロジェクトを保管する（新しい仕事を受け付けない）");
+        }
+        case "retry_project_device": return `<p>${esc(runner(String(d.device_id)))} の実行準備をもう一度依頼します。保存先の問題は、そのPCで修正してください。</p>`;
+
         case "create_user": return field("username", "ログイン名") + field("display_name", "表示名") + field("password", "初期パスワード", { type: "password", hint: "12文字以上。利用者へ安全な方法で伝えてください。" }) + check("administrator", "Hub管理者にする");
         case "update_user": return `<p>${esc(d.username)}</p>` + field("display_name", "表示名") + check("administrator", "Hub管理者にする") + check("disabled", "利用を停止する");
         case "set_password": return `<p>${esc(user(String(d.user_id)))}</p>` + field("password", "新しいパスワード", { type: "password", hint: "既存のログインを失効させます。" });
@@ -149,8 +168,11 @@ export function attachSharedAdmin(host: HTMLElement): { refresh: () => Promise<v
   function captureEditor() {
     if (!editor) return;
     const data = new FormData(node<HTMLFormElement>("shared-admin-form"));
+    // An empty PC list is still a selection: clear deleted devices even when
+    // no checkbox remains to visit below.
+    if (editor.kind === "save_project") Object.assign(editor.draft, projectPCSelection(data));
     for (const field of node("shared-admin-editor").querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>("[name]")) {
-      if (field.name === "project_ids") editor.draft.project_ids = data.getAll(field.name).map(String);
+      if (["project_ids","controller_device_ids","runner_device_ids"].includes(field.name)) editor.draft[field.name] = data.getAll(field.name).map(String);
       else editor.draft[field.name] = field instanceof HTMLInputElement && field.type === "checkbox" ? field.checked : field.value;
     }
   }
@@ -200,6 +222,9 @@ export function attachSharedAdmin(host: HTMLElement): { refresh: () => Promise<v
     const target = (event.target as HTMLElement).closest<HTMLButtonElement>("button");
     if (!target || target.disabled) return;
     if (target.dataset.saTab && !pending) { tab = target.dataset.saTab as SharedAdminTab; editor = null; renderRows(); renderEditor(); lock(); }
+    if (target.dataset.saRetryProject && target.dataset.saDevice && snapshot && !pending) {
+      editor={kind:"retry_project_device",draft:{project_id:target.dataset.saRetryProject,device_id:target.dataset.saDevice},revision:snapshot.revision,conflict:false}; renderEditor(); lock();
+    }
     if (target.dataset.saOperation) open(target.dataset.saOperation as AdminOperation, target.dataset.saId ?? "");
     if (target.dataset.saTemplate && target.dataset.saRunner) open("create_environment", "", { runner_id: target.dataset.saRunner, id: target.dataset.saTemplate });
     if (target.id === "shared-admin-close" && !pending) { editor = null; renderEditor(); }

@@ -1658,6 +1658,14 @@ impl DeviceNetwork {
         .expect("policy serialization");
         format!("{:x}", Sha256::digest(bytes))
     }
+    /// Current display name only. Callers must authorize the referenced work
+    /// before resolving its device, including retained jobs on retired PCs.
+    pub(crate) fn device_label(&self, id: &str) -> Option<&str> {
+        self.store
+            .devices
+            .get(id)
+            .map(|device| device.label.as_str())
+    }
     pub fn self_projection(&self, id: &str, now: u64) -> Result<serde_json::Value> {
         let d = self.active_device(id, now)?;
         let cancelled: BTreeSet<_> = self

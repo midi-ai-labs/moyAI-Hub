@@ -22,15 +22,16 @@ test("Authenticated browser manages the real Hub without a native app", { tag: "
     expect(network.server.running).toBe(true);
     expect(network.server.bind).toBe(`https://127.0.0.1:${hub.networkPort}`);
     expect(typeof network.server.gateway_bind).toBe("string");
-    const group = "Playwright browser verification";
-    await page.getByLabel("グループ名", { exact: true }).fill(group);
-    await page.getByRole("button", { name: "グループを保存", exact: true }).click();
-    await expect(page.locator("#network-group-list")).toContainText(group);
-    // Read-only independent consumer confirms the real Admin owner received the browser mutation.
-    const snapshot = await hub.command("hub_network_snapshot");
-    expect(snapshot.groups.some(item => item.label === group)).toBe(true);
+    const project = "Playwright browser verification";
+    await page.locator('nav a[href="#shared-administration"]').click();
+    await page.locator('[data-sa-operation="save_project"]').first().click();
+    await page.locator("#shared-admin-label").fill(project);
+    await page.locator("#shared-admin-save").click();
+    await expect(page.locator("#shared-admin-notice")).toHaveText("設定を保存しました。");
+    await expect(page.locator("#shared-admin-content")).toContainText(project);
     await page.reload();
-    await expect(page.locator("#network-group-list")).toContainText(group);
+    await expect(page.locator("#shared-admin-content")).toContainText(project);
+    await page.locator('nav a[href="#device-network"]').click();
 
     const downloadPending = page.waitForEvent("download");
     await page.getByRole("button", { name: "接続ファイルを保存", exact: true }).click();
@@ -48,13 +49,13 @@ test("Authenticated browser manages the real Hub without a native app", { tag: "
     await expect(page.getByRole("button", { name: "ネットワークを開始", exact: true })).toBeVisible();
     expect((await hub.observeNetwork()).server.running).toBe(false);
     await page.reload();
-    await expect(page.locator("#network-group-list")).toContainText(group);
+    await expect(page.locator("#shared-admin-content")).toContainText(project);
     await expect(page.getByRole("button", { name: "ネットワークを開始", exact: true })).toBeVisible();
     await expect(page.getByRole("button", { name: "接続ファイルを保存", exact: true })).toBeDisabled();
     expect((await hub.command("hub_web_status")).enabled).toBe(true);
 
     await page.getByRole("button", { name: "Hub本体へ再接続", exact: true }).click();
-    await expect(page.locator("#network-group-list")).toContainText(group);
+    await expect(page.locator("#shared-admin-content")).toContainText(project);
     await page.locator("#manual-server-connection > summary").click();
     await page.locator("#bind").fill(`127.0.0.1:${hub.networkPort}`);
     await page.locator("#generate-token").click();

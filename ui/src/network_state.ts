@@ -146,9 +146,7 @@ export function networkSubject(value: string): NetworkSubject | null {
 }
 export function networkDeviceStatus(device: NetworkDevice): { label: string; color: string; detail: string } {
     if (!device.online) return { label: "オフライン", color: "gray", detail: "有効な端末接続を確認できません。" };
-    return device.publications.some(profile => profile.enabled)
-        ? { label: "オンライン", color: "green", detail: "受付申告あり。実際の利用には承認と接続ルールが必要です。" }
-        : { label: "オンライン", color: "blue", detail: "受付の申告なし。端末の生存確認は届いています。" };
+    return { label: "オンライン", color: "green", detail: "端末からの接続を確認しています。使い方はプロジェクトで設定します。" };
 }
 /** Capture the exact reviewed device, including when its label is duplicated. */
 export function networkDeviceDeletion(device: NetworkDevice, revision: string): {

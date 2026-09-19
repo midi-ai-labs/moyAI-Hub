@@ -333,6 +333,7 @@ impl SharedWork {
         }
         tx.execute("UPDATE shared_approvals SET invalidated_at_ms=?1", [now])?;
         tx.execute("DELETE FROM identity_sessions", [])?;
+        tx.execute("DELETE FROM identity_refresh_sessions", [])?;
         tx.commit()?;
         Ok(())
     }

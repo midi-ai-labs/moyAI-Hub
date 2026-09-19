@@ -61,6 +61,14 @@ pub(super) async fn command(
             .network
             .lock()
             .map_err(|_| IdentityError::Unavailable)?;
+        if let Some(devices) = crate::shared_work::api::management::project_device_targets(&request)
+        {
+            for device in devices {
+                network
+                    .self_projection(&device, crate::service::now_ms())
+                    .map_err(|_| WorkError::Forbidden)?;
+            }
+        }
         if let Some(runner) = crate::shared_work::api::management::environment_target(&request) {
             network
                 .admission_revision(&runner, crate::service::now_ms())

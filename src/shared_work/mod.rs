@@ -11,6 +11,8 @@ mod provisioning;
 pub use local_admission::LocalAdmission;
 pub use provisioning::{ProvisionReceipt, ProvisionRequest, RunnerTemplate};
 mod management;
+pub(crate) mod project_setup;
+pub use project_setup::ProjectMember;
 mod projection;
 mod runner_contact;
 pub use data::{Asset, AssetDownload, AssetUpload, RunnerAssetUpload, TranscriptPage};
@@ -19,10 +21,13 @@ pub use handover::{ContinueJob, HandoverRequest, HandoverView};
 pub use management::{ManagementCommand, ManagementRequest};
 pub use runner_contact::{RUNNER_CONTACT_STALE_MS, RunnerContact, RunnerContactState};
 
-pub use approvals::{ApprovalAnswer, ApprovalDecision, ApprovalView};
+pub use approvals::{ApprovalAnswer, ApprovalConsumeResult, ApprovalDecision, ApprovalView};
 mod store;
 
-pub use projection::{EnvironmentStatus, JobSummary, ProjectStatus, ResourceOccupant, WorkPerson};
+pub use projection::{
+    EnvironmentStatus, ExecutionDeviceStatus, JobSummary, ProjectStatus, ResourceOccupant,
+    WorkPerson,
+};
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};

@@ -386,6 +386,7 @@ fn shared_deadline_v9_forward_migration_is_finite_and_keeps_started_authority() 
     .unwrap();
     let child = f.work.claim("WinE", 30).unwrap().unwrap();
     report_at(&mut f, &child, "start", ReportOutcome::Started, 40).unwrap();
+    f.remove_post_v10_fixture_schema();
     f.work.db.execute_batch("DROP INDEX shared_jobs_start_deadline; ALTER TABLE shared_jobs DROP COLUMN start_before_ms; PRAGMA user_version=9;").unwrap();
     f.reopen();
     assert_eq!(
@@ -393,7 +394,7 @@ fn shared_deadline_v9_forward_migration_is_finite_and_keeps_started_authority() 
             .db
             .pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
             .unwrap(),
-        10
+        12
     );
     for id in [&root.id, &child.job.id] {
         assert_eq!(

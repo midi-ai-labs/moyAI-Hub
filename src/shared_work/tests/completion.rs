@@ -424,17 +424,24 @@ fn delivered_approval_is_revalidated_at_effect_after_handover_or_credential_chan
                 )
                 .is_err()
         );
-        assert!(
-            f.work
-                .consume_approval(
-                    "WinE",
-                    "exact-approval",
-                    &attempt.attempt_id,
-                    attempt.generation,
-                    45
-                )
-                .is_err()
+        let consumed = f.work.consume_approval(
+            "WinE",
+            "exact-approval",
+            &attempt.attempt_id,
+            attempt.generation,
+            45,
         );
+        if change_credentials {
+            assert!(consumed.is_err());
+        } else {
+            assert!(matches!(
+                consumed.unwrap(),
+                Some(ApprovalConsumeResult::ReconfirmationRequired {
+                    reconfirmation_required: true,
+                    ..
+                })
+            ));
+        }
     }
 }
 
@@ -564,9 +571,47 @@ pub(super) fn released_migration(version: u32) {
             .unwrap();
         db.execute("INSERT INTO shared_approvals(id,attempt_id,request_json,expires_at_ms,created_at_ms) VALUES('old-approval','attempt','{}',1000,1)",[]).unwrap();
     }
+    for (target, sql) in [
+        (
+            5,
+            include_str!("../../../migrations/V5__shared_management.sql"),
+        ),
+        (6, include_str!("../../../migrations/V6__shared_data.sql")),
+        (
+            7,
+            include_str!("../../../migrations/V7__shared_runner_participation.sql"),
+        ),
+        (
+            8,
+            include_str!("../../../migrations/V8__shared_data_retention.sql"),
+        ),
+        (
+            9,
+            include_str!("../../../migrations/V9__shared_managed_files.sql"),
+        ),
+        (
+            10,
+            include_str!("../../../migrations/V10__shared_start_deadlines.sql"),
+        ),
+        (
+            11,
+            include_str!("../../../migrations/V11__remembered_human_sessions.sql"),
+        ),
+    ] {
+        if version >= target {
+            db.execute_batch(sql).unwrap();
+        }
+    }
     db.pragma_update(None, "user_version", version).unwrap();
     drop(db);
     let mut work = SharedWork::open(&path).unwrap();
+    assert!(
+        work.require_project_controller("old", "new-registered-PC")
+            .is_ok()
+    );
+    let device_projects = work.device_projects("WinE").unwrap();
+    assert_eq!(device_projects["projects"][0]["environment_id"], "env");
+    assert_eq!(device_projects["projects"][0]["can_control"], true);
     let attempt = work.attempt("WinE", "attempt").unwrap();
     assert_eq!(attempt.assignment.job.title, "Old job");
     assert_eq!(attempt.assignment.job.quota_owner_id, admin.user_id);

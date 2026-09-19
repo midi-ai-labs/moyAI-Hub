@@ -1,6 +1,10 @@
 use super::*;
 use crate::network::{self, DeviceNetwork};
 use std::collections::BTreeSet;
+#[path = "api_tests/project_devices.rs"]
+mod project_devices;
+#[path = "api_tests/remembered.rs"]
+mod remembered;
 
 struct Device {
     id: String,

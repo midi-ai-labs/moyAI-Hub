@@ -21,6 +21,7 @@ pub struct JobSummary {
     pub state: JobState,
     pub environment_id: String,
     pub environment_label: String,
+    pub device_label: Option<String>,
     pub requestor: WorkPerson,
     pub assignee: WorkPerson,
     pub wait_reason: Option<String>,
@@ -51,6 +52,7 @@ pub struct EnvironmentStatus {
     pub label: String,
     pub resource_id: String,
     pub runner_id: String,
+    pub device_label: Option<String>,
     pub enabled: bool,
     pub capacity: u32,
     pub occupied: u32,
@@ -61,10 +63,20 @@ pub struct EnvironmentStatus {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExecutionDeviceStatus {
+    pub device_id: String,
+    pub device_label: Option<String>,
+    pub environment_id: Option<String>,
+    pub preparation_state: String,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProjectStatus {
     pub project_id: String,
     pub jobs: Vec<JobSummary>,
     pub environments: Vec<EnvironmentStatus>,
+    pub execution_devices: Vec<ExecutionDeviceStatus>,
     pub next_before: Option<String>,
     pub next_environment_before: Option<String>,
 }
@@ -130,6 +142,45 @@ impl SharedWork {
         environment_before: Option<&str>,
         now: u64,
     ) -> Result<ProjectStatus> {
+        self.status_at_for_device(actor, project, before, limit, environment_before, now, None)
+    }
+    pub fn status_for_device(
+        &self,
+        actor: &Principal,
+        project: &str,
+        before: Option<&str>,
+        limit: u32,
+        environment_before: Option<&str>,
+        device: Option<&str>,
+    ) -> Result<ProjectStatus> {
+        self.status_at_for_device(
+            actor,
+            project,
+            before,
+            limit,
+            environment_before,
+            crate::service::now_ms(),
+            device,
+        )
+    }
+    fn status_at_for_device(
+        &self,
+        actor: &Principal,
+        project: &str,
+        before: Option<&str>,
+        limit: u32,
+        environment_before: Option<&str>,
+        now: u64,
+        device: Option<&str>,
+    ) -> Result<ProjectStatus> {
+        if let Some(device) = device {
+            self.require_project_controller(project, device)?;
+        }
+        let controlled = device
+            .map(|id| self.controlled_projects(id))
+            .transpose()?
+            .map(|ids| serde_json::to_string(&ids))
+            .transpose()?;
         let role =
             identity::require_project_role(&self.db, &actor.user_id, project, ProjectRole::Reader)?;
         let jobs = self.list(actor, project, before, limit)?;
@@ -158,6 +209,7 @@ impl SharedWork {
                             label: r.get(1)?,
                             resource_id: r.get(2)?,
                             runner_id: r.get(3)?,
+                            device_label: None,
                             enabled: r.get(4)?,
                             capacity: r.get(5)?,
                             occupied: 0,
@@ -182,11 +234,16 @@ impl SharedWork {
         };
         for environment in &mut environments {
             environment.occupied = self.db.query_row("SELECT COUNT(*) FROM shared_attempts WHERE resource_id=?1 AND state IN ('assigned','running','stop_requested')", [&environment.resource_id], |r| r.get(0))?;
-            let visible: u32 = self.db.query_row("SELECT COUNT(*) FROM shared_attempts a JOIN shared_jobs j ON j.id=a.job_id JOIN identity_effective_project_memberships m ON m.project_id=j.project_id AND m.user_id=?2 WHERE a.resource_id=?1 AND a.state IN ('assigned','running','stop_requested')", params![environment.resource_id, actor.user_id], |r|r.get(0))?;
-            let mut statement = self.db.prepare("SELECT j.id,j.title,j.project_id,p.label,u.id,u.display_name,j.state FROM shared_attempts a JOIN shared_jobs j ON j.id=a.job_id JOIN shared_projects p ON p.id=j.project_id JOIN identity_users u ON u.id=j.assignee_id JOIN identity_effective_project_memberships m ON m.project_id=j.project_id AND m.user_id=?2 WHERE a.resource_id=?1 AND a.state IN ('assigned','running','stop_requested') ORDER BY a.created_at_ms,a.id LIMIT ?3")?;
+            let visible: u32 = self.db.query_row("SELECT COUNT(*) FROM shared_attempts a JOIN shared_jobs j ON j.id=a.job_id JOIN identity_effective_project_memberships m ON m.project_id=j.project_id AND m.user_id=?2 WHERE a.resource_id=?1 AND a.state IN ('assigned','running','stop_requested') AND (?3 IS NULL OR j.project_id IN (SELECT value FROM json_each(?3)))", params![environment.resource_id, actor.user_id, controlled], |r|r.get(0))?;
+            let mut statement = self.db.prepare("SELECT j.id,j.title,j.project_id,p.label,u.id,u.display_name,j.state FROM shared_attempts a JOIN shared_jobs j ON j.id=a.job_id JOIN shared_projects p ON p.id=j.project_id JOIN identity_users u ON u.id=j.assignee_id JOIN identity_effective_project_memberships m ON m.project_id=j.project_id AND m.user_id=?2 WHERE a.resource_id=?1 AND a.state IN ('assigned','running','stop_requested') AND (?3 IS NULL OR j.project_id IN (SELECT value FROM json_each(?3))) ORDER BY a.created_at_ms,a.id LIMIT ?4")?;
             environment.occupants = statement
                 .query_map(
-                    params![environment.resource_id, actor.user_id, OCCUPANT_PREVIEW],
+                    params![
+                        environment.resource_id,
+                        actor.user_id,
+                        controlled,
+                        OCCUPANT_PREVIEW
+                    ],
                     |r| {
                         Ok(ResourceOccupant {
                             job_id: r.get(0)?,
@@ -213,6 +270,7 @@ impl SharedWork {
             project_id: project.into(),
             jobs: summaries,
             environments,
+            execution_devices: super::project_setup::execution_devices(&self.db, project)?,
             next_before,
             next_environment_before,
         })
@@ -238,7 +296,7 @@ impl SharedWork {
                 "開始期限を過ぎました。実行状態が不明なため、停止が確認されるまで利用枠を保持します。".into()
             })
         } else if super::handover::held(&self.db, &job.root_id)? {
-            Some("担当交代のため、実行済み処理の完了または安全な中断地点を待っています。".into())
+            Some("担当交代を予約しました。現在の担当者のもとで承認と処理を続け、安全な中断地点で交代します。仕事が先に完了した場合は交代せず終了します。".into())
         } else if uncertainty_reason.is_some() {
             Some("実行結果の照合待ちです。停止が確認されるまで利用枠を保持します。".into())
         } else if matches!(
@@ -280,6 +338,7 @@ impl SharedWork {
             state: job.state.clone(),
             environment_id: job.environment_id.clone(),
             environment_label,
+            device_label: None,
             requestor: person(&self.db, &job.requestor_id)?,
             assignee: person(&self.db, &job.assignee_id)?,
             wait_reason,

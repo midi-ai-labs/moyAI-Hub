@@ -86,13 +86,15 @@ test("approval and presence stay independent while a stopped device remains onli
     const device = snapshot().devices[0];
     assert.equal(networkAdmissionStatus(device).label, "許可");
     assert.equal(networkDeviceStatus(device).label, "オンライン");
-    assert.match(networkDeviceStatus(device).detail, /接続ルール/);
+    const connected=networkDeviceStatus(device);
+    assert.match(connected.detail, /プロジェクト/);
+    assert.doesNotMatch(connected.detail, /接続ルール|受付申告/);
     device.admission = "stopped";
     assert.equal(networkAdmissionStatus(device).label, "停止");
     assert.match(networkAdmissionStatus(device).detail, /再許可/);
     assert.equal(networkDeviceStatus(device).label, "オンライン");
     device.publications[0].enabled = false;
-    assert.match(networkDeviceStatus(device).detail, /受付の申告なし/);
+    assert.deepEqual(networkDeviceStatus(device), connected, "legacy MCP publication is not shared execution readiness");
     device.online = false;
     assert.equal(networkDeviceStatus(device).label, "オフライン");
     assert.equal(networkAdmissionStatus(device).label, "停止");

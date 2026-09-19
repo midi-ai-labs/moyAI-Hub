@@ -41,6 +41,11 @@ impl SharedWork {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        super::project_setup::require_project_controller(
+            &tx,
+            &request.project_id,
+            &request.actor_device_id,
+        )?;
         // The forwarding Runner cannot invent a human identity. The opaque session is verified
         // against its original device and is never retained in a work receipt or projection.
         let actor: Principal = identity::authenticate(

@@ -17,7 +17,7 @@ async function approve(page, participant, label, rename = null) {
     const row = page.locator(`[data-id="request:${participant.requestId}"]`);
     await expect(row).toContainText("承認待ち");
     if (rename) {
-        await row.getByRole("button", { name: `${label}の名前・所属を確認`, exact: true }).click();
+        await row.getByRole("button", { name: `${label}の名前を確認`, exact: true }).click();
         await page.locator("#network-device-label").fill(rename);
         await page.locator("#network-device-save").click();
         await expect(page.locator("#network-device-dialog")).not.toBeVisible();
@@ -35,52 +35,66 @@ async function capture(page, testInfo, name) {
     await testInfo.attach(name, { path, contentType: "image/png" });
 }
 
-test("Device admission, duplicate-name validation, membership, stop and deletion target the selected participant", { tag: "@smoke" }, async ({ page, hub }, testInfo) => {
+test("Device admission, duplicate-name validation, retained legacy memberships, stop and deletion target the selected participant", { tag: "@smoke" }, async ({ page, hub }, testInfo) => {
     const network = await startNetwork(page, hub);
-    await page.locator("#network-group-label").fill("Servers");
-    await page.getByRole("button", { name: "グループを保存", exact: true }).click();
-    await expect(page.locator("#network-group-list")).toContainText("Servers");
+    // Legacy ACL data remains compatible; it is setup through the existing
+    // administrative API, not through removed group/rule UI controls.
+    let legacy=await hub.command("hub_network_snapshot");
+    await hub.command("hub_network_group",{expectedRevision:legacy.revision,id:null,label:"Servers"});
     const first = await createDeviceParticipant(network, "WinB fixture");
     const firstId = await approve(page, first, "WinB fixture");
+    legacy=await hub.command("hub_network_snapshot");
+    await hub.command("hub_network_device",{expectedRevision:legacy.revision,deviceId:firstId,label:"WinB fixture",groups:[legacy.groups[0].id],revoked:false});
     await expect(createDeviceParticipant(network, "WinB fixture")).rejects.toThrow("device_name_conflict");
     const second = await createDeviceParticipant(network, "WinC pending");
     const secondId = await approve(page, second, "WinC pending", "WinC fixture");
     const firstRow = page.locator(`[data-id="device:${firstId}"]`);
     const secondRow = page.locator(`[data-id="device:${secondId}"]`);
     await expect(firstRow).toContainText("オンライン");
-    await expect(firstRow).toContainText("受付の申告なし");
+    const legacyStatus=firstRow.locator("details[data-network-legacy-mcp]");
+    await expect(legacyStatus).not.toHaveAttribute("open", "");
+    await expect(legacyStatus.getByText("受付の申告なし",{exact:true})).toBeHidden();
+    await expect(firstRow).toContainText("使い方はプロジェクトで設定します。");
+    await expect(firstRow).not.toContainText("接続ルールが必要");
     await first.publish({ profile_id: "fixture-project", name: "Fixture project", endpoint: "https://127.0.0.1:7332/mcp",
         mode: "agent", scope_id: "fixture-scope", enabled: true });
     await page.locator("#network-clients-refresh").click();
-    await expect(firstRow).toContainText("受付申告あり");
-    await firstRow.locator("summary").click();
+    await expect(legacyStatus.getByText("受付申告あり",{exact:true})).toBeHidden();
+    await legacyStatus.getByText("以前のMCP連携",{exact:true}).click();
+    await expect(legacyStatus.getByText("受付申告あり",{exact:true})).toBeVisible();
+    await legacyStatus.getByText("以前のMCP連携",{exact:true}).click();
+    await firstRow.locator("details[data-device-identity] > summary").click();
     await firstRow.getByRole("button", { name: "WinB fixtureを管理", exact: true }).click();
     await page.locator("#network-device-label").fill(" winc FIXTURE ");
     await page.locator("#network-device-save").click();
     await expect(page.locator("#network-device-error")).not.toBeEmpty();
     expect((await hub.command("hub_network_snapshot")).devices.find(device => device.device_id === firstId).label).toBe("WinB fixture");
     await page.locator("#network-device-label").fill("WinB renamed");
-    await page.locator("#network-device-groups").getByLabel("Servers", { exact: true }).check();
+    await expect(page.locator("#network-device-groups")).toBeHidden();
     await page.mouse.click(4, 4);
     await expect(page.locator("#network-device-dialog")).toBeVisible();
     await capture(page, testInfo, "device-rename-membership");
     await page.locator("#network-device-save").click();
     await expect(page.locator("#network-device-dialog")).not.toBeVisible();
     await expect(firstRow).toContainText("WinB renamed");
-    await expect(firstRow).toContainText("Servers");
-    await expect(firstRow.locator("details")).toHaveAttribute("open", "");
-    await page.locator("#network-search").fill("Servers");
+    await expect(firstRow.locator("td").nth(3)).toBeHidden();
+    expect((await hub.command("hub_network_snapshot")).devices.find(device=>device.device_id===firstId).groups).toEqual([legacy.groups[0].id]);
+    await expect(firstRow.locator("details[data-device-identity]")).toHaveAttribute("open", "");
+    await page.locator("#network-search").fill("WinB renamed");
     await expect(page.locator("#network-device-rows tr")).toHaveCount(1);
     await expect(firstRow).toBeVisible();
     await page.locator("#network-search").fill("");
     await page.locator('nav a[href="#device-network"]').click();
-    await page.locator("#network-rule-from").selectOption(`device:${secondId}`);
-    await page.locator("#network-rule-to").selectOption(`device:${firstId}`);
-    await page.locator("#network-rule-profile").selectOption("fixture-project");
-    await page.getByRole("button", { name: "接続ルールを追加", exact: true }).click();
-    await expect(page.locator("#network-rule-list")).toContainText("Fixture project");
-    expect((await hub.command("hub_network_snapshot")).rules[0].profile_id).toBe("fixture-project");
+    legacy=await hub.command("hub_network_snapshot");
+    await hub.command("hub_network_rule",{expectedRevision:legacy.revision,rule:{id:null,from:{kind:"device",id:secondId},to:{kind:"device",id:firstId},usage:"direct",effect:"allow",max_depth:1,profile_id:"fixture-project"}});
+    const configuredLegacy = await hub.command("hub_network_snapshot");
+    expect(configuredLegacy.rules[0].profile_id).toBe("fixture-project");
+    await expect(page.locator("#network-rule-form")).toBeHidden();
     await page.locator('nav a[href="#clients"]').click();
+    // API fixture setup is an external edit: observe its revision before the
+    // next user command so this lifecycle test does not submit an old CAS.
+    await page.locator("#network-clients-refresh").click();
+    await expect(page.locator("#network-identity")).toContainText(`更新 ${configuredLegacy.revision}`);
     await firstRow.getByRole("button", { name: "WinB renamedの停止", exact: true }).click();
     await expect(firstRow).toContainText("新規利用を停止");
     await expect(secondRow.getByRole("button", { name: "WinC fixtureの停止", exact: true })).toBeEnabled();

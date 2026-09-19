@@ -21,6 +21,18 @@ pub struct ManagementCommand {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ManagementRequest {
+    SaveProject {
+        id: String,
+        label: String,
+        archived: bool,
+        members: Vec<ProjectMember>,
+        controller_device_ids: Vec<String>,
+        runner_device_ids: Vec<String>,
+    },
+    RetryProjectDevice {
+        project_id: String,
+        device_id: String,
+    },
     PruneSharedData {
         before_ms: u64,
     },
@@ -175,16 +187,16 @@ fn snapshot(db: &Connection, actor: &Principal) -> Result<Value> {
     )?;
     let projects = rows(
         db,
-        "SELECT id,label,archived FROM shared_projects ORDER BY id",
+        "SELECT id,label,archived,legacy_devices_unrestricted FROM shared_projects ORDER BY id",
         |r| {
             Ok(
-                json!({"id":r.get::<_,String>(0)?,"label":r.get::<_,String>(1)?,"archived":r.get::<_,bool>(2)?}),
+                json!({"id":r.get::<_,String>(0)?,"label":r.get::<_,String>(1)?,"archived":r.get::<_,bool>(2)?,"legacy_devices_unrestricted":r.get::<_,bool>(3)?}),
             )
         },
     )?;
     let project_memberships = rows(
         db,
-        "SELECT project_id,user_id,role FROM identity_project_memberships ORDER BY project_id,user_id",
+        "SELECT project_id,user_id,role FROM identity_effective_project_memberships ORDER BY project_id,user_id",
         |r| {
             Ok(
                 json!({"project_id":r.get::<_,String>(0)?,"user_id":r.get::<_,String>(1)?,"role":r.get::<_,String>(2)?}),
@@ -234,7 +246,7 @@ fn snapshot(db: &Connection, actor: &Principal) -> Result<Value> {
         },
     )?;
     Ok(
-        json!({"revision":revision.to_string(),"users":users,"groups":groups,"group_memberships":group_memberships,"projects":projects,"project_memberships":project_memberships,"group_project_roles":group_project_roles,"environments":environments,"resources":resources,"maintenance":maintenance["items"],"maintenance_next_before":maintenance["next_before"],"maintenance_total":maintenance["total_active"],"templates":templates,"provisioning":provisioning,"storage":super::data::storage_status(db)?}),
+        json!({"revision":revision.to_string(),"users":users,"groups":groups,"group_memberships":group_memberships,"projects":projects,"project_memberships":project_memberships,"group_project_roles":group_project_roles,"project_devices":super::project_setup::device_rows(db,None)?,"environments":environments,"resources":resources,"maintenance":maintenance["items"],"maintenance_next_before":maintenance["next_before"],"maintenance_total":maintenance["total_active"],"templates":templates,"provisioning":provisioning,"storage":super::data::storage_status(db)?}),
     )
 }
 
@@ -331,6 +343,7 @@ fn environment_projects(db: &Connection, environment: &str, projects: &[String])
         }
         exists(db, "shared_projects", project)?;
     }
+    super::project_setup::validate_legacy_environment_edit(db, environment, projects)?;
     db.execute(
         "DELETE FROM shared_environment_projects WHERE environment_id=?1",
         [environment],
@@ -395,6 +408,52 @@ impl SharedWork {
         let hash = receipt_fingerprint(command, None)?;
         use ManagementRequest::*;
         match &command.request {
+            SaveProject {
+                id,
+                label,
+                archived,
+                members,
+                controller_device_ids,
+                runner_device_ids,
+            } => {
+                super::project_setup::save(
+                    &tx,
+                    actor,
+                    id,
+                    label,
+                    *archived,
+                    members,
+                    controller_device_ids,
+                    runner_device_ids,
+                    now,
+                )?;
+            }
+            RetryProjectDevice {
+                project_id,
+                device_id,
+            } => {
+                super::store::id(project_id)?;
+                super::store::id(device_id)?;
+                let selected:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM shared_project_devices d JOIN shared_projects p ON p.id=d.project_id WHERE d.project_id=?1 AND d.device_id=?2 AND d.can_execute=1 AND p.archived=0)",params![project_id,device_id],|r|r.get(0))?;
+                if !selected {
+                    return Err(WorkError::NotFound);
+                }
+                super::project_setup::synchronize(&tx, Some(device_id), now)?;
+                let existing:Option<(String,String,u64,String)>=tx.query_row("SELECT p.environment_id,p.template_id,p.generation,p.state FROM shared_project_devices d JOIN shared_provisioning p ON p.environment_id=d.environment_id WHERE d.project_id=?1 AND d.device_id=?2 AND d.can_execute=1",params![project_id,device_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+                if let Some((environment_id, template_id, generation, state)) = existing {
+                    if state == "failed" {
+                        super::provisioning::enqueue(
+                            &tx,
+                            &ProvisionRequest {
+                                environment_id,
+                                template_id,
+                                generation,
+                            },
+                            now,
+                        )?;
+                    }
+                }
+            }
             PruneSharedData { before_ms } => {
                 super::data::prune(&tx, *before_ms, now)?;
             }
@@ -624,7 +683,7 @@ impl SharedWork {
                     // A queued checkpoint and any active process retain their original environment binding.
                     no_reference(
                         &tx,
-                        "SELECT EXISTS(SELECT 1 FROM shared_jobs WHERE environment_id=?1) OR EXISTS(SELECT 1 FROM shared_job_environment_ceiling WHERE environment_id=?1) OR EXISTS(SELECT 1 FROM shared_provisioning WHERE environment_id=?1)",
+                        "SELECT EXISTS(SELECT 1 FROM shared_jobs WHERE environment_id=?1) OR EXISTS(SELECT 1 FROM shared_job_environment_ceiling WHERE environment_id=?1) OR EXISTS(SELECT 1 FROM shared_provisioning WHERE environment_id=?1) OR EXISTS(SELECT 1 FROM shared_project_devices WHERE environment_id=?1)",
                         id,
                     )?;
                 }

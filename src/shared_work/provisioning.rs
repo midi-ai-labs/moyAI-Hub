@@ -3,6 +3,8 @@ use super::*;
 use crate::identity::{self, Principal};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
+pub(super) const MAX_RUNNER_ENVIRONMENTS: u32 = 128;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunnerTemplate {
@@ -36,9 +38,9 @@ pub struct RunnerEnvironment {
 impl SharedWork {
     pub fn runner_environments(&self, runner: &str) -> Result<Vec<RunnerEnvironment>> {
         store::id(runner)?;
-        let mut statement=self.db.prepare("SELECT e.id,e.label,e.resource_id,r.capacity,e.enabled FROM shared_environments e JOIN shared_resources r ON r.id=e.resource_id WHERE e.runner_id=?1 ORDER BY e.id LIMIT 129")?;
+        let mut statement=self.db.prepare("SELECT e.id,e.label,e.resource_id,r.capacity,e.enabled FROM shared_environments e JOIN shared_resources r ON r.id=e.resource_id WHERE e.runner_id=?1 ORDER BY e.id LIMIT ?2")?;
         let mut environments = statement
-            .query_map([runner], |row| {
+            .query_map(params![runner, MAX_RUNNER_ENVIRONMENTS + 1], |row| {
                 Ok(RunnerEnvironment {
                     environment: Environment {
                         id: row.get(0)?,
@@ -52,7 +54,7 @@ impl SharedWork {
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        if environments.len() > 128 {
+        if environments.len() > MAX_RUNNER_ENVIRONMENTS as usize {
             return Err(WorkError::Capacity);
         }
         for environment in &mut environments {
@@ -99,6 +101,8 @@ impl SharedWork {
             .collect::<Vec<_>>();
         proposed.sort();
         if current == proposed {
+            super::project_setup::synchronize(&tx, Some(runner), now)?;
+            tx.commit()?;
             return Ok(());
         }
         tx.execute(
@@ -111,6 +115,7 @@ impl SharedWork {
                 params![runner, template.id, template.label, now],
             )?;
         }
+        super::project_setup::synchronize(&tx, Some(runner), now)?;
         tx.commit()?;
         Ok(())
     }
@@ -168,6 +173,9 @@ impl SharedWork {
             return Err(WorkError::Conflict);
         }
         tx.execute("UPDATE shared_provisioning SET state=?2,error=?3,updated_at_ms=?4 WHERE environment_id=?1",params![receipt.environment_id,next,receipt.error,now])?;
+        if receipt.success {
+            tx.execute("UPDATE shared_environments SET enabled=1 WHERE id=?1 AND EXISTS(SELECT 1 FROM shared_project_devices d JOIN shared_projects p ON p.id=d.project_id WHERE d.environment_id=?1 AND d.can_execute=1 AND p.archived=0)",[&receipt.environment_id])?;
+        }
         tx.commit()?;
         Ok(())
     }

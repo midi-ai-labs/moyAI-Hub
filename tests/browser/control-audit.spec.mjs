@@ -33,11 +33,14 @@ async function startNetwork(page, hub) {
     await expect(page.locator("#network-stop")).toBeVisible();
     return hub.observeNetwork();
 }
-async function group(page, label) {
-    await page.locator("#network-group-id").selectOption("");
-    await page.locator("#network-group-label").fill(label);
-    await page.locator("#network-group-form button").click();
-    await expect(page.locator("#network-group-list")).toContainText(label);
+async function group(hub, label) {
+    const snapshot=await hub.command("hub_network_snapshot");
+    await hub.command("hub_network_group",{expectedRevision:snapshot.revision,id:null,label});
+    return (await hub.command("hub_network_snapshot")).groups.find(row=>row.label===label);
+}
+async function legacyRule(hub,rule) {
+    const snapshot=await hub.command("hub_network_snapshot");
+    await hub.command("hub_network_rule",{expectedRevision:snapshot.revision,rule:{id:null,profile_id:null,max_depth:1,...rule}});
 }
 
 test("Every page link and explanatory disclosure opens its own current target", async ({ page, hub }, testInfo) => {
@@ -174,10 +177,10 @@ test("Model dropdown alternatives reset dependent values and register each provi
     } finally { await provider.close(); }
 });
 
-test("Device dialogs cancel drafts, review without losing edits, and update both membership values", async ({ page, hub }, testInfo) => {
+test("Device dialogs cancel drafts and preserve existing legacy memberships while editing names", async ({ page, hub }, testInfo) => {
     const errors = await ready(page, hub);
     const network = await startNetwork(page, hub);
-    await group(page, "Clients"); await group(page, "Servers");
+    await group(hub, "Clients"); await group(hub, "Servers");
     const participant = await createDeviceParticipant(network, "Pending control fixture");
     await page.locator("#network-clients-refresh").click();
     await page.locator("#network-filter").selectOption("pending");
@@ -190,15 +193,17 @@ test("Device dialogs cancel drafts, review without losing edits, and update both
     await page.locator("#network-device-close").click();
     await pending.locator("[data-network-request]").click();
     await expect(page.locator("#network-device-label")).toHaveValue("Pending control fixture");
-    for (const label of ["Clients", "Servers"]) await page.locator("#network-device-groups").getByLabel(label, { exact: true }).check();
+    await expect(page.locator("#network-device-groups")).toBeHidden();
     await page.locator("#network-device-save").click();
     await expect(page.locator("#network-device-dialog")).not.toBeVisible();
     const approval = await participant.collectApproval(); expect(approval.status).toBe("approved");
+    const legacy=await hub.command("hub_network_snapshot");
+    await hub.command("hub_network_device",{expectedRevision:legacy.revision,deviceId:approval.deviceId,label:"Pending control fixture",groups:legacy.groups.map(g=>g.id),revoked:false});
     await participant.presence(); await page.locator("#network-clients-refresh").click();
     await page.locator("#network-filter").selectOption("all");
     const row = page.locator(`[data-id="device:${approval.deviceId}"]`);
-    await expect(row).toContainText("Clients"); await expect(row).toContainText("Servers");
-    for (const query of ["Pending control", "127.0.0.1", approval.deviceId, "Servers"]) {
+    await expect(row.locator("td").nth(3)).toBeHidden();
+    for (const query of ["Pending control", "127.0.0.1", approval.deviceId]) {
         await page.locator("#network-search").fill(query); await expect(row).toBeVisible();
     }
     await page.locator("#network-search").fill("not-a-device"); await expect(row).toHaveCount(0);
@@ -208,26 +213,24 @@ test("Device dialogs cancel drafts, review without losing edits, and update both
     await page.locator("#network-device-save").click();
     expect(await page.locator("#network-device-label").evaluate(node => node.validity.valueMissing)).toBe(true);
     await page.locator("#network-device-label").fill("取消する名前");
-    await page.locator("#network-device-groups").getByLabel("Servers", { exact: true }).uncheck();
     await page.keyboard.press("Escape");
     await expect(page.locator("#network-device-dialog")).not.toBeVisible();
     await row.locator("[data-network-edit]").click();
     await expect(page.locator("#network-device-label")).toHaveValue("Pending control fixture");
     await expect(page.locator("#network-device-groups").getByLabel("Servers", { exact: true })).toBeChecked();
     await page.locator("#network-device-label").fill("変更を保持する端末");
-    await page.locator("#network-device-groups").getByLabel("Clients", { exact: true }).uncheck();
     await page.locator("#network-device-revoke-details > summary").click();
     await page.locator("#network-device-revoked").check(); await page.locator("#network-device-revoked").uncheck();
     await page.locator("#network-device-review").click();
     await expect(page.locator("#network-device-error")).toContainText("入力内容を確認して保存");
     await expect(page.locator("#network-device-label")).toHaveValue("変更を保持する端末");
-    await expect(page.locator("#network-device-groups").getByLabel("Clients", { exact: true })).not.toBeChecked();
+    await expect(page.locator("#network-device-groups").getByLabel("Clients", { exact: true })).toBeChecked();
     await capture(page, testInfo, "device-draft-review-memberships");
     await page.locator("#network-device-save").click();
     await expect(page.locator("#network-device-dialog")).not.toBeVisible();
     const state = await hub.command("hub_network_snapshot"), device = state.devices.find(device => device.device_id === approval.deviceId);
     expect(device.label).toBe("変更を保持する端末"); expect(device.revoked).toBe(false);
-    expect(device.groups).toEqual([state.groups.find(group => group.label === "Servers").id]);
+    expect(device.groups.sort()).toEqual(state.groups.map(group=>group.id).sort());
     await row.locator("[data-network-delete-device]").click();
     await page.mouse.click(4, 4); await expect(page.locator("#network-delete-dialog")).toBeVisible();
     await page.keyboard.press("Escape"); await expect(page.locator("#network-delete-dialog")).not.toBeVisible();
@@ -239,55 +242,18 @@ test("Device dialogs cancel drafts, review without losing edits, and update both
     expect(errors).toEqual([]);
 });
 
-test("Legacy invitation controls and rule depth three preserve exact selected groups", async ({ page, context, hub }, testInfo) => {
-    const errors = await ready(page, hub);
-    await context.grantPermissions(["clipboard-read", "clipboard-write"], { origin: new URL(hub.url).origin });
-    await startNetwork(page, hub);
-    await page.locator("#network-group-form button").click();
-    expect(await page.locator("#network-group-label").evaluate(node => node.validity.valueMissing)).toBe(true);
-    await group(page, "Client 日本語"); await group(page, "Server 日本語");
-    const state = await hub.command("hub_network_snapshot"), [clients, servers] = ["Client 日本語", "Server 日本語"].map(label => state.groups.find(group => group.label === label));
-    await page.locator("#network-group-id").selectOption(clients.id);
-    await expect(page.locator("#network-group-label")).toHaveValue(clients.label);
-    await page.locator("#network-group-id").selectOption(""); await expect(page.locator("#network-group-label")).toHaveValue("");
-    await page.locator("#network-rule-form button").click();
-    expect(await page.locator("#network-rule-from").evaluate(node => node.validity.valueMissing)).toBe(true);
-    await page.locator("#network-rule-from").selectOption(`group:${clients.id}`);
-    await page.locator("#network-rule-form button").click();
-    expect(await page.locator("#network-rule-to").evaluate(node => node.validity.valueMissing)).toBe(true);
-    await page.locator("#network-rule-to").selectOption(`group:${servers.id}`);
-    await page.locator("#network-rule-usage").selectOption("delegated");
-    await page.locator("#network-rule-effect").selectOption("deny");
-    await page.locator("#network-rule-depth").selectOption("3");
-    await page.locator("#network-rule-form button").click();
-    await expect(page.locator("#network-rule-list")).toContainText("最大3段");
-    const saved = (await hub.command("hub_network_snapshot")).rules[0];
-    expect(saved).toMatchObject({ from: { kind: "group", id: clients.id }, to: { kind: "group", id: servers.id }, usage: "delegated", effect: "deny", max_depth: 3, profile_id: null });
-    const details = page.locator('details[data-details-key="network-legacy-invite"]');
-    await details.locator("summary").click();
-    await page.locator("#network-invite-form button").click();
-    expect(await page.locator("#network-invite-label").evaluate(node => node.validity.valueMissing)).toBe(true);
-    await page.locator("#network-invite-label").fill("Legacy invited fixture");
-    for (const label of [clients.label, servers.label]) await page.locator("#network-invite-groups").getByLabel(label, { exact: true }).check();
-    await page.locator("#network-invite-groups").getByLabel(clients.label, { exact: true }).uncheck();
-    const request = page.waitForRequest(request => request.url().endsWith("/admin/command") && request.postDataJSON()?.command === "hub_network_invite");
-    await page.locator("#network-invite-form button").click();
-    const payload = (await request).postDataJSON();
-    expect(payload.args.groups).toEqual([servers.id]); expect(payload.args.label).toBe("Legacy invited fixture");
-    await expect(page.locator("#network-invite-receipt")).toBeVisible();
-    await expect(page.locator("#network-invite-expiry")).toContainText("1回限り");
-    const code = await page.locator("#network-invite-code").inputValue(); expect(code.length).toBeGreaterThan(20);
-    await expect(page.locator("#network-invite-code")).toHaveJSProperty("readOnly", true);
-    await page.locator("#network-copy-invite").click();
-    await expect(page.locator("#network-clients-notice")).toContainText("参加コードをコピーしました");
-    expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(code);
-    await details.locator("summary").click(); await details.locator("summary").click();
-    await expect(page.locator("#network-invite-code")).toHaveValue(code);
-    // Hide only by the user-facing disclosure before capture; invitation is a credential.
-    await details.locator("summary").click();
-    await capture(page, testInfo, "legacy-invite-and-depth-three");
-    await page.reload(); await expect(page.locator("#network-rule-list")).toContainText("最大3段");
-    expect(errors).toEqual([]);
+test("Legacy invitation and directed-rule API data stay compatible without exposing their removed forms",async({page,hub},testInfo)=>{
+    const errors=await ready(page,hub); await startNetwork(page,hub);
+    const clients=await group(hub,"Client 日本語"),servers=await group(hub,"Server 日本語");
+    await legacyRule(hub,{from:{kind:"group",id:clients.id},to:{kind:"group",id:servers.id},usage:"delegated",effect:"deny",max_depth:3});
+    const state=await hub.command("hub_network_snapshot");
+    expect(state.rules[0]).toMatchObject({from:{kind:"group",id:clients.id},to:{kind:"group",id:servers.id},usage:"delegated",effect:"deny",max_depth:3,profile_id:null});
+    const invite=await hub.command("hub_network_invite",{expectedRevision:state.revision,label:"Legacy invited fixture",groups:[servers.id]});
+    expect(typeof invite.code).toBe("string"); expect(invite.code.length).toBeGreaterThan(20);
+    await page.reload();
+    for(const selector of ["#network-group-form","#network-rule-form",'details[data-details-key="network-legacy-invite"]']) await expect(page.locator(selector)).toBeHidden();
+    expect((await hub.command("hub_network_snapshot")).rules).toEqual(state.rules);
+    await capture(page,testInfo,"legacy-compatibility-project-navigation"); expect(errors).toEqual([]);
 });
 
 test.describe("Configured external Web controls", () => {
@@ -366,51 +332,29 @@ test("Network bind validation and explicit automatic Gateway setting preserve st
     expect(errors).toEqual([]);
 });
 
-test("Rule destination dropdown replaces publication options without retaining the old target", async ({ page, hub }, testInfo) => {
-    const errors = await ready(page, hub), network = await startNetwork(page, hub);
-    await group(page, "Destination group");
-    const groupId = (await hub.command("hub_network_snapshot")).groups[0].id;
-    const ids = [];
-    for (const [label, profileId] of [["Publication one", "profile-one"], ["Publication two", "profile-two"]]) {
-        const participant = await createDeviceParticipant(network, label);
-        await page.locator("#network-clients-refresh").click();
-        await page.locator(`[data-id="request:${participant.requestId}"] [data-network-request]`).click();
-        await page.locator("#network-device-groups").getByLabel("Destination group", { exact: true }).check();
-        await page.locator("#network-device-save").click();
-        await expect(page.locator("#network-device-dialog")).not.toBeVisible();
-        const approval = await participant.collectApproval(); expect(approval.status).toBe("approved");
-        ids.push(approval.deviceId); await participant.presence();
-        await participant.publish({ profile_id: profileId, name: `${label} project`, endpoint: "https://127.0.0.1:7332/mcp", mode: "agent", scope_id: profileId, enabled: true });
+test("Project PC purposes can be changed independently without inheriting another PC selection",async({page,hub},testInfo)=>{
+    const errors=await ready(page,hub),network=await startNetwork(page,hub);
+    const ids=[];
+    for(const label of ["PC one","PC two"]){
+        const participant=await createDeviceParticipant(network,label); await page.locator("#network-clients-refresh").click();
+        await page.locator(`[data-id="request:${participant.requestId}"] button[data-network-action]`).click();
+        const approval=await participant.collectApproval(); ids.push(approval.deviceId); await participant.presence();
     }
-    await page.locator("#network-refresh").click();
-    await expect(page.locator("#network-rule-to option")).toHaveCount(4);
-    await page.locator("#network-rule-from").selectOption(`device:${ids[0]}`);
-    await page.locator("#network-rule-to").selectOption(`device:${ids[0]}`);
-    await page.locator("#network-rule-profile").selectOption("profile-one");
-    await page.locator("#network-rule-to").selectOption(`device:${ids[1]}`);
-    await expect(page.locator("#network-rule-profile")).toHaveValue("");
-    await expect(page.locator("#network-rule-profile")).toHaveJSProperty("selectedIndex", 0);
-    await expect(page.locator("#network-rule-profile option:checked")).toHaveText("この宛先の公開対象すべて");
-    await expect(page.locator('#network-rule-profile option[value="profile-one"]')).toHaveCount(0);
-    await page.locator("#network-rule-profile").selectOption("profile-two");
-    await page.locator("#network-rule-to").selectOption(`group:${groupId}`);
-    await expect(page.locator("#network-rule-profile option")).toHaveCount(3);
-    await expect(page.locator("#network-rule-profile")).toHaveValue("profile-two");
-    await page.locator("#network-rule-form button").click();
-    await expect(page.locator("#network-rule-list")).toContainText("Publication two project");
-    expect((await hub.command("hub_network_snapshot")).rules[0]).toMatchObject({ to: { kind: "group", id: groupId }, profile_id: "profile-two" });
-    await page.locator("#network-rule-to").selectOption("");
-    await expect(page.locator("#network-rule-profile option")).toHaveCount(1);
-    await expect(page.locator("#network-rule-profile")).toHaveValue("");
-    await expect(page.locator("#network-rule-profile")).toHaveJSProperty("selectedIndex", 0);
-    await expect(page.locator("#network-rule-profile option:checked")).toHaveText("この宛先の公開対象すべて");
-    await capture(page, testInfo, "rule-destination-options");
-    expect(errors).toEqual([]);
+    await page.locator("#network-clients-refresh").click(); await page.locator('nav a[href="#shared-administration"]').click();
+    await page.locator('[data-sa-operation="save_project"]').first().click(); await page.locator("#shared-admin-label").fill("選択範囲を確認するプロジェクト");
+    await page.getByLabel("PC oneを操作に使う",{exact:true}).check(); await page.getByLabel("PC oneで仕事を実行する",{exact:true}).check();
+    await page.getByLabel("PC oneで仕事を実行する",{exact:true}).uncheck(); await page.getByLabel("PC twoで仕事を実行する",{exact:true}).check();
+    await expect(page.getByLabel("PC oneを操作に使う",{exact:true})).toBeChecked(); await expect(page.getByLabel("PC twoを操作に使う",{exact:true})).not.toBeChecked();
+    const request=page.waitForRequest(request=>request.url().endsWith("/admin/command")&&request.postDataJSON()?.command==="hub_shared_command");
+    await page.locator("#shared-admin-save").click(); const sent=(await request).postDataJSON().args.request;
+    expect(sent.controller_device_ids).toEqual([ids[0]]); expect(sent.runner_device_ids).toEqual([ids[1]]);
+    await expect(page.locator("#shared-admin-notice")).toHaveText("設定を保存しました。");
+    await capture(page,testInfo,"project-purpose-options"); expect(errors).toEqual([]);
 });
 
-test("Fixed control reverse directions retain disclosure drafts and explicitly restore rule choices", async ({ page, hub }, testInfo) => {
+test("Device disclosure drafts remain intact while legacy rule API choices remain compatible", async ({ page, hub }, testInfo) => {
     const errors = await ready(page, hub), network = await startNetwork(page, hub);
-    await group(page, "Reverse control sender");
+    await group(hub, "Reverse control sender");
     const sender = (await hub.command("hub_network_snapshot")).groups.find(item => item.label === "Reverse control sender");
     const participant = await createDeviceParticipant(network, "Reverse control receiver");
     await page.locator('nav a[href="#clients"]').click();
@@ -425,6 +369,8 @@ test("Fixed control reverse directions retain disclosure drafts and explicitly r
     await page.locator("#network-clients-refresh").click();
     const row = page.locator(`[data-id="device:${approval.deviceId}"]`), identity = row.locator("details[data-device-identity]");
     await expect(row).toContainText("受付申告あり");
+    await expect(row.locator("details[data-network-legacy-mcp]")).not.toHaveAttribute("open", "");
+    await expect(row.getByText("受付申告あり",{exact:true})).toBeHidden();
 
     // C083: the same current device identity survives an explicit close, a normal poll and reopen.
     await identity.locator("summary").click(); await expect(identity).toHaveAttribute("open", "");
@@ -457,40 +403,13 @@ test("Fixed control reverse directions retain disclosure drafts and explicitly r
     expect(unchanged).toMatchObject({ label: "Reverse control receiver", revoked: false });
 
     await page.locator('nav a[href="#device-network"]').click();
-    await page.locator("#network-rule-from").selectOption(`group:${sender.id}`);
-    await page.locator("#network-rule-to").selectOption(`device:${approval.deviceId}`);
-    // C055: explicitly select the blank option after a real sender selection.
-    await page.locator("#network-rule-from").selectOption("");
-    await expect(page.locator("#network-rule-from")).toHaveJSProperty("selectedIndex", 0);
-    await expect(page.locator("#network-rule-from option:checked")).toHaveText("選択してください");
-    await page.locator("#network-rule-form button").click();
-    expect(await page.locator("#network-rule-from").evaluate(node => node.validity.valueMissing)).toBe(true);
-    expect((await hub.command("hub_network_snapshot")).rules).toHaveLength(0);
-    await page.locator("#network-rule-from").selectOption(`group:${sender.id}`);
-    await page.locator("#network-rule-profile").selectOption("reverse-control-project");
-    await page.locator("#network-rule-effect").selectOption("deny");
-    await page.locator("#network-rule-form button").click();
-    await expect(page.locator("#network-rule-list .network-rule")).toHaveCount(1);
-    const denied = (await hub.command("hub_network_snapshot")).rules[0];
-    expect(denied).toMatchObject({ from: { kind: "group", id: sender.id }, to: { kind: "device", id: approval.deviceId },
-        effect: "deny", profile_id: "reverse-control-project" });
-    // C058/C059: explicit selections rather than initial defaults or destination-triggered reset.
-    await page.locator("#network-rule-effect").selectOption("allow");
-    await page.locator("#network-rule-profile").selectOption("");
-    await expect(page.locator("#network-rule-effect")).toHaveValue("allow");
-    await expect(page.locator("#network-rule-profile")).toHaveJSProperty("selectedIndex", 0);
-    await expect(page.locator("#network-rule-profile option:checked")).toHaveText("この宛先の公開対象すべて");
-    await page.locator("#network-rule-form button").click();
-    await expect(page.locator("#network-rule-list .network-rule")).toHaveCount(2);
-    const rules = (await hub.command("hub_network_snapshot")).rules;
-    expect(rules.filter(item => item.id === denied.id)).toEqual([denied]);
-    expect(rules.filter(item => item.id !== denied.id)).toEqual([expect.objectContaining({
-        from: { kind: "group", id: sender.id }, to: { kind: "device", id: approval.deviceId }, effect: "allow", profile_id: null,
-    })]);
-    await capture(page, testInfo, "rule-choices-explicitly-restored");
-    await testInfo.attach("fixed-reverse-direction-identity", { contentType: "application/json", body: Buffer.from(JSON.stringify({
-        controls: ["C055", "C058", "C059", "C072", "C083"], deviceId: approval.deviceId, senderId: sender.id, rules,
-        publication: "Participant public-protocol fixture; no actual model or remote task execution.",
-    }, null, 2)) });
+    await expect(page.locator("#network-rule-form")).toBeHidden();
+    await legacyRule(hub,{from:{kind:"group",id:sender.id},to:{kind:"device",id:approval.deviceId},usage:"direct",effect:"deny",profile_id:"reverse-control-project"});
+    const denied=(await hub.command("hub_network_snapshot")).rules[0];
+    await legacyRule(hub,{from:{kind:"group",id:sender.id},to:{kind:"device",id:approval.deviceId},usage:"direct",effect:"allow",profile_id:null});
+    const rules=(await hub.command("hub_network_snapshot")).rules;
+    expect(rules.filter(item=>item.id===denied.id)).toEqual([denied]);
+    expect(rules.filter(item=>item.id!==denied.id)).toEqual([expect.objectContaining({from:{kind:"group",id:sender.id},to:{kind:"device",id:approval.deviceId},effect:"allow",profile_id:null})]);
+    await testInfo.attach("legacy-rule-api-compatibility",{contentType:"application/json",body:Buffer.from(JSON.stringify({deviceId:approval.deviceId,rules,scope:"Existing compatibility API only; removed controls are hidden."}))});
     expect(errors).toEqual([]);
 });

@@ -11,6 +11,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::num::NonZeroU32;
+mod remembered;
+pub use remembered::{RememberedSession, login_remembered, logout_remembered, refresh_session};
 
 pub const MIGRATION_SQL: &str = include_str!("../migrations/V2__shared_identity.sql");
 const PASSWORD_ITERATIONS: u32 = 600_000;
@@ -497,6 +499,9 @@ pub fn logout(
 ) -> Result<()> {
     if !audience.valid_device(device_id) || !token_ok(token) {
         return Err(IdentityError::Unauthorized);
+    }
+    if audience == SessionAudience::SharedWork {
+        return logout_remembered(conn, Some(token), None, device_id.expect("checked binding"));
     }
     conn.execute(
         "DELETE FROM identity_sessions WHERE token_hash=?1 AND audience=?2 AND device_id IS ?3",
