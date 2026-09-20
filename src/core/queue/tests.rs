@@ -4,6 +4,7 @@ use crate::catalog::{CapacityPool, CatalogPolicy, LogicalModel};
 fn fixture() -> HubCore {
     let mut store = CatalogStore::empty("queue-fixture");
     let catalog = Catalog {
+        team_default_model_id: None,
         models: ["a", "b"]
             .into_iter()
             .map(|id| LogicalModel {

@@ -21,7 +21,11 @@ async function approve(page, participant, label, rename = null) {
         await page.locator("#network-device-label").fill(rename);
         await page.locator("#network-device-save").click();
         await expect(page.locator("#network-device-dialog")).not.toBeVisible();
-    } else await row.getByRole("button", { name: `${label}の許可`, exact: true }).click();
+    } else {
+        await row.getByRole("button", { name: `${label}の許可`, exact: true }).click();
+        await page.locator("#join-project-save").click();
+        await expect(page.locator("#join-project-dialog")).not.toBeVisible();
+    }
     await expect(row).toHaveCount(0);
     const result = await participant.collectApproval();
     expect(result.status).toBe("approved");
@@ -54,7 +58,7 @@ test("Device admission, duplicate-name validation, retained legacy memberships, 
     const legacyStatus=firstRow.locator("details[data-network-legacy-mcp]");
     await expect(legacyStatus).not.toHaveAttribute("open", "");
     await expect(legacyStatus.getByText("受付の申告なし",{exact:true})).toBeHidden();
-    await expect(firstRow).toContainText("使い方はプロジェクトで設定します。");
+    await expect(firstRow).toContainText("このPCはHubに接続しています。依頼や実行に使うプロジェクトを設定してください。");
     await expect(firstRow).not.toContainText("接続ルールが必要");
     await first.publish({ profile_id: "fixture-project", name: "Fixture project", endpoint: "https://127.0.0.1:7332/mcp",
         mode: "agent", scope_id: "fixture-scope", enabled: true });
@@ -160,7 +164,7 @@ test("History list, pagination, detail and Markdown export use the authenticated
     await page.locator("#history-request").click();
     await answer(participant, { rows: [first], next_offset: 1, anchor: "instruction:2" });
     await expect(page.locator("#history-rows")).toContainText(first.title);
-    await expect(page.locator("#history-rows")).toContainText("指示側に保存された最終確認");
+    await expect(page.locator("#history-rows")).toContainText("依頼元に保存された最終確認");
     await expect(page.locator("#history-next")).toBeEnabled();
     await page.locator("#history-next").click();
     const next = await answer(participant, { rows: [second], next_offset: null, anchor: "instruction:2" });

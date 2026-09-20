@@ -29,8 +29,9 @@
           ページ内の移動
         </div>
         <nav aria-label="ページ内の移動">
-          <a href="#device-network" class="nav-link">⇄<span>Desktopの接続</span></a>
-          <a href="#shared-administration" class="nav-link">▦<span>プロジェクトと人</span></a>
+          <a href="#team-onboarding" class="nav-link">✓<span>チームの初期設定</span></a>
+          <a href="#device-network" class="nav-link">⇄<span>PCの接続</span></a>
+          <a href="#shared-administration" class="nav-link">▦<span>プロジェクト・利用者</span></a>
           <a href="#web-management" class="nav-link">↗<span>管理画面のURL</span></a>
           <a href="#overview" class="nav-link">
             ◉
@@ -50,7 +51,7 @@
           <a href="#clients" class="nav-link">
             ▣
             <span>
-              接続端末 <small id="nav-pending-count" class="network-pending-count" hidden></small>
+              接続PC <small id="nav-pending-count" class="network-pending-count" hidden></small>
             </span>
             <span id="nav-client-count" class="count">
               0
@@ -60,7 +61,7 @@
           <a href="#revisions" class="nav-link">
             ↻
             <span>
-              カタログ変更
+              モデル設定の変更
             </span>
           </a>
         </nav>
@@ -69,10 +70,10 @@
             開発版
           </span>
           <p>
-            v0.1.0 · 管理基盤
+            v0.1.0 · 管理画面
           </p>
           <small>
-            モデルの接続先と端末間の連係を管理します。
+            モデル、利用者、仕事に使うPCを管理します。
           </small>
         </div>
       </aside>
@@ -83,10 +84,10 @@
               管理の概要
             </p>
             <h1>
-              みんなで使うmoyAIを、ここから。
+              チームのmoyAIを管理
             </h1>
             <p class="subtle">
-              Desktopの接続、利用者と仕事の公開先、共有するモデルを管理します。
+              利用者とプロジェクトを登録し、仕事に使うPCとモデルを設定します。
             </p>
           </div>
           <div class="header-status">
@@ -108,7 +109,7 @@
               0
             </strong>
             <small id="metric-hosts">
-              0 配置
+              0 登録先
             </small>
           </div>
           <div class="metric">
@@ -131,13 +132,13 @@
           </div>
           <div class="metric">
             <span>
-              カタログ更新番号
+              モデル設定の更新番号
             </span>
             <strong id="metric-revision">
               —
             </strong>
             <small>
-              設定変更は再確認の対象
+              変更後はDesktopでモデル設定を確認
             </small>
           </div>
         </section>
@@ -148,13 +149,13 @@
                 はじめに
               </p>
               <h2 id="server-heading">
-                Desktopを接続して、仕事を共有する
+                PCを接続して仕事を依頼する
               </h2>
             </div>
           </div>
           <div class="network-introduction">
-            <p class="subtle">最初にHubへの接続を開始し、接続ファイルを各Desktopへ渡します。端末の参加を許可したら、利用者・プロジェクト・仕事の実行先を設定してください。</p>
-            <a id="open-device-network" class="primary-link" href="#device-network">Desktopの接続を準備する →</a>
+            <p class="subtle">「チームの初期設定」で利用者とプロジェクトを登録し、接続ファイルを各Desktopへ渡します。PCの参加を許可するときに、そのPCを依頼の送信に使うか、仕事の実行に使うかを選んでください。</p>
+            <a id="open-device-network" class="primary-link" href="#device-network">PCの接続設定を開く →</a>
           </div>
           <div id="gateway-summary" class="execution-summary" role="status"><h3>Hub のモデル中継</h3><p id="gateway-status">Hub のモデル中継は停止中</p><p id="gateway-detail" class="subtle">この Hub が中継する通信の状況を表示します。</p></div>
           <details class="technical-details"><summary>中継経路の詳しい説明</summary><p class="footnote">Gateway が Desktop とモデルホストの通信を中継します。同時接続数の上限はこの Hub 経由の通信に適用します。モデルのロード・生成・停止はホスト側が管理します。</p></details>
@@ -256,7 +257,7 @@
                 </button>
               </div>
               <label class="checkbox"><input id="allow-tools" type="checkbox"/>ツール利用を許可（管理者確認）</label>
-              <p class="footnote">ホストが機能を未報告の場合の管理者宣言です。このモデルでツール利用を確認した場合に選択してください。ホストの報告値とは別の確認方法です。</p>
+              <p class="footnote">ホストからツール対応の情報を取得できない場合に使います。このモデルでツールが動作することを管理者が確認してから選択してください。</p>
               <details class="registration-options">
                 <summary>
                   同じモデルの別ホスト・同時接続数を設定
@@ -351,7 +352,7 @@
             </span>
           </div>
           <p class="footnote">一覧にあるモデルへ要求を中継します。ロードや実行可否の判断は oMLX や LM Studio などのホスト側が行います。</p>
-          <details class="technical-details"><summary>モデルの確認と同時接続数の詳しい説明</summary><p class="footnote">Hub はモデル一覧・接続状態・管理者の設定に基づいて接続先を選びます。未ロードでも一覧にあれば割当候補になります。生成の成功はホスト側の設定と応答によります。同じホストなど、同時接続数を共有したい接続先は同じグループ（容量プール）にまとめます。</p></details>
+          <details class="technical-details"><summary>モデルの確認と同時接続数の詳しい説明</summary><p class="footnote">Hub はモデル一覧・接続状態・管理者の設定に基づいて接続先を選びます。未ロードでも一覧にあれば割当候補になります。生成の成功はホスト側の設定と応答によります。同じホストなど、同時接続数を共有したい接続先は同時接続数を共有するグループにまとめます。</p></details>
         </section>
         <section class="panel" id="clients" aria-labelledby="clients-heading">
           <div class="section-title">
@@ -360,7 +361,7 @@
                 参加の承認と端末の管理
               </p>
               <h2 id="clients-heading">
-                接続端末
+                接続PC
               </h2>
             </div>
             <span class="live-caption">
@@ -370,7 +371,7 @@
             </span>
           </div>
           <div id="network-clients-management"></div>
-          <details id="model-client-details" class="technical-details"><summary>モデル接続の生存確認（詳細）</summary>
+          <details id="model-client-details" class="technical-details"><summary>モデルを利用するPCの接続状態（詳細）</summary>
           <p class="footnote">モデル通信の接続ごとの情報です。端末の参加・停止・所属は上の一覧で管理します。</p>
           <div class="table-wrap">
             <table>
@@ -389,7 +390,7 @@
                     カタログ確認
                   </th>
                   <th>
-                    最終生存確認
+                    最後の応答
                   </th>
                 </tr>
               </thead>
@@ -408,7 +409,7 @@
           <p class="footnote">
             端末の状態は Desktop からの申告です。この Hub のモデル通信は概要の「Hub のモデル中継」で確認できます。
           </p>
-          <p class="footnote">ここに表示する ID はモデル通信の接続 ID です。端末の永続 ID とは別で、サーバー再起動時に作り直します。30 秒間の生存確認がない接続は切断として表示します。</p>
+          <p class="footnote">ここに表示する ID はモデル通信の接続 ID です。PCの登録ID とは別で、サーバー再起動時に作り直します。30秒間応答がない接続は切断として表示します。</p>
           </details>
         </section>
         <section class="panel" id="mcp-history" aria-labelledby="history-heading"></section>
@@ -419,7 +420,7 @@
                 変更の再確認
               </p>
               <h2 id="revision-heading">
-                カタログの変更
+                モデル設定の変更
               </h2>
             </div>
             <span class="subtle">
@@ -427,7 +428,7 @@
             </span>
           </div>
           <p class="subtle">
-            モデルや同時接続数の設定を変更すると、カタログ更新番号が進みます。Desktop では次に Hub へ送信する前に、変更内容の確認が必要です。
+            モデルや同時接続数の設定を変更すると、モデル設定の更新番号が進みます。Desktop では次に Hub へ送信する前に、変更内容の確認が必要です。
           </p>
           <div id="revision-rows" class="revision-list">
           </div>
@@ -460,7 +461,7 @@
       <form id="edit-form">
         <div class="section-title">
           <h2 id="edit-heading">
-            モデル配置を編集
+            モデルの登録先を編集
           </h2>
           <button type="button" id="close-edit" class="icon-button" aria-label="閉じる">
             ×
@@ -481,13 +482,13 @@
         </p>
         <label class="checkbox">
           <input id="edit-enabled" type="checkbox"/>
-          割当候補に含める（OFF はメンテナンス）
+          この登録先を利用する（外すと新しい利用を停止）
         </label>
         <p id="edit-error" class="field-status" role="status">
         </p>
         <div class="dialog-actions">
           <button type="button" class="danger" id="remove-model">
-            配置を削除
+            この登録先を削除
           </button>
           <button type="submit" class="primary" id="save-edit">
             変更を保存

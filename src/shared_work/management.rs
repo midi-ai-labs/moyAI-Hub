@@ -21,6 +21,16 @@ pub struct ManagementCommand {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ManagementRequest {
+    CreateUserWithSetupCode {
+        username: String,
+        display_name: String,
+    },
+    ReissueSetupCode {
+        user_id: String,
+    },
+    RevokeSetupCode {
+        user_id: String,
+    },
     SaveProject {
         id: String,
         label: String,
@@ -32,6 +42,12 @@ pub enum ManagementRequest {
     RetryProjectDevice {
         project_id: String,
         device_id: String,
+    },
+    AssignProjectDevice {
+        project_id: String,
+        device_id: String,
+        can_control: bool,
+        can_execute: bool,
     },
     PruneSharedData {
         before_ms: u64,
@@ -406,8 +422,27 @@ impl SharedWork {
         }
         capacity(&tx, "shared_management_receipts", 100_000)?;
         let hash = receipt_fingerprint(command, None)?;
+        let mut issued_setup_code = None;
         use ManagementRequest::*;
         match &command.request {
+            CreateUserWithSetupCode {
+                username,
+                display_name,
+            } => {
+                issued_setup_code = Some(identity::create_user_with_setup_code(
+                    &tx,
+                    actor,
+                    username,
+                    display_name,
+                    now,
+                )?);
+            }
+            ReissueSetupCode { user_id } => {
+                issued_setup_code = Some(identity::reissue_setup_code(&tx, actor, user_id, now)?);
+            }
+            RevokeSetupCode { user_id } => {
+                identity::revoke_setup_code(&tx, actor, user_id, now)?;
+            }
             SaveProject {
                 id,
                 label,
@@ -425,6 +460,21 @@ impl SharedWork {
                     members,
                     controller_device_ids,
                     runner_device_ids,
+                    now,
+                )?;
+            }
+            AssignProjectDevice {
+                project_id,
+                device_id,
+                can_control,
+                can_execute,
+            } => {
+                super::project_setup::assign_device(
+                    &tx,
+                    project_id,
+                    device_id,
+                    *can_control,
+                    *can_execute,
                     now,
                 )?;
             }
@@ -786,12 +836,15 @@ impl SharedWork {
         )?;
         // Return configuration even when the command deliberately invalidates this login.
         // The caller must reauthenticate before another command.
-        let result = if identity::require_admin(&tx, actor).is_ok() {
+        let mut result = if identity::require_admin(&tx, actor).is_ok() {
             snapshot(&tx, actor)?
         } else {
             json!({"reauthenticate":true})
         };
         tx.commit()?;
+        if let Some(issued) = issued_setup_code {
+            result["issued_setup_code"] = serde_json::to_value(issued)?;
+        }
         if matches!(&command.request, ManagementRequest::PruneSharedData { .. }) {
             // The committed tombstones remain authoritative if filesystem cleanup fails.
             // Uploads retry bounded collection under the same SharedWork owner.

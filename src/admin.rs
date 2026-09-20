@@ -21,6 +21,9 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
+mod autostart;
+mod firewall;
+mod hosting_options;
 mod network_admin;
 mod network_hosting;
 
@@ -167,6 +170,17 @@ impl Admin {
             ),
             "hub_stop" => output(hub_stop(self).await?),
             "hub_network_snapshot" => network_admin::hub_network_snapshot(self).await,
+            "hub_hosting_options" => hosting_options::snapshot().await,
+            "hub_firewall_preview" => firewall::preview(self, argument(&args, "scope")?).await,
+            "hub_firewall_apply" | "hub_firewall_remove" => {
+                firewall::change(
+                    self,
+                    argument(&args, "scope")?,
+                    argument(&args, "expectedFingerprint")?,
+                    command == "hub_firewall_remove",
+                )
+                .await
+            }
             "hub_network_renew_certificate" => {
                 output(network_admin::hub_network_renew_certificate(self).await?)
             }
@@ -201,6 +215,30 @@ impl Admin {
     fn dispatch_sync(&self, command: &str, args: &Value) -> Result<Value, String> {
         use network_admin::*;
         match command {
+            "hub_autostart_status" => autostart::snapshot(self),
+            "hub_autostart_set" => autostart::set(
+                self,
+                argument(args, "enabled")?,
+                argument(args, "expectedCommand")?,
+            ),
+            "hub_set_standard_model" => {
+                let revision: String = argument(args, "revision")?;
+                let model: Option<String> = argument(args, "modelId")?;
+                edit_catalog(self, parse_revision(&revision)?, |catalog| {
+                    if let Some(id) = &model {
+                        if !catalog
+                            .deployments
+                            .iter()
+                            .any(|d| &d.logical_model_id == id && d.enabled)
+                        {
+                            return Err("有効な登録先を持つモデルを選択してください。".into());
+                        }
+                    }
+                    catalog.team_default_model_id = model;
+                    Ok(())
+                })?;
+                output(())
+            }
             "hub_register" => output(hub_register(self, argument(args, "request")?)?),
             "hub_edit" => output(hub_edit(self, argument(args, "request")?)?),
             "hub_history_request" => output(hub_history_request(
@@ -543,6 +581,9 @@ fn hub_edit(admin: &Admin, request: Edit) -> Result<(), String> {
                 .any(|d| d.logical_model_id == row.logical_model_id)
             {
                 catalog.models.retain(|m| m.id != row.logical_model_id);
+                if catalog.team_default_model_id.as_deref() == Some(&row.logical_model_id) {
+                    catalog.team_default_model_id = None;
+                }
             }
             if !catalog
                 .deployments

@@ -196,6 +196,7 @@ impl Fixture {
         });
         let mut store = CatalogStore::empty("0.1.0");
         let catalog = Catalog {
+            team_default_model_id: None,
             models: vec![LogicalModel {
                 id: "logical-qwen".into(),
                 label: "Selected Qwen".into(),

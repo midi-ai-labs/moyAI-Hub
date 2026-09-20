@@ -2,7 +2,7 @@ use crate::protocol::{Availability, HubError};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 pub const MAX_CATALOG_ENTRIES: usize = 1024;
 pub const MAX_LOGICAL_MODELS: usize = 128;
 const MAX_CHANGES: usize = 64;
@@ -60,6 +60,9 @@ impl Default for CatalogPolicy {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Catalog {
+    /// Explicit initial choice for new model clients; existing client choices are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_default_model_id: Option<String>,
     pub models: Vec<LogicalModel>,
     pub deployments: Vec<Deployment>,
     pub capacity_pools: Vec<CapacityPool>,
@@ -115,7 +118,8 @@ impl CatalogStore {
     }
 
     pub fn validate(&self) -> Result<(), HubError> {
-        if self.schema_version != SCHEMA_VERSION || self.revision == 0 {
+        let legacy = self.schema_version == 1 && self.catalog.team_default_model_id.is_none();
+        if (!legacy && self.schema_version != SCHEMA_VERSION) || self.revision == 0 {
             return Err(invalid("unsupported schema or invalid revision"));
         }
         valid_text(&self.software_version, 128)?;
@@ -144,10 +148,11 @@ impl CatalogStore {
     ) -> Result<bool, HubError> {
         self.validate()?;
         valid_text(software_version, 128)?;
-        if self.software_version == software_version {
+        if self.software_version == software_version && self.schema_version == SCHEMA_VERSION {
             return Ok(false);
         }
         let revision = self.next_revision()?;
+        self.schema_version = SCHEMA_VERSION;
         self.software_version = software_version.to_owned();
         self.record(CatalogChange {
             revision,
@@ -197,10 +202,12 @@ impl CatalogStore {
                 .collect(),
             deployments_changed: before.deployments != catalog.deployments,
             policy_changed: before.policy != catalog.policy
-                || before.capacity_pools != catalog.capacity_pools,
+                || before.capacity_pools != catalog.capacity_pools
+                || before.team_default_model_id != catalog.team_default_model_id,
             software_changed: false,
         };
         self.catalog = catalog;
+        self.schema_version = SCHEMA_VERSION;
         self.record(change);
         Ok(revision)
     }
@@ -222,6 +229,17 @@ impl CatalogStore {
 
 impl Catalog {
     pub fn validate(&self) -> Result<(), HubError> {
+        if let Some(id) = &self.team_default_model_id {
+            if !self
+                .models
+                .iter()
+                .any(|model| &model.id == id && model.capabilities.contains("tools"))
+            {
+                return Err(invalid(
+                    "standard model must be an existing tools-capable model",
+                ));
+            }
+        }
         if self.models.len() > MAX_LOGICAL_MODELS {
             return Err(invalid("logical model catalog exceeds 128 entries"));
         }

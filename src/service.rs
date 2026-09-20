@@ -187,20 +187,38 @@ async fn device_session(
             device: Some(identity.device_id),
         },
     );
-    let models: Vec<_> = core
-        .catalog_store()
-        .catalog
-        .models
-        .iter()
-        .filter(|m| m.capabilities.contains("tools"))
-        .map(|m| m.id.clone())
-        .collect();
     // Hub owns this initial automatic receiver policy. Desktop does not select a
     // first model independently, and must review the exact returned revision.
-    let default_selection=models.first().map(|preferred|json!({"allowed_model_ids":models,"preferred_model_id":preferred,"required_capabilities":["tools"],"wait_policy":"allow_selected_fallback","affinity_turns":3}));
+    let default_selection = initial_model_selection(&core.catalog_store().catalog);
     Ok(Json(
         json!({"id":id,"client_token":secret,"hub_id":core.catalog_store().hub_id,"revision":core.catalog_store().revision.to_string(),"heartbeat_interval_ms":10000,"supports_turn_heartbeat":true,"supports_delegated_execution":true,"identity_scope":"device_session","default_selection":default_selection}),
     ))
+}
+
+fn initial_model_selection(catalog: &crate::catalog::Catalog) -> Option<Value> {
+    let models: Vec<_> = match &catalog.team_default_model_id {
+        Some(id) => catalog
+            .models
+            .iter()
+            .filter(|model| {
+                &model.id == id
+                    && model.capabilities.contains("tools")
+                    && catalog
+                        .deployments
+                        .iter()
+                        .any(|d| &d.logical_model_id == id && d.enabled)
+            })
+            .map(|model| model.id.clone())
+            .collect(),
+        // Preserve existing installations until their administrator explicitly chooses a standard.
+        None => catalog
+            .models
+            .iter()
+            .filter(|model| model.capabilities.contains("tools"))
+            .map(|model| model.id.clone())
+            .collect(),
+    };
+    models.first().map(|preferred| json!({"allowed_model_ids":models,"preferred_model_id":preferred,"required_capabilities":["tools"],"wait_policy":"allow_selected_fallback","affinity_turns":3}))
 }
 
 type ApiResult = Result<Json<Value>, (StatusCode, Json<Value>)>;
@@ -579,6 +597,40 @@ async fn disconnect(
 mod tests {
     use super::*;
     use crate::catalog::CatalogStore;
+
+    #[test]
+    fn explicit_standard_does_not_silently_fall_back_to_a_different_model() {
+        use crate::catalog::*;
+        let mut catalog = Catalog::default();
+        catalog.models = vec!["first", "standard"]
+            .into_iter()
+            .map(|id| LogicalModel {
+                id: id.into(),
+                label: id.into(),
+                capabilities: ["tools".into()].into(),
+            })
+            .collect();
+        catalog.deployments = vec![Deployment {
+            id: "host".into(),
+            logical_model_id: "standard".into(),
+            capacity_pool_id: "pool".into(),
+            label: "Host".into(),
+            endpoint: "http://localhost:1234/v1".into(),
+            provider_model: "model".into(),
+            provider_profile: "openai_compatible_chat".into(),
+            enabled: true,
+        }];
+        assert_eq!(
+            initial_model_selection(&catalog).unwrap()["allowed_model_ids"],
+            json!(["first", "standard"])
+        );
+        catalog.team_default_model_id = Some("standard".into());
+        let choice = initial_model_selection(&catalog).unwrap();
+        assert_eq!(choice["allowed_model_ids"], json!(["standard"]));
+        assert_eq!(choice["preferred_model_id"], "standard");
+        catalog.deployments[0].enabled = false;
+        assert!(initial_model_selection(&catalog).is_none());
+    }
 
     #[tokio::test]
     async fn authenticated_catalog_and_presence_do_not_expose_admin_or_provider_data() {

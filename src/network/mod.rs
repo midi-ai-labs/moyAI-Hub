@@ -394,7 +394,7 @@ impl DeviceNetwork {
                 groups: BTreeMap::new(),
                 rules: BTreeMap::new(),
                 invitations: Vec::new(),
-                gateway_port: 0,
+                gateway_port: 9472,
                 authority: Ledger::default(),
                 join_requests: BTreeMap::new(),
             }

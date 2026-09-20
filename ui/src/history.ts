@@ -8,7 +8,7 @@ const when = (value: number | null) => value === null ? "未取得" : new Date(v
 
 export function attachHistory(host: HTMLElement): { updateNetwork: (snapshot: NetworkSnapshot) => void; showDevice: (id: string) => void } {
     host.innerHTML = `<div class="section-title"><div><p class="eyebrow">端末の作業を確認する</p><h2 id="history-heading">MCP履歴</h2></div><span class="badge blue">読み取り専用</span></div>
-      <p class="subtle">端末に保存された「MCP指示」と「MCP実行」を取得します。受付OFFの端末も確認できます。ここからタスクを実行・停止することはありません。</p>
+      <p class="subtle">端末に保存された「MCP指示」と「MCP実行」を取得します。仕事の受付を停止しているPCでも、接続中なら履歴を取得できます。仕事の実行・停止は各Desktopで操作してください。</p>
       <div class="history-toolbar"><label>履歴を確認する端末<select id="history-device"><option value="">端末を選択してください</option></select></label>
         <label>履歴の種類<select id="history-direction"><option value="instruction">MCP指示 — この端末からの依頼</option><option value="execution">MCP実行 — この端末が受けた依頼</option></select></label>
         <button id="history-request" class="primary" type="button">履歴を取得</button></div>
@@ -67,14 +67,14 @@ export function attachHistory(host: HTMLElement): { updateNetwork: (snapshot: Ne
     function acquired(snapshot: HistorySnapshot): string {
         const online = network?.deleted_devices?.some(device => device.device_id === snapshot.device_id) ? false
             : network?.devices.find(device => device.device_id === snapshot.device_id)?.online ?? snapshot.device_online;
-        return `取得日時: ${when(snapshot.completed_at_ms)} · ${snapshot.device_label} · ${online ? "端末は接続中" : "端末は未接続"} · 取得済みのスナップショット`;
+        return `取得日時: ${when(snapshot.completed_at_ms)} · ${snapshot.device_label} · ${online ? "端末は接続中" : "端末は未接続"} · 取得時点の記録`;
     }
     function show(snapshot: HistorySnapshot) {
         if (snapshot.response === null) return;
         if ("rows" in snapshot.response) {
             currentPage = { snapshot, page: snapshot.response }; currentDetail = null; node("history-detail").hidden = true;
             const rows = snapshot.response.rows;
-            node("history-rows").innerHTML = rows.map(row => `<tr data-history-id="${escape(row.id)}"><td><strong>${escape(row.title)}</strong><small>${escape(row.target_label)}</small><small class="network-mono">${escape(row.id)}</small></td><td>${escape(row.peer_label)}<small>${escape(row.device_path.join(" → "))}</small></td><td><span class="badge ${row.state === "completed" ? "green" : row.state === "failed" ? "red" : "gray"}">${escape(historyStateLabel(row.state))}</span><small>${row.state_source === "last_observed" ? "指示側に保存された最終確認" : "実行側の保存記録"}</small><small>${row.direction === "execution" ? "指示側の結果受信は、この端末では未確認" : row.result_received ? "結果を受信済み" : "結果の受信は未記録"}</small></td><td>${row.direction === "instruction" ? "指示" : "受付"}: ${when(row.created_at_ms)}<small>最終記録: ${when(row.updated_at_ms)}</small></td><td><button class="tiny-button" type="button" data-history-detail="${escape(row.id)}" aria-label="${escape(row.title)}の詳細を見る">詳細を見る</button></td></tr>`).join("");
+            node("history-rows").innerHTML = rows.map(row => `<tr data-history-id="${escape(row.id)}"><td><strong>${escape(row.title)}</strong><small>${escape(row.target_label)}</small><small class="network-mono">${escape(row.id)}</small></td><td>${escape(row.peer_label)}<small>${escape(row.device_path.join(" → "))}</small></td><td><span class="badge ${row.state === "completed" ? "green" : row.state === "failed" ? "red" : "gray"}">${escape(historyStateLabel(row.state))}</span><small>${row.state_source === "last_observed" ? "依頼元に保存された最終確認" : "実行PCの保存記録"}</small><small>${row.direction === "execution" ? "依頼元の結果受信は、この端末では未確認" : row.result_received ? "結果を受信済み" : "結果の受信は未記録"}</small></td><td>${row.direction === "instruction" ? "指示" : "受付"}: ${when(row.created_at_ms)}<small>最終記録: ${when(row.updated_at_ms)}</small></td><td><button class="tiny-button" type="button" data-history-detail="${escape(row.id)}" aria-label="${escape(row.title)}の詳細を見る">詳細を見る</button></td></tr>`).join("");
             node("history-empty").hidden = rows.length !== 0; node("history-acquired").textContent = acquired(snapshot);
             node("history-page-label").textContent = rows.length ? `${snapshot.offset + 1}〜${snapshot.offset + rows.length} 件` : "0 件";
         } else {

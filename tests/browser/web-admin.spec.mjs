@@ -12,11 +12,11 @@ test("Authenticated browser manages the real Hub without a native app", { tag: "
     expect((await page.context().cookies(hub.url)).every(cookie => cookie.httpOnly && cookie.sameSite === "Strict")).toBe(true);
 
     await page.locator('nav a[href="#device-network"]').click();
-    await expect(page.getByRole("button", { name: "ネットワークを開始", exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "接続の受付を開始", exact: true })).toBeVisible();
     await page.getByLabel("このHubのIP", { exact: true }).fill("127.0.0.1");
     await page.locator("#network-port").fill(String(hub.networkPort));
-    await page.getByRole("button", { name: "ネットワークを開始", exact: true }).click();
-    await expect(page.getByRole("button", { name: "ネットワークを停止", exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "接続の受付を開始", exact: true }).click();
+    await expect(page.getByRole("button", { name: "接続の受付を停止", exact: true })).toBeVisible();
     await expect(page.getByRole("button", { name: "接続ファイルを保存", exact: true })).toBeEnabled();
     const network = await hub.observeNetwork();
     expect(network.server.running).toBe(true);
@@ -36,7 +36,7 @@ test("Authenticated browser manages the real Hub without a native app", { tag: "
     const downloadPending = page.waitForEvent("download");
     await page.getByRole("button", { name: "接続ファイルを保存", exact: true }).click();
     const download = await downloadPending;
-    expect(download.suggestedFilename()).toBe("hub-config.toml");
+    expect(download.suggestedFilename()).toBe("hub-config.moyai-join");
     const downloaded = testInfo.outputPath(download.suggestedFilename());
     await download.saveAs(downloaded);
     const config = await readFile(downloaded, "utf8");
@@ -45,12 +45,12 @@ test("Authenticated browser manages the real Hub without a native app", { tag: "
     expect(config).not.toContain("PRIVATE KEY");
     await testInfo.attach("web-network", { body: await page.screenshot({ fullPage: true }), contentType: "image/png" });
 
-    await page.getByRole("button", { name: "ネットワークを停止", exact: true }).click();
-    await expect(page.getByRole("button", { name: "ネットワークを開始", exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "接続の受付を停止", exact: true }).click();
+    await expect(page.getByRole("button", { name: "接続の受付を開始", exact: true })).toBeVisible();
     expect((await hub.observeNetwork()).server.running).toBe(false);
     await page.reload();
     await expect(page.locator("#shared-admin-content")).toContainText(project);
-    await expect(page.getByRole("button", { name: "ネットワークを開始", exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "接続の受付を開始", exact: true })).toBeVisible();
     await expect(page.getByRole("button", { name: "接続ファイルを保存", exact: true })).toBeDisabled();
     expect((await hub.command("hub_web_status")).enabled).toBe(true);
 

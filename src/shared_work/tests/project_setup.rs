@@ -1,5 +1,189 @@
 use super::*;
 
+#[test]
+fn setup_code_management_returns_secret_once_and_preserves_authority_and_revision() {
+    let mut f = Fixture::new();
+    let command = ManagementCommand {
+        request_id: "initial-person".into(),
+        expected_revision: f.work.management_snapshot(&f.admin).unwrap()["revision"]
+            .as_str()
+            .unwrap()
+            .into(),
+        request: ManagementRequest::CreateUserWithSetupCode {
+            username: "new-person".into(),
+            display_name: "New Person".into(),
+        },
+    };
+    assert!(f.work.manage(&f.alice, &command, 100).is_err());
+    let first = f.work.manage(&f.admin, &command, 100).unwrap();
+    let user_id = first["issued_setup_code"]["user_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let code = first["issued_setup_code"]["code"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(code.len(), 64);
+    assert!(
+        first["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|u| u["user_id"] == user_id && u["setup_pending"] == true)
+    );
+    assert!(
+        f.work
+            .management_snapshot(&f.admin)
+            .unwrap()
+            .get("issued_setup_code")
+            .is_none()
+    );
+    assert!(
+        f.work
+            .manage(&f.admin, &command, 101)
+            .unwrap()
+            .get("issued_setup_code")
+            .is_none()
+    );
+    let mut reissue = ManagementCommand {
+        request_id: "reissue-person".into(),
+        expected_revision: command.expected_revision.clone(),
+        request: ManagementRequest::ReissueSetupCode {
+            user_id: user_id.clone(),
+        },
+    };
+    assert!(f.work.manage(&f.admin, &reissue, 102).is_err());
+    reissue.expected_revision = first["revision"].as_str().unwrap().into();
+    assert!(f.work.manage(&f.alice, &reissue, 103).is_err());
+    let second = f.work.manage(&f.admin, &reissue, 104).unwrap();
+    let replacement = second["issued_setup_code"]["code"].as_str().unwrap();
+    assert_ne!(code, replacement);
+    assert!(
+        identity::complete_password_setup(
+            &f.work.db,
+            "new-person",
+            &code,
+            "a sufficiently long password",
+            "WinA",
+            105
+        )
+        .is_err()
+    );
+    assert!(
+        identity::complete_password_setup(
+            &f.work.db,
+            "new-person",
+            replacement,
+            "a sufficiently long password",
+            "WinA",
+            105
+        )
+        .is_ok()
+    );
+    f.reopen();
+    assert!(
+        f.work
+            .manage(&f.admin, &command, 106)
+            .unwrap()
+            .get("issued_setup_code")
+            .is_none()
+    );
+    assert!(
+        f.work
+            .manage(&f.admin, &reissue, 106)
+            .unwrap()
+            .get("issued_setup_code")
+            .is_none()
+    );
+}
+
+#[test]
+fn onboarding_reason_distinguishes_person_from_device_without_disclosing_project_data() {
+    let mut f = Fixture::new();
+    save(&mut f, "onboarding", &["WinA"], &[]);
+    let outsider = identity::create_user(
+        &f.work.db,
+        &f.admin,
+        "outsider",
+        "Outsider",
+        "a sufficiently long password",
+        false,
+        45,
+    )
+    .unwrap();
+    assert_eq!(
+        super::super::project_setup::project_access(&f.work.db, &outsider.user_id, "WinA").unwrap(),
+        "no_membership"
+    );
+    identity::set_project_role(
+        &f.work.db,
+        &f.admin,
+        "onboarding",
+        &outsider.user_id,
+        Some(identity::ProjectRole::Reader),
+        46,
+    )
+    .unwrap();
+    assert_eq!(
+        super::super::project_setup::project_access(&f.work.db, &outsider.user_id, "WinA").unwrap(),
+        "ready"
+    );
+    assert_eq!(
+        super::super::project_setup::project_access(&f.work.db, &outsider.user_id, "WinB").unwrap(),
+        "device_not_allowed"
+    );
+}
+
+#[test]
+fn joining_pc_adds_only_reviewed_purposes_without_granting_people_or_replacing_other_pcs() {
+    let mut f = Fixture::new();
+    save(&mut f, "onboarding", &["WinA"], &[]);
+    let before = f.work.management_snapshot(&f.admin).unwrap();
+    let command = ManagementCommand {
+        request_id: "join-pc".into(),
+        expected_revision: before["revision"].as_str().unwrap().into(),
+        request: ManagementRequest::AssignProjectDevice {
+            project_id: "onboarding".into(),
+            device_id: "WinB".into(),
+            can_control: false,
+            can_execute: true,
+        },
+    };
+    assert!(f.work.manage(&f.alice, &command, 50).is_err());
+    let after = f.work.manage(&f.admin, &command, 50).unwrap();
+    assert_eq!(before["project_memberships"], after["project_memberships"]);
+    assert!(
+        f.work
+            .require_project_controller("onboarding", "WinA")
+            .is_ok()
+    );
+    assert!(
+        f.work
+            .require_project_controller("onboarding", "WinB")
+            .is_err()
+    );
+    assert_eq!(
+        f.work.device_projects("WinB").unwrap()["projects"][0]["preparation_state"],
+        "waiting_setup"
+    );
+    f.work.manage(&f.admin, &command, 51).unwrap();
+    let mut changed = command.clone();
+    changed.request = ManagementRequest::AssignProjectDevice {
+        project_id: "onboarding".into(),
+        device_id: "WinC".into(),
+        can_control: true,
+        can_execute: true,
+    };
+    assert!(f.work.manage(&f.admin, &changed, 52).is_err());
+    f.reopen();
+    assert!(
+        f.work
+            .require_project_controller("onboarding", "WinA")
+            .is_ok()
+    );
+}
+
 fn save(
     f: &mut Fixture,
     project: &str,

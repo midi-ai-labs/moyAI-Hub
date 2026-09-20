@@ -1,6 +1,7 @@
 export type ProjectRole = "reader" | "contributor" | "manager";
-export interface SharedAdminUser { user_id: string; username: string; display_name: string; administrator: boolean; disabled: boolean }
+export interface SharedAdminUser { user_id: string; username: string; display_name: string; administrator: boolean; disabled: boolean; setup_pending?: boolean }
 export interface SharedAdminSnapshot {
+  issued_setup_code?: { user_id: string; username: string; code: string; expires_at_ms: number };
   revision: string;
   users: SharedAdminUser[];
   groups: { id: string; label: string; disabled: boolean }[];
@@ -20,9 +21,10 @@ export interface SharedAdminSnapshot {
 }
 export type SharedAdminTab = "users" | "groups" | "projects" | "environments" | "resources" | "maintenance" | "storage";
 export const adminTabs: [SharedAdminTab, string][] = [
-  ["projects", "プロジェクト"], ["users", "人"], ["maintenance", "停止状態の確認"], ["storage", "保存と保守"],
+  ["projects", "プロジェクト"], ["users", "利用者"], ["maintenance", "停止状態の確認"], ["storage", "保存と保守"],
 ];
 export type AdminOperation = "create_user" | "update_user" | "set_password" | "delete_user"
+  | "create_user_with_setup_code" | "reissue_setup_code" | "revoke_setup_code"
   | "save_project" | "retry_project_device"
   | "create_group" | "update_group" | "delete_group" | "group_member"
   | "create_project" | "update_project" | "delete_project" | "project_member" | "group_project_role"
@@ -38,14 +40,15 @@ export function environmentDefaults(snapshot: Pick<SharedAdminSnapshot, "environ
   return { runner_id: runnerId, resource_id: resource?.id ?? (ids.length === 0 ? newResourceId : ""), capacity: String(resource?.capacity ?? 1), template_id: "" };
 }
 export const operationLabels: Record<AdminOperation, string> = {
-  save_project: "プロジェクトを保存", retry_project_device: "実行するPCの準備を再試行",
+  create_user_with_setup_code: "本人設定コードで利用者を追加", reissue_setup_code: "本人設定コードを再発行", revoke_setup_code: "本人設定コードを失効",
+  save_project: "プロジェクトを保存", retry_project_device: "実行PCのフォルダー作成を再試行",
   create_user: "利用者を追加", update_user: "利用者を編集", set_password: "パスワードを再設定", delete_user: "利用者を削除",
   create_group: "グループを追加", update_group: "グループを編集", delete_group: "グループを削除", group_member: "グループの所属を設定",
   create_project: "プロジェクトを追加", update_project: "プロジェクトを編集", delete_project: "プロジェクトを削除",
   project_member: "利用者の役割を設定", group_project_role: "グループの役割を設定",
   create_environment: "実行先を追加", update_environment: "実行先を編集", delete_environment: "実行先を削除",
-  set_resource: "共有枠を設定", delete_resource: "共有資源を削除", settle_attempt: "実停止を確認して清算",
-  request_provision: "実行領域の作成を依頼", prune_shared_data: "保存データを整理",
+  set_resource: "共有枠を設定", delete_resource: "同時利用の枠を削除", settle_attempt: "停止を確認して枠を解放",
+  request_provision: "作業フォルダーの作成を依頼", prune_shared_data: "保存データを整理",
 };
 const text = (draft: AdminDraft, key: string) => String(draft[key] ?? "").trim();
 const flag = (draft: AdminDraft, key: string) => draft[key] === true;
@@ -74,6 +77,8 @@ export function adminRequest(kind: AdminOperation, draft: AdminDraft): Record<st
   const id = () => required(draft, "id");
   const user_id = () => required(draft, "user_id");
   switch (kind) {
+    case "create_user_with_setup_code": return { kind, username: required(draft,"username"), display_name: required(draft,"display_name") };
+    case "reissue_setup_code": case "revoke_setup_code": return { kind, user_id:user_id() };
     case "save_project": {
       const members = Object.entries(draft).filter(([key,value]) => key.startsWith("participant:") && value !== "").map(([key,value]) => {
         if (!["reader","contributor","manager"].includes(String(value))) throw "参加者の役割を確認してください。";
@@ -96,13 +101,13 @@ export function adminRequest(kind: AdminOperation, draft: AdminDraft): Record<st
     case "group_project_role": return { kind, project_id: required(draft, "project_id"), group_id: required(draft, "group_id"), role: role(draft) };
     case "create_environment": case "update_environment": {
       const project_ids = Array.isArray(draft.project_ids) ? [...draft.project_ids] : [];
-      if (!project_ids.length) throw "公開するプロジェクトを一つ以上選択してください。";
+      if (!project_ids.length) throw "この実行先を使えるプロジェクトを一つ以上選択してください。";
       return { kind, id: id(), label: required(draft, "label"), resource_id: required(draft, "resource_id"), runner_id: required(draft, "runner_id"), project_ids,
         ...(kind === "create_environment" ? { capacity: capacity(draft), ...(text(draft, "template_id") ? { template_id: text(draft, "template_id") } : {}) } : { enabled: flag(draft, "enabled") }) };
     }
     case "request_provision": {
       const generation = Number(draft.generation);
-      if (!Number.isSafeInteger(generation) || generation < 0) throw "最新の配置状態を確認してください。";
+      if (!Number.isSafeInteger(generation) || generation < 0) throw "最新のフォルダー作成状況を確認してください。";
       return { kind, environment_id: required(draft, "environment_id"), template_id: required(draft, "template_id"), generation };
     }
     case "prune_shared_data": {
@@ -112,7 +117,7 @@ export function adminRequest(kind: AdminOperation, draft: AdminDraft): Record<st
     }
     case "set_resource": return { kind, id: id(), capacity: capacity(draft) };
     case "settle_attempt": {
-      if (!flag(draft, "acknowledge_stopped")) throw "対象の実処理と資源が停止済みであることを確認してください。";
+      if (!flag(draft, "acknowledge_stopped")) throw "対象の処理が停止し、PCやソフトウェアを再利用できることを確認してください。";
       const generation = Number(draft.generation);
       if (!Number.isSafeInteger(generation) || generation < 1) throw "最新の復旧対象を選択してください。";
       return { kind, attempt_id: required(draft, "attempt_id"), generation, acknowledge_stopped: true, reason: required(draft, "reason") };
@@ -120,5 +125,5 @@ export function adminRequest(kind: AdminOperation, draft: AdminDraft): Record<st
   }
 }
 export function roleLabel(role: ProjectRole): string {
-  return { reader: "閲覧", contributor: "仕事の投入・実行", manager: "プロジェクト管理" }[role];
+  return { reader: "閲覧", contributor: "仕事の依頼・実行", manager: "プロジェクト管理" }[role];
 }

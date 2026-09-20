@@ -1,11 +1,37 @@
 use moyai_hub::{catalog::*, core::HubCore, protocol::*};
 use std::collections::BTreeSet;
 
+#[test]
+fn legacy_catalog_upgrades_without_assuming_a_standard_and_explicit_choice_is_validated() {
+    let mut store = fixture().catalog_store().clone();
+    store.schema_version = 1;
+    let legacy = serde_json::to_string(&store).unwrap();
+    assert!(!legacy.contains("team_default_model_id"));
+    let mut reopened: CatalogStore = serde_json::from_str(&legacy).unwrap();
+    assert!(reopened.reconcile_software("0.1.0", 20).unwrap());
+    assert_eq!(reopened.schema_version, SCHEMA_VERSION);
+    assert_eq!(reopened.catalog.team_default_model_id, None);
+    let mut selected = reopened.catalog.clone();
+    selected.team_default_model_id = Some("model-b".into());
+    reopened.replace_catalog(selected.clone(), 21).unwrap();
+    assert!(reopened.changes.last().unwrap().policy_changed);
+    assert_eq!(
+        serde_json::from_str::<CatalogStore>(&serde_json::to_string(&reopened).unwrap()).unwrap(),
+        reopened
+    );
+    selected.team_default_model_id = Some("missing".into());
+    assert!(selected.validate().is_err());
+    selected.team_default_model_id = Some("model-b".into());
+    selected.models[1].capabilities.clear();
+    assert!(selected.validate().is_err());
+}
+
 fn fixture() -> HubCore {
     let mut store = CatalogStore::empty("0.1.0");
     store
         .replace_catalog(
             Catalog {
+                team_default_model_id: None,
                 models: vec![
                     model("model-a", &["tools"]),
                     model("model-b", &["tools", "vision"]),

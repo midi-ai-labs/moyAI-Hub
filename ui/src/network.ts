@@ -1,38 +1,46 @@
 import { copyText, invoke, savedMessage } from "./management.ts";
-import { NetworkEdits, networkAdmissionStatus, networkCertificateStatus, networkClientAction, networkClients, networkDeviceDeletion, networkDeviceStatus, networkDiagnosticMatches, networkDiagnosticStages, networkDiagnosticTarget, networkGatewayPort, networkSubject } from "./network_state.ts";
+import { NetworkEdits, networkAdmissionStatus, networkCertificateStatus, networkClientAction, networkClients, networkDeviceDeletion, networkDeviceStatus, networkDiagnosticMatches, networkDiagnosticStages, networkDiagnosticTarget, networkGatewayPort, networkSetupStep, networkSubject } from "./network_state.ts";
 import type { NetworkClientAction, NetworkClientFilter, NetworkDiagnostics, NetworkSnapshot, NetworkSubject } from "./network_state.ts";
 import "./network.css";
 import { reconcileNetworkRows } from "./network_rows.ts";
+import { attachFirewall } from "./firewall.ts";
 
 const escape = (value: unknown) => String(value ?? "").replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]!);
 const when = (value: number | null) => value ? new Date(value).toLocaleString("ja-JP") : "未確認";
 
 export function attachDeviceNetwork(host: HTMLElement, clientsHost: HTMLElement, interactionActive: () => boolean,
     onSnapshot: (snapshot: NetworkSnapshot) => void): { refresh: () => Promise<void> } {
-    host.innerHTML = `<div class="section-title"><div><p class="eyebrow">初めての接続・端末の追加</p><h2 id="network-heading">Desktopの接続</h2></div><button id="network-refresh" class="secondary">最新情報を取得</button></div>
-      <p class="subtle">Hubを公開し、接続ファイルをDesktopへ渡して、届いた参加申請を許可します。同じ接続ファイルを複数の端末で使えます。</p>
+    host.innerHTML = `<div class="section-title"><div><p class="eyebrow">初めての接続・端末の追加</p><h2 id="network-heading">PCの接続</h2></div><button id="network-refresh" class="secondary">最新情報を取得</button></div>
+      <p class="subtle">最初の1台で接続を確かめてから、同じ接続ファイルをチームに配ります。下の1〜4の順に進めてください。</p>
+      <aside class="network-next-action" aria-label="次の操作"><strong id="network-next-title">接続状態を読み込んでいます</strong><p id="network-next-detail"></p><a id="network-next-link" href="#network-step-start">接続先を設定する</a></aside>
       <p id="network-notice" class="field-status" role="status" aria-live="polite"></p>
-      <div class="network-grid"><section class="network-card"><h3>1. このHubへの接続を開始 <span id="network-server-status" class="badge gray">停止中</span></h3>
-        <form id="network-server-form"><div class="network-fields"><label>このHubのIP<input id="network-ip" placeholder="例: 192.168.1.10" required autocomplete="off" spellcheck="false" aria-describedby="network-ip-help" /></label><label>ポート<input id="network-port" value="9471" inputmode="numeric" required /></label></div>
-        <p id="network-ip-help" class="footnote">Hubを動かしているPCのLAN側IPを入力します。Windowsの「設定 → ネットワークとインターネット → プロパティ」でIPv4アドレスを確認できます。127.0.0.1は同じPC内だけの接続用です。</p>
-        <p class="footnote">一度開始できたIPとポートは保存されます。次回はStart-Hub.cmdから同じ設定で再開できます。モデル接続とGatewayもまとめて開始・停止します。</p><p id="network-hosting-error" class="field-status error" role="status" hidden></p><div class="network-actions"><button id="network-start" class="primary">ネットワークを開始</button><button id="network-stop" type="button" class="danger" hidden>ネットワークを停止</button><button id="network-diagnose" type="button" class="secondary">接続状態を診断</button></div></form>
+      <div class="network-grid network-setup-grid"><section id="network-step-start" class="network-card"><h3>1. 接続先を設定してHubを開始 <span id="network-server-status" class="badge gray">停止中</span></h3><p class="footnote">このPCでHubとモデル通信の受付を起動します。Windowsの受信許可は、実際のポートが決まった後に手順2で設定します。</p>
+        <label>共有するLANの候補<select id="network-lan"><option value="">候補を確認しています…</option></select></label><p id="network-lan-status" class="footnote"></p><button id="network-lan-refresh" type="button" class="secondary">LAN候補を再取得</button>
+        <p class="footnote">モデル通信は保存済みポートで開始します。変更する場合だけ下を開いて保存してください。</p>
+        <details id="network-gateway-settings" data-details-key="network-gateway-settings"><summary>モデル通信ポートを変更する（通常は変更不要）</summary><form id="network-settings-form"><label>Gatewayポート<input id="network-gateway-port" inputmode="numeric" autocomplete="off" placeholder="9472" /></label><p class="footnote">表示中の保存済み設定で開始します。通常は変更・保存せずに下の開始ボタンへ進めます。新規Hubの標準は9472です。変更するときだけ「ポート設定を保存」を押してください。稼働中の変更は次回開始時に適用し、空欄または0は再開始時にポートが変わる自動選択です。</p><p class="footnote">GatewayはHubで共有するAIとの通信に使います。実行PCに直接設定したAIで共有仕事を動かす場合、Gatewayを使うためのモデル登録・Desktop診断は不要です。Hubの開始時にはGatewayも起動します。</p><button type="submit" class="secondary">ポート設定を保存</button></form></details>
+        <form id="network-server-form"><div class="network-fields"><label>このHubのIP<input id="network-ip" placeholder="例: 192.168.1.10" required autocomplete="off" spellcheck="false" aria-describedby="network-ip-help" /></label><label>Hubポート<input id="network-port" value="9471" inputmode="numeric" required /></label></div>
+        <p id="network-ip-help" class="footnote">チームで使う場合は、同じPCのDesktopも最初からLAN側IPへ接続してください。複数LAN・VPNがある場合は参加PCから届くものを選びます。127.0.0.1はこのPCだけの試用向けです。登録済みDesktopのURL変更は、同じHub・同じCAの接続ファイルで接続先を確認して行います。別Hub・CAへの差し替えは対象外です。</p>
+        <p class="footnote">一度開始できたIPとポートは保存されます。次回はStart-Hub.cmdから同じ設定で再開できます。モデル接続とGatewayもまとめて開始・停止します。</p><p id="network-hosting-error" class="field-status error" role="status" hidden></p><div class="network-actions"><button id="network-start" class="primary">接続の受付を開始</button><button id="network-stop" type="button" class="danger" hidden>接続の受付を停止</button><button id="network-diagnose" type="button" class="secondary">接続状態を診断</button></div></form>
         <section id="network-diagnostic-result" aria-label="接続診断の結果" aria-live="polite" hidden></section>
         <details data-details-key="network-connection-details"><summary>接続と証明書の詳細</summary><p id="network-identity" class="network-mono"></p><p id="network-ca" class="network-mono"></p>
-          <form id="network-settings-form"><label>モデル通信用ポート（Gateway）<input id="network-gateway-port" inputmode="numeric" autocomplete="off" placeholder="自動" /></label><p class="footnote">空欄または0は自動です。ファイアウォールで固定ポートが必要な場合は1〜65535を指定します。稼働中の変更は次回のネットワーク開始時に適用します。</p><button type="submit" class="secondary">ポート設定を保存</button></form>
           <p id="network-gateway-bind" class="network-mono"></p>
           <p id="network-certificate-status" class="footnote" role="status"></p><dl id="network-certificate-times" class="network-certificate-times"></dl>
           <button id="network-renew-certificate" type="button" class="secondary">証明書を今すぐ更新</button><p class="footnote">HubとGatewayの証明書を更新します。新しい接続から適用し、進行中の通信は継続します。</p>
         </details></section>
-      <section class="network-card"><h3>2. 接続ファイルをDesktopへ渡す</h3>
-        <p class="subtle">hub-config.tomlを保存して各端末へ渡し、Desktopの「moyAI Hub → 端末連携」で読み込みます。IPや証明書を端末ごとに入力する必要はありません。</p>
+      <section id="network-step-firewall" class="network-card"><h3>2. Windowsで受信を許可</h3><p>Hub PCで設定する場合は、下の「このHub PCで受信許可を設定する」を開いてください。Windowsの管理者権限がない場合や会社で一括管理している場合は、PC管理者へ設定を依頼します。</p><p id="network-firewall-prerequisite" class="footnote"></p>
+        <div id="network-firewall-native"></div><details><summary>受信許可の設定を管理者へ依頼</summary><p>次の実行ファイルとHub・Gatewayの受信TCPポートに限定します。利用する接続元PCまたはサブネットと、社内LANのネットワークプロファイルを管理者が確認してください。</p><pre id="network-firewall-info"></pre><button id="network-firewall-copy" type="button" class="secondary">設定依頼をコピー</button><p class="footnote">コピーした内容をPC管理者へ渡し、設定を依頼してください。設定後は参加するDesktopから接続を診断します。許可が引き続き有効になるよう、更新後もHubの実行ファイルは同じ場所に置いてください。</p></details><p><a href="#network-step-file">受信許可を設定したら、最初の1台へ接続ファイルを渡す →</a></p></section>
+      <section id="network-step-file" class="network-card"><h3>3. 最初の1台へ接続ファイルを渡す</h3>
+        <p class="subtle">hub-config.moyai-joinを保存して、まず接続を試すPCへ渡します。そのPCにmoyAIをセットアップし、ファイルをダブルクリックしてDesktopで接続先を確認してください。Desktopの「moyAI Hub → PCの接続」からも読み込めます。IPや証明書をPCごとに入力する必要はありません。</p>
         <div class="network-actions"><button id="network-save-config" type="button" class="primary">接続ファイルを保存</button><button id="network-copy-config" type="button" class="secondary">接続設定をコピー</button></div>
         <p class="footnote">接続を開始すると保存・コピーできます。含まれるのはHubのURLと公開CAです。管理画面のURLや利用者のパスワードは含みません。</p>
         <details id="network-config-preview" hidden><summary>接続設定を選択してコピー</summary><textarea id="network-config-text" readonly rows="7" aria-label="Desktopに渡す接続設定"></textarea></details>
-        <h3 class="network-next-step">3. 届いた参加申請を許可する</h3>
-        <p class="subtle">Desktopが自動で申請します。PC名とIPを確認して許可してください。名前は後から変更できます。用途はプロジェクトで設定します。</p>
-        <a id="network-open-pending" href="#clients" class="primary-link">接続端末・承認待ちを確認する <span id="network-pending-summary"></span> →</a>
-        <p class="footnote">共有仕事を使う場合は、続いて<a href="#shared-administration">プロジェクトと人</a>でログインする人とプロジェクトを設定します。</p></section></div>
-      <div hidden><div class="network-rule-introduction"><h3>PC同士で直接仕事を依頼する場合</h3><p class="subtle">端末グループと接続ルールを設定します。Hubが受け付ける共有仕事の利用者・公開先は「プロジェクトと人」で管理します。</p></div>
+        <p><a href="#network-step-confirm">Desktopで接続ファイルを開いたら、参加を許可する →</a></p></section>
+      <section id="network-step-confirm" class="network-card"><h3>4. 参加を許可して、Desktopで接続を診断</h3>
+        <p class="subtle">Desktopが自動で申請します。PC名とIPを確認し、許可画面で既存プロジェクトへの操作・実行用途も選べます。名前は後から変更できます。</p>
+        <a id="network-open-pending" href="#clients" class="primary-link">接続PC・承認待ちを確認する <span id="network-pending-summary"></span> →</a>
+        <ol><li>上の一覧で申請元のPCを確かめ、「許可」を押します。</li><li>そのPCのDesktopで「PCの接続 → 接続の詳細・診断 → Hubへの接続を診断」を実行します。</li><li>そのPCでHubのAIも使う場合は「このPCでHubのAIを使う場合の診断」も実行します。</li></ol><p>接続と必要なAIが使えることを確かめたら、手順3の同じ接続ファイルを残りのPCへ渡します。各PCの参加はそれぞれ許可してください。</p><a href="#network-step-file">チームに配る接続ファイルを保存する</a>
+        <p class="footnote">共有仕事を使う人とプロジェクトは先に<a href="#team-onboarding">チームの初期設定</a>から設定できます。PC参加だけを許可し、用途を後から指定することもできます。</p></section></div>
+      <div hidden><div class="network-rule-introduction"><h3>PC同士で直接仕事を依頼する場合</h3><p class="subtle">端末グループと接続ルールを設定します。Hubが受け付ける共有仕事の利用者・実行先は「プロジェクト・利用者」で管理します。</p></div>
       <div class="network-grid"><section class="network-card"><h3>端末グループ</h3><p class="footnote">PCをまとめて接続許可を設定できます。例:「開発」「GPU搭載」の両方へ同じ端末を追加できます。</p>
         <form id="network-group-form"><label>編集するグループ<select id="network-group-id"><option value="">新しいグループを追加</option></select></label><label>グループ名<input id="network-group-label" maxlength="160" required /></label><button class="secondary">グループを保存</button></form><ul id="network-group-list" class="network-group-list"></ul></section>
       <section class="network-card"><h3>どのPCからどのPCへ依頼できるか</h3><form id="network-rule-form"><div class="network-fields"><label>送信元<select id="network-rule-from" required></select></label><label>受入先<select id="network-rule-to" required></select></label></div>
@@ -40,28 +48,30 @@ export function attachDeviceNetwork(host: HTMLElement, clientsHost: HTMLElement,
         <label>公開対象<select id="network-rule-profile"><option value="">この宛先の公開対象すべて</option></select></label><label>最大の委任段数<select id="network-rule-depth"><option value="1">1段</option><option value="2">2段（例: 00 → 19 → 20）</option><option value="3">3段</option></select></label><button class="primary">接続ルールを追加</button></form>
         <p class="footnote">矢印は一方向です。逆向きは別に許可します。再委任には直前の端末からの直接許可と、最初の依頼元から宛先への再委任許可の両方が必要です。</p></section></div>
       <section class="network-card"><h3>接続ルールと個別例外</h3><div id="network-rule-list"></div><p class="footnote">端末の停止・失効やルール変更は新しい受付を止めます。既に実行しているタスクの停止完了は、Desktopの委任経路と停止状況で確認してください。</p></section></div>`;
-    clientsHost.innerHTML = `<p class="subtle">申請の許可と、登録後の名前・利用の停止をここで管理します。承認状態と稼働状態は別の情報です。</p>
-      <div class="network-client-toolbar"><label class="network-search">端末を検索<input id="network-search" type="search" placeholder="PC名・IP" /></label>
-        <label>表示<select id="network-filter"><option value="all">すべての端末</option><option value="pending">承認待ちのみ</option></select></label>
+    clientsHost.innerHTML = `<p class="subtle">参加申請を許可したり、登録したPCの名前を変更したりできます。「承認状態」は利用の許可、「稼働状態」はPCが現在接続しているかを表します。</p>
+      <div class="network-client-toolbar"><label class="network-search">PCを検索<input id="network-search" type="search" placeholder="PC名・IP" /></label>
+        <label>表示<select id="network-filter"><option value="all">すべてのPC</option><option value="pending">承認待ちのみ</option></select></label>
         <button id="network-clients-refresh" class="secondary">最新情報を取得</button></div>
       <p id="network-clients-summary" class="footnote"></p><p id="network-clients-notice" class="field-status" role="status" aria-live="polite"></p>
-      <div class="table-wrap"><table class="network-table"><thead><tr><th>PC名・観測IP</th><th>承認状態</th><th>稼働状態</th><th hidden>所属グループ</th><th>時刻</th><th>操作</th></tr></thead><tbody id="network-device-rows"></tbody></table></div>
-      <p id="network-devices-empty" class="subtle">まだ端末はありません。共通設定をDesktopへ渡し、Desktopから参加を申請してください。</p>
+      <div class="table-wrap"><table class="network-table"><thead><tr><th>PC名・接続時のIPアドレス</th><th>承認状態</th><th>稼働状態</th><th hidden>所属グループ</th><th>時刻</th><th>操作</th></tr></thead><tbody id="network-device-rows"></tbody></table></div>
+      <p id="network-devices-empty" class="subtle">登録されたPCはありません。接続ファイルをDesktopで開くと、参加申請が届きます。</p>
       <p class="footnote">「停止」は新しい利用を止める操作です。登録情報と接続ルールは保持し、「再許可」で戻せます。実行中のタスクは即座には止まりません。停止完了はDesktopの委任経路で確認してください。</p>
       <details hidden class="technical-details network-legacy-invite" data-details-key="network-legacy-invite"><summary>従来の参加コードで登録する（互換）</summary><div class="network-card">
-        <form id="network-invite-form"><label>登録する端末名<input id="network-invite-label" placeholder="例: Win19" maxlength="160" required autocomplete="off" /></label>
+        <form id="network-invite-form"><label>登録するPC名<input id="network-invite-label" placeholder="例: Win19" maxlength="160" required autocomplete="off" /></label>
         <fieldset hidden><legend>所属グループ（複数選択可）</legend><div id="network-invite-groups" class="network-memberships"></div></fieldset><button class="secondary">参加コードを発行</button></form>
         <div id="network-invite-receipt" hidden><label>参加コード<input id="network-invite-code" readonly autocomplete="off" /></label><p id="network-invite-expiry" class="footnote"></p><button id="network-copy-invite" class="secondary">コードをコピー</button></div>
         <p class="footnote">コード入力に対応したDesktopで使う互換手順です。参加コードは10分以内に1回だけ使えます。</p></div></details>
-      <dialog id="network-device-dialog" aria-labelledby="network-device-title"><form id="network-device-form"><div class="section-title"><h2 id="network-device-title">端末を管理</h2><button id="network-device-close" type="button" class="icon-button" aria-label="閉じる">×</button></div>
-        <p id="network-device-id" class="network-mono"></p><label>端末名<input id="network-device-label" maxlength="160" aria-describedby="network-device-error network-device-name-help" required /></label><p id="network-device-error" class="field-status" role="status"></p><p id="network-device-name-help" class="footnote">同じHubで使われていない名前を指定してください。前後の空白・大文字小文字は区別しません。</p><fieldset hidden><legend>所属グループ（複数選択可）</legend><div id="network-device-groups" class="network-memberships"></div></fieldset>
+      <dialog id="network-device-dialog" aria-labelledby="network-device-title"><form id="network-device-form"><div class="section-title"><h2 id="network-device-title">PCの登録を編集</h2><button id="network-device-close" type="button" class="icon-button" aria-label="閉じる">×</button></div>
+        <p id="network-device-id" class="network-mono"></p><label>PC名<input id="network-device-label" maxlength="160" aria-describedby="network-device-error network-device-name-help" required /></label><p id="network-device-error" class="field-status" role="status"></p><p id="network-device-name-help" class="footnote">同じHubで使われていない名前を指定してください。前後の空白・大文字小文字は区別しません。</p><fieldset hidden><legend>所属グループ（複数選択可）</legend><div id="network-device-groups" class="network-memberships"></div></fieldset>
         <details id="network-device-revoke-details"><summary>端末認証の恒久失効（元に戻せません）</summary><label class="network-check"><input id="network-device-revoked" type="checkbox" /><span>この端末の認証を恒久的に失効する</span></label><p class="footnote">一時的に利用を止める場合は、一覧の「停止」を使ってください。恒久失効は再許可できず、実行中のタスクの停止完了を意味しません。</p></details>
         <div class="network-actions"><button class="primary" id="network-device-save">変更を保存</button><button type="button" class="secondary" id="network-device-review">最新情報を取得</button></div></form></dialog>
-      <details data-details-key="network-deleted-devices"><summary>削除済みの登録</summary><p class="footnote">元の端末IDと履歴の帰属を保持しています。登録と接続許可は復元しません。</p><div id="network-deleted-list"></div></details>
+      <details data-details-key="network-deleted-devices"><summary>削除済みの登録</summary><p class="footnote">削除前のPCの登録IDと過去の履歴を表示します。接続を再開するには、Desktopから新しく参加を申請してください。</p><div id="network-deleted-list"></div></details>
       <dialog id="network-delete-dialog" aria-labelledby="network-delete-title"><h2 id="network-delete-title">この端末の登録を削除しますか</h2><p id="network-delete-identity" class="network-mono"></p><p id="network-delete-warning"></p><p id="network-delete-error" class="field-status error" role="status"></p><div class="network-actions"><button id="network-delete-cancel" class="secondary" type="button">取消</button><button id="network-delete-confirm" class="danger" type="button">この登録を削除</button></div></dialog>`;
     const roots = [host, clientsHost];
     const node = <T extends HTMLElement = HTMLElement>(id: string) => (host.querySelector<T>(`#${id}`) ?? clientsHost.querySelector<T>(`#${id}`))!;
     const value = (id: string) => node<HTMLInputElement | HTMLSelectElement>(id).value;
+    const firewallHost = node("network-firewall-native");
+    attachFirewall(firewallHost);
     const message = (text: string, error = false) => { for (const id of ["network-notice", "network-clients-notice"]) { node(id).textContent = text; node(id).classList.toggle("error", error); } };
     const owner = new NetworkEdits();
     let busy = false;
@@ -70,6 +80,8 @@ export function attachDeviceNetwork(host: HTMLElement, clientsHost: HTMLElement,
     let selectedClient: { kind: "request" | "device"; id: string } | null = null;
     let diagnostic: { result: NetworkDiagnostics; target: string; checkedAt: number } | null = null;
     let copiedConfigTarget: string | null = null;
+    let executable: string | null = null;
+    let loadingOptions = false;
     // Compare server projection markup with its previous projection, not live
     // DOM serialization: details.open and user selections belong to the UI.
     let renderedClientRows: string | null = null;
@@ -97,13 +109,19 @@ export function attachDeviceNetwork(host: HTMLElement, clientsHost: HTMLElement,
     function lock(): void {
         for (const root of roots) {
             root.setAttribute("aria-busy", String(busy));
-            for (const control of root.querySelectorAll<HTMLButtonElement | HTMLInputElement | HTMLSelectElement>("button,input,select")) control.disabled = busy || !owner.snapshot;
+            for (const control of root.querySelectorAll<HTMLButtonElement | HTMLInputElement | HTMLSelectElement>("button,input,select")) {
+                // The Firewall child owns its review/confirmation and in-flight
+                // state. Network polling must not enable its guarded actions.
+                if (!firewallHost.contains(control)) control.disabled = busy || !owner.snapshot;
+            }
         }
         node<HTMLButtonElement>("network-refresh").disabled = busy;
         node<HTMLButtonElement>("network-clients-refresh").disabled = busy;
         node<HTMLButtonElement>("network-device-review").disabled = busy;
         node<HTMLInputElement>("network-ip").disabled = busy || !owner.snapshot || Boolean(owner.snapshot.server.running);
         node<HTMLInputElement>("network-port").disabled = busy || !owner.snapshot || Boolean(owner.snapshot.server.running);
+        node<HTMLSelectElement>("network-lan").disabled = busy || loadingOptions || Boolean(owner.snapshot?.server.running);
+        node<HTMLButtonElement>("network-lan-refresh").disabled = busy || loadingOptions;
         node<HTMLButtonElement>("network-renew-certificate").disabled = busy || !owner.snapshot?.server.running;
         node<HTMLButtonElement>("network-diagnose").disabled = busy || !owner.snapshot?.server.running;
         for (const id of ["network-copy-config", "network-save-config"]) node<HTMLButtonElement>(id).disabled = busy || !owner.snapshot?.server.running || !owner.snapshot.server.bind;
@@ -122,6 +140,12 @@ export function attachDeviceNetwork(host: HTMLElement, clientsHost: HTMLElement,
             node<HTMLTextAreaElement>("network-config-text").value = "";
         }
         node("network-server-status").textContent = snapshot.server.running ? "稼働中" : "停止中";
+        const step = networkSetupStep(snapshot);
+        node("network-next-title").textContent = step.title;
+        node("network-next-detail").textContent = step.detail;
+        node<HTMLAnchorElement>("network-next-link").href = `#${step.anchor}`;
+        node("network-next-link").textContent = step.action;
+        node("network-firewall-prerequisite").textContent = snapshot.server.running ? "現在のHubとGatewayのポートを使って受信許可を設定します。設定後の接続確認はDesktopで行ってください。" : "手順1で接続の受付を開始してから、受信許可を設定してください。";
         node("network-server-status").className = `badge ${snapshot.server.running ? "green" : "gray"}`;
         node("network-start").hidden = snapshot.server.running;
         node("network-stop").hidden = !snapshot.server.running;
@@ -132,12 +156,13 @@ export function attachDeviceNetwork(host: HTMLElement, clientsHost: HTMLElement,
         }
         node("network-hosting-error").hidden = !snapshot.hosting.error;
         node("network-hosting-error").textContent = snapshot.hosting.error
-            ? `${snapshot.hosting.error} IPとポートを確認してネットワークを開始すると、起動設定を保存し直せます。` : "";
+            ? `${snapshot.hosting.error} IPとポートを確認して接続の受付を開始すると、起動設定を保存し直せます。` : "";
         node("network-identity").textContent = `Hub: ${snapshot.hub_id} / ${snapshot.server.bind ?? "停止中"} / 更新 ${snapshot.revision}`;
         node("network-ca").textContent = `公開CA SHA-256: ${snapshot.ca_sha256}`;
         const gatewayPort = node<HTMLInputElement>("network-gateway-port");
         if (gatewayPort !== document.activeElement && !owner.revisions.has("network-settings-form")) gatewayPort.value = snapshot.gateway_port ? String(snapshot.gateway_port) : "";
         node("network-gateway-bind").textContent = `稼働中のGateway: ${snapshot.server.gateway_bind ?? "停止中"}`;
+        node("network-firewall-info").textContent = `moyAI Hub 受信許可の依頼\n実行ファイル: ${executable ?? "LAN候補を再取得して確認してください"}\nHub: ${snapshot.server.bind ?? snapshot.hosting.bind ?? "未設定"}\nGateway: ${snapshot.server.gateway_bind ?? `停止中（次回指定ポート: ${snapshot.gateway_port || "自動"}）`}\n通信: TCP\n接続元PC/サブネット: 管理者が利用範囲を指定\nネットワークプロファイル: 社内LANに限定\n別PCからの到達: Desktop側で確認が必要`;
         const certificateStatus = networkCertificateStatus(snapshot.server.certificate, Date.now());
         node("network-certificate-status").textContent = certificateStatus.label;
         node("network-certificate-status").classList.toggle("error", certificateStatus.warning);
@@ -193,7 +218,7 @@ export function attachDeviceNetwork(host: HTMLElement, clientsHost: HTMLElement,
             const device = client.device;
             const status = networkDeviceStatus(device);
             const admission = networkAdmissionStatus(device);
-            return `<tr data-id="device:${escape(device.device_id)}"><td><strong>${escape(device.label)}</strong>${device.name_conflict ? '<small class="error">同名の登録があります。IDで識別し、名前の変更か不要登録の削除で解消してください。</small>' : ""}<small>観測IP: ${escape(device.observed_ip ?? "未確認")}</small><details data-device-identity="device:${escape(device.device_id)}"><summary>照合用ID</summary><small>端末ID</small><code>${escape(device.device_id)}</code><small>証明書 SHA-256</small><code>${escape(device.certificate_sha256)}</code></details></td><td><span class="badge ${admission.color}">${admission.label}</span><small>${escape(admission.detail)}</small></td><td><span class="badge ${status.color}">${status.label}</span><small>${escape(status.detail)}</small><details data-network-legacy-mcp="${escape(device.device_id)}"><summary>以前のMCP連携</summary><small>${device.publications.some(profile => profile.enabled) ? "受付申告あり" : "受付の申告なし"}</small></details>${device.unsettled_jobs ? `<small>終了未確認のタスク: ${device.unsettled_jobs} 件</small>` : ""}</td><td hidden>${device.groups.map(id => `<span class="network-tag">${escape(snapshot.groups.find(group => group.id === id)?.label ?? id)}</span>`).join("") || "所属なし"}</td><td><small>最終生存確認</small>${when(device.last_seen_ms)}</td><td><div class="network-row-actions">${actionButton}<button type="button" class="tiny-button" data-network-edit="${escape(device.device_id)}" data-network-revision="${escape(snapshot.revision)}" aria-label="${escape(device.label)}を管理">名前・詳細</button><button type="button" class="tiny-button" data-network-history="${escape(device.device_id)}" aria-label="${escape(device.label)}のMCP履歴を見る">履歴を見る</button><button type="button" class="tiny-button danger" data-network-delete-device="${escape(device.device_id)}" data-network-revision="${escape(snapshot.revision)}" aria-label="${escape(device.label)}の登録を削除">削除</button></div></td></tr>`;
+            return `<tr data-id="device:${escape(device.device_id)}"><td><strong>${escape(device.label)}</strong>${device.name_conflict ? '<small class="error">同名の登録があります。IDで識別し、名前の変更か不要登録の削除で解消してください。</small>' : ""}<small>接続時のIPアドレス: ${escape(device.observed_ip ?? "未確認")}</small><details data-device-identity="device:${escape(device.device_id)}"><summary>照合用ID</summary><small>端末ID</small><code>${escape(device.device_id)}</code><small>証明書 SHA-256</small><code>${escape(device.certificate_sha256)}</code></details></td><td><span class="badge ${admission.color}">${admission.label}</span><small>${escape(admission.detail)}</small></td><td><span class="badge ${status.color}">${status.label}</span><small>${escape(status.detail)}</small><details data-network-legacy-mcp="${escape(device.device_id)}"><summary>以前のMCP連携</summary><small>${device.publications.some(profile => profile.enabled) ? "受付申告あり" : "受付の申告なし"}</small></details>${device.unsettled_jobs ? `<small>終了未確認のタスク: ${device.unsettled_jobs} 件</small>` : ""}</td><td hidden>${device.groups.map(id => `<span class="network-tag">${escape(snapshot.groups.find(group => group.id === id)?.label ?? id)}</span>`).join("") || "所属なし"}</td><td><small>最後の応答</small>${when(device.last_seen_ms)}</td><td><div class="network-row-actions">${actionButton}<button type="button" class="tiny-button" data-network-edit="${escape(device.device_id)}" data-network-revision="${escape(snapshot.revision)}" aria-label="${escape(device.label)}を管理">名前・詳細</button><button type="button" class="tiny-button" data-network-history="${escape(device.device_id)}" aria-label="${escape(device.label)}のMCP履歴を見る">履歴を見る</button><button type="button" class="tiny-button danger" data-network-delete-device="${escape(device.device_id)}" data-network-revision="${escape(snapshot.revision)}" aria-label="${escape(device.label)}の登録を削除">削除</button></div></td></tr>`;
             }).join("");
             if (renderedClientRows !== html) {
                 reconcileNetworkRows(body, html, node("network-clients-refresh"));
@@ -202,7 +227,7 @@ export function attachDeviceNetwork(host: HTMLElement, clientsHost: HTMLElement,
         }
         node("network-devices-empty").hidden = rows.length > 0;
         node("network-devices-empty").textContent = value("network-filter") === "pending" ? "条件に一致する承認待ちの申請はありません。"
-            : snapshot.devices.length || snapshot.join_requests.length ? "検索に一致する端末はありません。" : "まだ端末はありません。共通設定をDesktopへ渡し、Desktopから参加を申請してください。";
+            : snapshot.devices.length || snapshot.join_requests.length ? "検索に一致する端末はありません。" : "登録されたPCはありません。接続ファイルをDesktopで開くと、参加申請が届きます。";
         node("network-group-list").innerHTML = snapshot.groups.map(group => `<li><strong>${escape(group.label)}</strong><span>${snapshot.devices.filter(device => device.groups.includes(group.id)).length} 台</span></li>`).join("");
         const rules = node("network-rule-list");
         if (!rules.contains(document.activeElement)) rules.innerHTML = snapshot.rules.map(rule => `<article class="network-rule"><div><strong>${escape(subjectLabel(rule.from))} → ${escape(subjectLabel(rule.to))}</strong><p>${rule.usage === "direct" ? "直接の依頼" : "再委任の宛先"} · <span class="${rule.effect === "deny" ? "error" : ""}">${rule.effect === "allow" ? "許可" : "拒否"}</span> · 最大${rule.max_depth}段 · ${rule.profile_id ? escape(snapshot.devices.flatMap(device => device.publications).find(profile => profile.profile_id === rule.profile_id)?.name ?? rule.profile_id) : "公開対象すべて"}</p></div><button class="secondary" data-network-delete-rule="${escape(rule.id)}" data-network-revision="${escape(snapshot.revision)}" aria-label="${escape(subjectLabel(rule.from))}から${escape(subjectLabel(rule.to))}のルールを削除">削除</button></article>`).join("") || '<p class="subtle">接続ルールはありません。端末を参加させただけでは、ほかの端末へ依頼できません。</p>';
@@ -215,7 +240,7 @@ export function attachDeviceNetwork(host: HTMLElement, clientsHost: HTMLElement,
             if (serial !== requestSerial || !owner.accept(snapshot)) return false;
             if (!interactionActive() && !dialog.open && !deleteDialog.open) render();
             return true;
-        } catch { message("端末ネットワークの状態を取得できません。最新情報を取得してください。", true); return false; }
+        } catch { message("PCの接続状態を取得できません。最新情報を取得してください。", true); return false; }
     }
     async function acquireSnapshot(): Promise<boolean> {
         if (busy) return false;
@@ -234,8 +259,8 @@ export function attachDeviceNetwork(host: HTMLElement, clientsHost: HTMLElement,
             const result = await invoke(name, args);
             owner.saved(editor);
             if (result && typeof result === "object" && "devices" in result) owner.accept(result as NetworkSnapshot);
-            message(name === "hub_network_stop" ? "ネットワークを停止しました。" : name === "hub_network_start"
-                ? "ネットワークを開始し、起動設定を保存しました。次回は起動ショートカットで再開できます。" : "設定を更新しました。");
+            message(name === "hub_network_stop" ? "接続の受付を停止しました。" : name === "hub_network_start"
+                ? "接続の受付を開始し、起動設定を保存しました。次回は起動ショートカットで再開できます。" : "設定を更新しました。");
             receipt?.(result);
             await readSnapshot();
         } catch (error) {
@@ -259,6 +284,23 @@ export function attachDeviceNetwork(host: HTMLElement, clientsHost: HTMLElement,
         });
     });
     node("network-search").addEventListener("input", render);
+    async function hostingOptions() {
+        if (loadingOptions) return;
+        loadingOptions = true; lock();
+        try {
+            const options = await invoke<{ candidates: {label:string;ip:string}[]; error:string|null; executable:string|null }>("hub_hosting_options");
+            executable = options.executable;
+            node<HTMLSelectElement>("network-lan").innerHTML = '<option value="">接続するLANを選択（手入力も可）</option>' + options.candidates.map(row => `<option value="${escape(row.ip)}">${escape(row.label)} · ${escape(row.ip)}</option>`).join("");
+            node("network-lan-status").textContent = options.error ?? (options.candidates.length ? "接続するPCと通信できるLANのIPアドレスを選び、「接続の受付を開始」を押してください。" : "LAN候補がありません。OSのネットワーク設定で確認して手入力してください。");
+        } catch { node("network-lan-status").textContent = "候補を取得できません。IPを手入力して続けられます。"; }
+        finally { loadingOptions = false; lock(); render(); }
+    }
+    node("network-lan-refresh").addEventListener("click", () => void hostingOptions());
+    node("network-lan").addEventListener("change", () => {
+        if (!value("network-lan")) return;
+        node<HTMLInputElement>("network-ip").value = value("network-lan"); owner.touch("network-server-form");
+    });
+    node("network-firewall-copy").addEventListener("click", () => { void copyText(node("network-firewall-info").textContent ?? "").then(() => message("設定依頼をコピーしました。接続元とプロファイルは管理者が指定してください。")).catch(() => message("コピーできませんでした。表示された設定依頼を選択してコピーしてください。",true)); });
     node("network-filter").addEventListener("change", render);
     node("network-open-pending").addEventListener("click", () => {
         node<HTMLSelectElement>("network-filter").value = owner.snapshot?.join_requests.some(row => row.status === "pending") ? "pending" : "all";
@@ -293,7 +335,7 @@ export function attachDeviceNetwork(host: HTMLElement, clientsHost: HTMLElement,
     });
     const exportArgs = (): { hubUrl: string } | null => {
         const hubUrl = owner.snapshot?.server.running ? owner.snapshot.server.bind : null;
-        if (!hubUrl) { message("共通設定を取得するには、端末ネットワークを開始してください。", true); return null; }
+        if (!hubUrl) { message("共通設定を取得するには、端末接続の受付を開始してください。", true); return null; }
         return { hubUrl };
     };
     node("network-copy-config").addEventListener("click", () => {
@@ -303,7 +345,7 @@ export function attachDeviceNetwork(host: HTMLElement, clientsHost: HTMLElement,
             copiedConfigTarget = JSON.stringify([owner.snapshot!.hub_id, owner.snapshot!.server.running, owner.snapshot!.server.bind, owner.snapshot!.ca_sha256]);
             node("network-config-preview").hidden = false;
             node<HTMLTextAreaElement>("network-config-text").value = text;
-            void copyText(text).then(() => message("接続設定をコピーしました。Desktopの「moyAI Hub → 端末連携」へ貼り付けてください。"), () => {
+            void copyText(text).then(() => message("接続設定をコピーしました。Desktopの「moyAI Hub → PCの接続」へ貼り付けてください。"), () => {
                 node<HTMLDetailsElement>("network-config-preview").open = true;
                 node<HTMLTextAreaElement>("network-config-text").focus(); node<HTMLTextAreaElement>("network-config-text").select();
                 message("下の接続設定を選択しました。手動でコピーするか、接続ファイルを保存してください。", true);
@@ -369,14 +411,14 @@ export function attachDeviceNetwork(host: HTMLElement, clientsHost: HTMLElement,
             node<HTMLInputElement>("network-device-label").value = request.label;
             node<HTMLInputElement>("network-device-revoked").checked = false;
             node("network-device-revoke-details").hidden = true;
-            memberships("network-device-groups", []); node("network-device-error").textContent = request.status === "expired" ? "申請の期限が切れています。Desktopからもう一度申請してください。" : request.name_conflict ? "同名の登録または申請があります。別の端末名へ変更してから許可してください。" : "名前の変更は任意です。";
+            memberships("network-device-groups", []); node("network-device-error").textContent = request.status === "expired" ? "申請の期限が切れています。Desktopからもう一度申請してください。" : request.name_conflict ? "同名の登録または申請があります。別のPC名へ変更してから許可してください。" : "名前の変更は任意です。";
             lock(); dialog.showModal(); return;
         }
         const device = owner.snapshot.devices.find(device => device.device_id === target.dataset.networkEdit);
         if (!device) return;
         selectedClient = { kind: "device", id: device.device_id };
         owner.saved("network-device-form"); owner.revisions.set("network-device-form", target.dataset.networkRevision!);
-        node("network-device-title").textContent = "端末を管理";
+        node("network-device-title").textContent = "PCの登録を編集";
         node("network-device-save").textContent = "変更を保存";
         node("network-device-id").textContent = `端末ID: ${device.device_id}`;
         node<HTMLInputElement>("network-device-label").value = device.label;
@@ -410,5 +452,6 @@ export function attachDeviceNetwork(host: HTMLElement, clientsHost: HTMLElement,
         }, () => dialog.close());
     });
     lock();
+    void hostingOptions();
     return { refresh };
 }

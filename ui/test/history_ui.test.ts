@@ -115,8 +115,8 @@ test("Hub pending direction change ignores an old in-flight result and releases 
         oldPoll.resolve(response({ deviceId: "WinB", direction: "instruction", offset: 0, anchor: null, id: null })); await flush();
         assert.equal(node("history-rows").innerHTML, "");
         node("history-request").fire("click"); await flush();
-        assert.match(node("history-rows").innerHTML, /実行側の保存記録/);
-        assert.match(node("history-rows").innerHTML, /指示側の結果受信は、この端末では未確認/);
+        assert.match(node("history-rows").innerHTML, /実行PCの保存記録/);
+        assert.match(node("history-rows").innerHTML, /依頼元の結果受信は、この端末では未確認/);
         assert.equal(node("history-request").disabled, false);
         assert.deepEqual(calls.map(call => call.name), ["hub_history_request", "hub_history_result", "hub_history_request", "hub_history_request"]);
     });
@@ -138,13 +138,13 @@ test("Hub cached offline details expire consistently, escape markup, and export 
         assert.doesNotMatch(node("history-notice").textContent, /ダウンロードを開始しました/);
         node("history-direction").value = "instruction"; node("history-direction").fire("change");
         ui.updateNetwork(network(false));
-        assert.match(node("history-acquired").textContent, /未接続.*スナップショット/);
+        assert.match(node("history-acquired").textContent, /未接続.*取得時点の記録/);
         assert.equal(node("history-request").disabled, true);
         const beforeOffline = calls.length;
         node("history-rows").fire("click", node("history-rows").buttons[0]); await flush();
         assert.equal(calls.length, beforeOffline);
         assert.equal(node("history-detail").hidden, false);
-        assert.match(node("history-detail-acquired").textContent, /未接続.*スナップショット/);
+        assert.match(node("history-detail-acquired").textContent, /未接続.*取得時点の記録/);
         setNow(1000 + 30 * 60_000); ui.updateNetwork(network(false));
         assert.equal(node("history-detail").hidden, true);
         assert.equal(node("history-markdown").textContent, "");

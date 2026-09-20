@@ -394,7 +394,7 @@ fn shared_deadline_v9_forward_migration_is_finite_and_keeps_started_authority() 
             .db
             .pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
             .unwrap(),
-        12
+        13
     );
     for id in [&root.id, &child.job.id] {
         assert_eq!(

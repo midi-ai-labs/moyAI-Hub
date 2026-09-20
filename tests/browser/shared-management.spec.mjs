@@ -19,6 +19,8 @@ async function enroll(page,hub,label) {
   await page.locator("#network-refresh").click();
   await page.locator("#network-open-pending").click();
   await page.locator(`[data-id="request:${participant.requestId}"] button[data-network-action]`).click();
+  await page.locator("#join-project-save").click();
+  await expect(page.locator("#join-project-dialog")).not.toBeVisible();
   const {deviceId}=await participant.collectApproval(); await participant.presence();
   await page.locator("#network-clients-refresh").click();
   return {participant,deviceId};
@@ -61,9 +63,9 @@ test("one project form assigns people and both PC purposes and automatically pre
   expect(request.template_id).toBe("desktop-default");
   const preparing=await first.participant.sharedCall("snapshot");
   expect(preparing.environments.find(row=>row.id===request.environment_id).enabled).toBe(false);
-  await page.locator("#shared-admin-refresh").click(); await expect(page.locator("#shared-admin-content")).toContainText("作業フォルダを準備中");
+  await page.locator("#shared-admin-refresh").click(); await expect(page.locator("#shared-admin-content")).toContainText("作業フォルダーを準備中");
   await second.participant.sharedProvisionReceipt({...request,success:true,error:null});
-  await page.locator("#shared-admin-refresh").click(); await expect(page.locator("#shared-admin-content")).toContainText("利用可能");
+  await page.locator("#shared-admin-refresh").click(); await expect(page.locator("#shared-admin-content")).toContainText("作業フォルダー作成済み");
   await info.attach("project-pc-preparation-ready",{body:await page.locator("#shared-administration").screenshot(),contentType:"image/png"});
   await operation(page,"save_project"); await page.locator("#shared-admin-label").fill("設計プロジェクト B");
   await page.getByRole("combobox",{name:"設計担当 Alice",exact:true}).selectOption("contributor");
@@ -73,7 +75,7 @@ test("one project form assigns people and both PC purposes and automatically pre
   const shared=await first.participant.sharedCall("snapshot"); expect(shared.environments).toHaveLength(2);
   expect(shared.environments[0].resource_id).toBe(shared.environments[1].resource_id); expect(shared.resources).toHaveLength(1); expect(shared.resources[0].capacity).toBe(1);
   await page.locator("#shared-admin-refresh").click();
-  await expect(page.locator("#shared-admin-content").getByText(/解析用 PC: 利用可能/)).toHaveCount(2);
+  await expect(page.locator("#shared-admin-content").getByText(/解析用 PC: 作業フォルダー作成済み/)).toHaveCount(2);
   await operation(page,"save_project",projectId); await page.getByLabel("解析用 PCで仕事を実行する",{exact:true}).uncheck(); await save(page);
   const removed=await first.participant.sharedCall("snapshot");
   expect(removed.environments.find(row=>row.id===request.environment_id).enabled).toBe(false);
@@ -85,14 +87,63 @@ test("one project form assigns people and both PC purposes and automatically pre
   await info.attach("shared-storage-maintenance",{body:await page.locator("#shared-administration").screenshot(),contentType:"image/png"});
 });
 
-test("a concurrent project edit retains the stale people and PC draft and requires an explicit refresh",async({page,context,hub})=>{
+test("a concurrent project edit keeps its draft through comparison and repeated conflicts",async({page,context,hub},info)=>{
   await open(page,hub); await operation(page,"save_project"); await page.locator("#shared-admin-label").fill("編集中の内容");
   const other=await context.newPage(); await open(other,hub); await operation(other,"save_project");
   await other.locator("#shared-admin-label").fill("別画面の保存"); await save(other);
-  await page.locator("#shared-admin-save").click(); await expect(page.locator("#shared-admin-form-error")).toContainText("設定が変更されています");
+  await page.locator("#shared-admin-save").click(); await expect(page.locator("#shared-admin-form-error")).toContainText("入力は残っています");
   await expect(page.locator("#shared-admin-label")).toHaveValue("編集中の内容"); await expect(page.locator("#shared-admin-save")).toBeDisabled();
-  await page.locator("#shared-admin-close").click(); await page.locator("#shared-admin-refresh").click();
-  await expect(page.locator("#shared-admin-content")).toContainText("別画面の保存"); await expect(page.locator("#shared-admin-content")).not.toContainText("編集中の内容");
+  await page.locator("#shared-admin-review-conflict").click(); await expect(page.locator("#shared-admin-comparison")).toContainText("編集中の内容");
+  await expect(page.locator("#shared-admin-save")).toBeDisabled();
+  await page.locator("#shared-admin-label").fill("保持した入力を修正"); await expect(page.locator("#shared-admin-comparison")).toBeHidden();
+  await expect(page.locator("#shared-admin-save")).toBeDisabled();
+  await page.locator("#shared-admin-review-conflict").click(); await page.locator("#shared-admin-accept-comparison").click();
+  await expect(page.locator("#shared-admin-label")).toHaveValue("保持した入力を修正");
+  await operation(other,"save_project"); await other.locator("#shared-admin-label").fill("比較後の別保存"); await save(other);
+  await page.locator("#shared-admin-save").click(); await expect(page.locator("#shared-admin-form-error")).toContainText("入力は残っています");
+  await page.locator("#shared-admin-review-conflict").click();
+  await info.attach("conflict-comparison-keeps-input",{body:await page.locator("#shared-administration").screenshot(),contentType:"image/png"});
+  await page.locator("#shared-admin-accept-comparison").click(); await save(page);
+  await expect(page.locator("#shared-admin-content")).toContainText("別画面の保存");
+  await expect(page.locator("#shared-admin-content")).toContainText("保持した入力を修正");
+});
+
+test("a deleted project stays blocked during comparison and is never recreated from the draft",async({page,context,hub})=>{
+  await open(page,hub); await operation(page,"save_project"); await page.locator("#shared-admin-label").fill("削除される対象"); await save(page);
+  const row=page.locator(".shared-admin-row").filter({has:page.getByRole("heading",{name:"削除される対象",exact:true})});
+  const id=await row.locator('[data-sa-operation="save_project"]').getAttribute("data-sa-id");
+  await operation(page,"save_project",id); await page.locator("#shared-admin-label").fill("保持中の名前");
+  const other=await context.newPage(); await open(other,hub); await operation(other,"delete_project",id); await save(other);
+  await page.locator("#shared-admin-save").click(); await expect(page.locator("#shared-admin-form-error")).toContainText("入力は残っています");
+  await page.locator("#shared-admin-review-conflict").click(); await expect(page.locator("#shared-admin-comparison")).toContainText("削除されました");
+  await expect(page.locator("#shared-admin-accept-comparison")).toHaveCount(0); await expect(page.locator("#shared-admin-save")).toBeDisabled();
+  await expect(page.locator("#shared-admin-label")).toHaveValue("保持中の名前");
+  await page.locator('[data-sa-tab="users"]').click(); await expect(page.locator("#shared-admin-form")).toHaveCount(0);
+  await page.locator('[data-sa-tab="projects"]').click(); await expect(page.locator("#shared-admin-content")).not.toContainText("保持中の名前");
+});
+
+test("a delayed comparison cannot return a previous administrator draft after login changes",async({page,context,hub})=>{
+  await open(page,hub); await page.locator('[data-sa-tab="users"]').click(); await operation(page,"create_user");
+  await page.locator("#shared-admin-username").fill("comparison-admin"); await page.locator("#shared-admin-display_name").fill("比較後の管理者");
+  await page.locator("#shared-admin-password").fill("fixture-comparison-password"); await page.getByLabel("Hub管理者にする",{exact:true}).check(); await save(page);
+  await page.locator('[data-sa-tab="projects"]').click(); await operation(page,"save_project"); await page.locator("#shared-admin-label").fill("前の管理者の入力");
+  const other=await context.newPage(); await open(other,hub); await operation(other,"save_project"); await other.locator("#shared-admin-label").fill("別の保存"); await save(other);
+  await page.locator("#shared-admin-save").click(); await expect(page.locator("#shared-admin-form-error")).toContainText("入力は残っています");
+  let release; const gate=new Promise(resolve=>{release=resolve;}); let held=false;
+  await page.route("**/admin/command",async route=>{
+    if(route.request().postDataJSON()?.command!=="hub_shared_snapshot") return route.continue();
+    const response=await route.fetch(); held=true; await gate; await route.fulfill({response}).catch(()=>{});
+  });
+  try {
+    await page.locator("#shared-admin-review-conflict").click(); await expect.poll(()=>held).toBe(true);
+    await expect(page.locator('[data-sa-tab="users"]')).toBeDisabled();
+    await page.locator("#web-auth-logout").click(); await expect(page.locator("#web-auth-username")).toBeVisible(); release();
+    await page.unroute("**/admin/command");
+    await page.locator("#web-auth-username").fill("comparison-admin"); await page.locator("#web-auth-password").fill("fixture-comparison-password"); await page.locator("#web-auth-submit").click();
+    await expect(page.locator("#web-auth-user")).toHaveText("比較後の管理者");
+    await expect(page.locator("#shared-admin-content")).toContainText("別の保存");
+    await expect(page.locator("#shared-admin-form")).toHaveCount(0); await expect(page.locator("#shared-administration")).not.toContainText("前の管理者の入力");
+  } finally { release(); await page.unroute("**/admin/command"); }
 });
 
 test("a deleted final PC can be removed from both project purposes even when the editor has no PC checkboxes",async({page,hub},info)=>{

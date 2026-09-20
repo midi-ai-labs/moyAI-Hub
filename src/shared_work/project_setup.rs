@@ -27,6 +27,21 @@ pub(crate) fn controlled_projects(db: &Connection, device: &str) -> Result<Vec<S
     Ok(db.prepare("SELECT p.id FROM shared_projects p WHERE (p.legacy_devices_unrestricted=1 OR EXISTS(SELECT 1 FROM shared_project_devices d WHERE d.project_id=p.id AND d.device_id=?1 AND d.can_control=1)) ORDER BY p.id")?.query_map([device], |r|r.get(0))?.collect::<std::result::Result<_,_>>()?)
 }
 
+/// Explain only this authenticated person's readiness; disclose no unallowed project names.
+pub(crate) fn project_access(db: &Connection, user: &str, device: &str) -> Result<&'static str> {
+    let memberships: Vec<String> = db.prepare("SELECT m.project_id FROM identity_effective_project_memberships m JOIN shared_projects p ON p.id=m.project_id WHERE m.user_id=?1 AND p.archived=0")?
+        .query_map([user], |r| r.get(0))?.collect::<std::result::Result<_,_>>()?;
+    if memberships.is_empty() {
+        return Ok("no_membership");
+    }
+    let allowed = controlled_projects(db, device)?;
+    Ok(if memberships.iter().any(|id| allowed.contains(id)) {
+        "ready"
+    } else {
+        "device_not_allowed"
+    })
+}
+
 /// Legacy projects keep their old environment grants. Explicit PC projects
 /// accept only the exact workspace binding chosen by the project owner.
 pub(crate) fn environment_matches_project(
@@ -167,6 +182,37 @@ pub(super) fn save(
 fn stable_id(prefix: &str, parts: &[&str]) -> String {
     let bytes = serde_json::to_vec(parts).expect("strings serialize");
     format!("{prefix}-{:x}", Sha256::digest(bytes))
+}
+
+/// Add one reviewed PC without replacing people, other PCs or inherited roles.
+pub(super) fn assign_device(
+    db: &Connection,
+    project: &str,
+    device: &str,
+    control: bool,
+    execute: bool,
+    now: u64,
+) -> Result<()> {
+    super::store::id(project)?;
+    super::store::id(device)?;
+    if !control && !execute {
+        return Err(WorkError::Invalid);
+    }
+    let available: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM shared_projects WHERE id=?1 AND archived=0 AND legacy_devices_unrestricted=0)",[project],|r|r.get(0))?;
+    if !available {
+        return Err(WorkError::Conflict);
+    }
+    let count: u32 = db.query_row("SELECT COUNT(*) FROM shared_project_devices WHERE project_id=?1 AND (can_control=1 OR can_execute=1) AND device_id<>?2",params![project,device],|r|r.get(0))?;
+    if count >= 128 {
+        return Err(WorkError::Capacity);
+    }
+    // This approval operation adds purposes. Removing a purpose remains an
+    // explicit project edit, so a repeated join cannot revoke existing usage.
+    db.execute("INSERT INTO shared_project_devices(project_id,device_id,can_control,can_execute) VALUES(?1,?2,?3,?4) ON CONFLICT(project_id,device_id) DO UPDATE SET can_control=MAX(can_control,excluded.can_control),can_execute=MAX(can_execute,excluded.can_execute)",params![project,device,control,execute])?;
+    if execute {
+        synchronize(db, Some(device), now)?;
+    }
+    Ok(())
 }
 
 pub(super) fn synchronize(db: &Connection, runner: Option<&str>, now: u64) -> Result<()> {

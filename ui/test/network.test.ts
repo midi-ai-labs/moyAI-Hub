@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { NetworkEdits, networkAdmissionStatus, networkCertificateStatus, networkClientAction, networkClients, networkDeviceDeletion, networkDevices, networkDeviceStatus, networkDiagnosticMatches, networkDiagnosticStages, networkDiagnosticTarget, networkGatewayPort, networkHostingAddress, networkServerAddress, networkSubject, type NetworkSnapshot, type NetworkDiagnostics } from "../src/network_state.ts";
+import { NetworkEdits, networkAdmissionStatus, networkCertificateStatus, networkClientAction, networkClients, networkDeviceDeletion, networkDevices, networkDeviceStatus, networkDiagnosticMatches, networkDiagnosticStages, networkDiagnosticTarget, networkGatewayPort, networkHostingAddress, networkServerAddress, networkSetupStep, networkSubject, type NetworkSnapshot, type NetworkDiagnostics } from "../src/network_state.ts";
 
 function snapshot(revision = "9007199254740993"): NetworkSnapshot {
     return { revision, hub_id: "hub-a", ca_certificate_pem: "public-ca", ca_sha256: "digest", gateway_port: 0, hosting: { configured: false, bind: null, advertise_ip: null, error: null }, server: { running: false, bind: null, gateway_bind: null, certificate: null },
@@ -9,6 +9,24 @@ function snapshot(revision = "9007199254740993"): NetworkSnapshot {
             publications: [{ profile_id: "receiver", name: "Temp受付", enabled: true, mode: "agent", endpoint: "https://192.168.1.19:7332" }] }],
         join_requests: [], groups: [{ id: "dev", label: "開発" }, { id: "gpu", label: "GPU搭載" }], rules: [] };
 }
+
+test("connection steps start with hosting and never infer firewall or AI completion from an online PC", () => {
+    const current = snapshot();
+    assert.equal(networkSetupStep(current).anchor, "network-step-start");
+    current.server.running = true;
+    assert.equal(networkSetupStep(current).anchor, "network-step-confirm");
+    assert.match(networkSetupStep(current).detail, /Desktopで接続を診断/);
+    assert.doesNotMatch(networkSetupStep(current).detail, /完了|成功/);
+    current.devices[0].admission = "stopped";
+    assert.equal(networkSetupStep(current).anchor, "network-step-firewall");
+});
+test("pending joins take the user to approval and expired requests never count as pending", () => {
+    const current=snapshot(); current.server.running=true; current.devices=[];
+    current.join_requests=[{request_id:"request",label:"WinB",observed_ip:"192.168.1.20",key_sha256:"key",created_at_ms:1,expires_at_ms:9,status:"pending"}];
+    assert.equal(networkSetupStep(current).anchor,"clients");
+    current.join_requests[0].status="expired";
+    assert.equal(networkSetupStep(current).anchor,"network-step-firewall");
+});
 
 test("saved hosting restores its public address while stopped and preserves a dirty server editor across polls", () => {
     const current = snapshot();
@@ -51,7 +69,7 @@ test("local diagnostic reports internal checks without claiming remote reachabil
         gateway_ready: true, certificate, gateway_certificate: certificate };
     assert.equal(networkDiagnosticMatches(result, current), true);
     assert.deepEqual(networkDiagnosticStages(result, 1000).map(stage => stage.status), ["pass", "pass", "skipped"]);
-    assert.match(networkDiagnosticStages(result, 1000)[2].detail, /設定は自動で変更しません/);
+    assert.match(networkDiagnosticStages(result, 1000)[2].detail, /この診断は設定を変更しません/);
     assert.deepEqual(networkDiagnosticStages({ ...result, gateway_ready: false }, 1000).map(stage => stage.status), ["pass", "fail", "skipped"]);
     assert.deepEqual(networkDiagnosticStages(result, 2000).map(stage => stage.status), ["fail", "fail", "skipped"]);
     const target = networkDiagnosticTarget(current);
@@ -167,7 +185,7 @@ test("deletion confirms the exact identity even for duplicate names and reports 
     assert.notDeepEqual(a.args, b.args);
     assert.match(b.identity, /replacement/); assert.match(b.identity, /192\.168\.1\.20/);
     assert.match(b.warning, /2 件/); assert.match(b.warning, /停止または完了/);
-    assert.match(a.warning, /過去の履歴/); assert.match(a.warning, /停止する操作ではありません/);
+    assert.match(a.warning, /過去の履歴/); assert.match(a.warning, /この操作では止まりません/);
     first.device_id = "a later registration";
     assert.equal(a.args.deviceId, "device-a", "the confirmation target must not follow later snapshots");
 });

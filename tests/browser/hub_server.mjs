@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { access, mkdir, readFile, writeFile } from "node:fs/promises";
@@ -6,6 +6,7 @@ import { createConnection, createServer } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
+import { promisify } from "node:util";
 
 const repository = fileURLToPath(new URL("../../", import.meta.url));
 const canonical = value => path.resolve(value.startsWith("\\\\?\\") ? value.slice(4) : value);
@@ -46,14 +47,29 @@ async function binaryHash(binary) {
     return hash.digest("hex");
 }
 
-async function listenerState(port) {
+async function listenerState(port, host = "127.0.0.1") {
     return new Promise(resolve => {
-        const socket = createConnection({ host: "127.0.0.1", port });
+        const socket = createConnection({ host, port });
         const finish = state => { socket.destroy(); resolve(state); };
         socket.once("connect", () => finish("open"));
         socket.once("error", error => finish(error.code === "ECONNREFUSED" ? "closed" : `error:${error.code}`));
         socket.setTimeout(1_000, () => finish("timeout"));
     });
+}
+
+export function classifyWindowsListener(snapshot, host, port) {
+    requireValue(Array.isArray(snapshot?.listeners) && snapshot.listeners.every(row => typeof row.address === "string"
+        && Number.isInteger(row.port) && row.port > 0 && row.port <= 65535), "Windows listener snapshot is invalid");
+    return snapshot.listeners.some(row => row.port === port && [host, "0.0.0.0", "::"].includes(row.address)) ? "open" : "closed";
+}
+
+async function windowsListenerSnapshot() {
+    // A local LAN address can time out behind host policy even after its owner
+    // exits. Inspect the OS socket table instead of interpreting that as closed.
+    const command = "[Console]::OutputEncoding=[Text.UTF8Encoding]::new();$ErrorActionPreference='Stop';[pscustomobject]@{listeners=@([Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners() | ForEach-Object {[pscustomobject]@{address=$_.Address.ToString();port=$_.Port}})} | ConvertTo-Json -Depth 4 -Compress";
+    const powershell = path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+    const result = await promisify(execFile)(powershell, ["-NoProfile", "-NonInteractive", "-Command", command], { windowsHide:true, timeout:5_000, maxBuffer:128 * 1024 });
+    return JSON.parse(result.stdout);
 }
 
 /** Fresh real server shared by browser and actual Desktop adapters; never starts a device network. */
@@ -85,11 +101,13 @@ export async function startHubServer({ dataDirectory, binary: explicitBinary = p
         child.once("error", error => { spawnError = error; resolve(null); });
     });
     const listeners = new Map();
+    const privateNetworkAddresses = new Set();
     const rememberListener = (name, address) => {
         if (typeof address !== "string") return;
         const url = new URL(address.includes("://") ? address : `http://${address}`);
-        requireValue(url.hostname === "127.0.0.1" && url.port && Number(url.port) > 0, `Fixture ${name} listener must use an explicit loopback port`);
-        listeners.set(Number(url.port), name);
+        const authorized = url.hostname === "127.0.0.1" || (["network", "gateway"].includes(name) && privateNetworkAddresses.has(url.hostname));
+        requireValue(authorized && url.port && Number(url.port) > 0, `Fixture ${name} listener must use an explicitly authorized local address`);
+        listeners.set(`${url.hostname}:${url.port}`, { host:url.hostname, port:Number(url.port), name });
     };
     const request = async (route, body, timeoutMs = 30_000) => {
         requireValue(route === "health" || verifiedHost, "Hub ownership must be verified before commands or shutdown");
@@ -111,6 +129,16 @@ export async function startHubServer({ dataDirectory, binary: explicitBinary = p
         if (snapshot.server.running) { rememberListener("network", snapshot.server.bind); rememberListener("gateway", snapshot.server.gateway_bind); }
         return snapshot;
     };
+    const allowPrivateNetworkAddress = async address => {
+        // Only a dedicated real-LAN read-only preview case opts in. Ordinary
+        // tests keep loopback, and arbitrary remote/wildcard binds are forbidden.
+        const options = await command("hub_hosting_options");
+        const match = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(address);
+        const octets = match?.slice(1).map(Number);
+        const privateAddress = octets?.every(value=>value<=255) && (octets[0]===10 || (octets[0]===172 && octets[1]>=16 && octets[1]<=31) || (octets[0]===192 && octets[1]===168));
+        requireValue(privateAddress && options.candidates.some(row=>row.ip===address), "Private fixture address must be a current local LAN candidate");
+        privateNetworkAddresses.add(address);
+    };
     const close = () => closePromise ??= (async () => {
         let cleanShutdown = false;
         if (verifiedHost && child.exitCode === null && !spawnError) {
@@ -122,7 +150,19 @@ export async function startHubServer({ dataDirectory, binary: explicitBinary = p
             } catch { /* Exact-child fallback is a failed graceful cleanup. */ }
         }
         if (child.exitCode === null && !spawnError) { child.kill(); await Promise.race([exited, delay(5_000, null, { ref: false })]); }
-        const listenerStates = await Promise.all([...listeners].map(async ([port, name]) => ({ name, port, state: await listenerState(port) })));
+        let windowsSnapshot, windowsSnapshotError = false;
+        if (process.platform === "win32" && [...listeners.values()].some(row => row.host !== "127.0.0.1")) {
+            try { windowsSnapshot = await windowsListenerSnapshot(); }
+            catch { windowsSnapshotError = true; }
+        }
+        const listenerStates = await Promise.all([...listeners.values()].map(async ({host,port,name}) => {
+            if (process.platform === "win32" && host !== "127.0.0.1") {
+                let state = "error:listener-query";
+                if (!windowsSnapshotError) { try { state = classifyWindowsListener(windowsSnapshot,host,port); } catch { /* Invalid output is not proof of closure. */ } }
+                return { name, host, port, state, method:"windows-listener-table" };
+            }
+            return { name, host, port, state:await listenerState(port,host), method:"tcp-probe" };
+        }));
         let descriptorRemoved = false;
         try { await access(descriptorFile); } catch (error) { descriptorRemoved = error.code === "ENOENT"; }
         const result = { pid: child.pid, clean_shutdown: cleanShutdown, exit_code: child.exitCode,
@@ -153,9 +193,13 @@ export async function startHubServer({ dataDirectory, binary: explicitBinary = p
         rememberListener("web", web.local_url);
         if (web.remote_url) rememberListener("remote web", web.remote_url);
         const networkPort = await freePort();
-        requireValue((await observeNetwork()).server.running === false, "Hub fixture must not implicitly start the device network");
+        const network = await observeNetwork();
+        requireValue(network.server.running === false, "Hub fixture must not implicitly start the device network");
+        let gatewayPort = await freePort();
+        while (gatewayPort === networkPort) gatewayPort = await freePort();
+        await command("hub_network_settings", { expectedRevision: network.revision, gatewayPort });
         await record("hub-build", { binary, sha256: await binaryHash(binary), pid: child.pid, local_url: web.local_url, remote_url: web.remote_url });
-        return Object.freeze({ binary, dataDirectory: data, pid: child.pid, url: web.local_url, remoteUrl: web.remote_url, command, networkPort, observeNetwork, close });
+        return Object.freeze({ binary, dataDirectory: data, pid: child.pid, url: web.local_url, remoteUrl: web.remote_url, command, networkPort, gatewayPort, observeNetwork, allowPrivateNetworkAddress, close });
     } catch (error) {
         try { await close(); } catch (cleanupError) { throw new AggregateError([error, cleanupError], "Hub fixture setup and cleanup failed"); }
         throw error;

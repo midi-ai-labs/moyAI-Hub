@@ -342,6 +342,46 @@ impl DeviceNetwork {
         })
     }
 
+    /// Durable join receipt used to resume project assignment after approval.
+    /// Never infer the approved identity from a display name or observed IP.
+    pub fn approved_join_device(
+        &self,
+        request_id: &str,
+        key_sha256: &str,
+    ) -> Result<Option<String>> {
+        if !id_ok(request_id) || key_sha256.len() != 64 {
+            return Err(NetworkError::InvalidRequest);
+        }
+        if let Some(request) = self.store.join_requests.get(request_id) {
+            if request.key_sha256 != key_sha256 {
+                return Err(NetworkError::Unauthorized);
+            }
+            return Ok(None);
+        }
+        let device = self
+            .store
+            .devices
+            .values()
+            .find(|device| {
+                device
+                    .join_approval
+                    .as_ref()
+                    .is_some_and(|approval| approval.request.request_id == request_id)
+            })
+            .ok_or(NetworkError::InvalidRequest)?;
+        if device.deleted_at_ms.is_some() || device.revoked || device.stopped {
+            return Err(NetworkError::Revoked);
+        }
+        if device
+            .join_approval
+            .as_ref()
+            .is_none_or(|approval| approval.request.key_sha256 != key_sha256)
+        {
+            return Err(NetworkError::Unauthorized);
+        }
+        Ok(Some(device.device_id.clone()))
+    }
+
     pub(super) fn pending_joins(&self, now: u64) -> serde_json::Value {
         self.store.join_requests.values().map(|r| serde_json::json!({
             "request_id":r.request_id,"label":r.label,"observed_ip":r.observed_ip,"key_sha256":r.key_sha256,

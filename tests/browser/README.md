@@ -89,6 +89,8 @@ npm run verify:gui -- --headless
 
 GUI操作・DOM assertionの成功と、保存した画像を人が確認した結果は別に記録します。この試験の成功は、全GUI機能、moyAI Desktopのネイティブ操作、物理別端末、実LLM生成、外部HTTPS/proxy、長時間試験の受入を意味しません。
 
+`firewall.spec.mjs`の専用ケースだけは、Hubが読み取った現在のLAN候補から社内IPv4を明示選択し、隔離Hubの端末ネットワークをそのIPへ一時的に公開します。Web管理はloopbackのままです。ルールの照会・previewと入力変更までを操作し、apply／remove／UACは実行しません。対象IPの候補がなければこの環境受入はskipとして残り、全regression合格にはなりません。fixtureは事前に許可したIPのHub／Gatewayだけを追跡します。WindowsではLANへのTCP接続がhost policyでtimeoutになる場合があるため、正常終了とdescriptor削除に加え、OSの待受一覧でそのIP・ポートおよびwildcardの待受がないことを確認します。読取失敗やtimeoutを閉鎖済みへ読み替えません。通常のloopbackケースは従来どおりTCP接続拒否で確認します。
+
 ## 証跡と後始末
 
 `verify:gui`／`test:gui`の既定保存先は、リポジトリの隣の`project_sandbox/hub-gui/<実行日時とID>/`です。`--artifact-parent <絶対パス>`で親フォルダーを指定すると、その下に新しい実行フォルダーを作ります。`--artifacts <新しい絶対パス>`は実行フォルダーそのものを指定し、既存フォルダーの上書きを拒否します。

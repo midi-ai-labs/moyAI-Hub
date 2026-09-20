@@ -1,0 +1,12 @@
+.onboarding-steps { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit,minmax(250px,1fr)); margin: 18px 0; }
+.onboarding-steps article { border: 1px solid var(--border, #d8e0e8); border-radius: 12px; padding: 16px; background: var(--surface, #fff); }
+.onboarding-steps h3 { margin: 0 0 10px; }
+#team-onboarding > details { margin-top: 14px; }
+#team-onboarding select { max-width: 100%; }
+#hub-autostart-command { display: block; box-sizing: border-box; width: 100%; padding: 10px 12px; border: 1px solid var(--border, #d8e0e8); border-radius: 8px; font: inherit; line-height: 1.6; resize: vertical; }
+#join-project-dialog { max-width: 660px; width: calc(100% - 48px); }
+#join-project-dialog label { display: block; margin: 12px 0; }
+#join-project-dialog input:not([type=checkbox]), #join-project-dialog select { width: 100%; }
+#join-project-dialog .network-actions label { display: inline-flex; align-items: center; gap: 8px; }
+#join-project-dialog input[type=checkbox] { width: 18px; height: 18px; min-height: 18px; margin: 0; }
+#join-project-error { color: #9f2a26; }

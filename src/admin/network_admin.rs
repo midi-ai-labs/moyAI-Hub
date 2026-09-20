@@ -9,6 +9,18 @@ pub(super) struct NetworkServer {
     runtime: Arc<network::server_runtime::NetworkServerRuntime>,
     renewal: tokio::task::JoinHandle<()>,
 }
+
+pub(super) fn firewall_endpoints(server: &Option<NetworkServer>) -> Result<(&str, &str), String> {
+    let server = server
+        .as_ref()
+        .filter(|server| !server.task.is_finished())
+        .ok_or("先に社内LANのHubとGatewayを開始してください。")?;
+    let gateway = server
+        .runtime
+        .gateway_endpoint()
+        .ok_or("Gatewayの起動を確認してください。")?;
+    Ok((&server.bind, gateway))
+}
 fn message(error: NetworkError) -> String {
     match error {
         NetworkError::StaleRevision => {
@@ -271,7 +283,7 @@ async fn start_network(
     let public_ip = settings.advertise_ip;
     let mut server = admin.server.lock().await;
     if server.is_some() {
-        return Err("モデルサーバーを停止してから端末ネットワークを開始してください。必要な Gateway も一緒に起動します。".into());
+        return Err("「概要」の「従来の手動接続」を停止してから、PCの接続受付を開始してください。モデル通信のGatewayも一緒に起動します。".into());
     }
     let (certificate, key, ca, gateway_port) = {
         let mut network = owner(admin)?;

@@ -6,6 +6,7 @@ fn fixture() -> (HubCore, Selection) {
     store
         .replace_catalog(
             Catalog {
+                team_default_model_id: None,
                 models: vec![LogicalModel {
                     id: "model".into(),
                     label: "Model".into(),

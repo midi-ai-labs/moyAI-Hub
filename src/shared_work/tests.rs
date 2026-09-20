@@ -132,6 +132,8 @@ impl Fixture {
                 "
             DROP TABLE shared_project_devices;
             ALTER TABLE shared_projects DROP COLUMN legacy_devices_unrestricted;
+            DROP TABLE identity_setup_codes;
+            ALTER TABLE identity_users DROP COLUMN setup_pending;
             DROP TRIGGER identity_refresh_credentials_changed;
             DROP INDEX identity_sessions_refresh;
             ALTER TABLE identity_sessions DROP COLUMN refresh_hash;

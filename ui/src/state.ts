@@ -56,7 +56,7 @@ export interface RouteContextRow {
 export function reviewStatus(contexts: RouteContextRow[], contextId: string): string {
     const context = contexts.find(value => value.context_id === contextId);
     if (!context) return "未確認";
-    return context.review_required ? "再確認が必要" : `確認済み r${context.reviewed_revision}`;
+    return context.review_required ? "再確認が必要" : `確認済み（更新 ${context.reviewed_revision}）`;
 }
 export interface CatalogChange {
     revision: string;
@@ -74,6 +74,7 @@ export interface Snapshot {
         hub_id: string;
         revision: string;
         catalog: {
+            team_default_model_id?: string | null;
             models: LogicalModel[];
             capacity_pools: Pool[];
         };
@@ -140,7 +141,7 @@ export const availability: Record<Availability, {
     maintenance: {
         label: "メンテナンス",
         color: "amber",
-        reason: "管理者が割当候補から除外"
+        reason: "管理者がこの登録先の利用を停止しています"
     },
 };
 
@@ -173,9 +174,9 @@ export function changeSummary(change: CatalogChange): string {
     if (change.changed_model_ids.length)
         parts.push(`モデル設定変更 ${change.changed_model_ids.length} 件`);
     if (change.deployments_changed)
-        parts.push("配置の変更");
+        parts.push("モデルの登録先の変更");
     if (change.policy_changed)
-        parts.push("同時接続数・割当ルールの変更");
+        parts.push("同時接続数と接続先の選び方の変更");
     if (change.software_changed)
         parts.push("Hub の更新");
     return parts.join(" / ");

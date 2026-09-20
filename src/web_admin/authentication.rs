@@ -188,7 +188,7 @@ async fn authenticate(
     password: String,
 ) -> Response {
     if !login_allowed(&state, local.0) {
-        return (StatusCode::FORBIDDEN, Json(json!({"error":"管理者ログインにはHTTPSまたはこのPCのloopback URLを利用してください。"}))).into_response();
+        return (StatusCode::FORBIDDEN, Json(json!({"error":"管理者ログインにはHTTPSの管理URL、またはHub PC上のローカル管理画面を利用してください。"}))).into_response();
     }
     let Some(admin) = state.admin.upgrade() else {
         return failure(StatusCode::SERVICE_UNAVAILABLE);

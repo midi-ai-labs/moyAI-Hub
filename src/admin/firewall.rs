@@ -1,0 +1,601 @@
+//! Explicit, locally reviewed inbound Windows rules. The OS rule is the state owner.
+use super::*;
+use base64::Engine;
+use sha2::{Digest, Sha256};
+use std::net::Ipv4Addr;
+
+const HELPER: &str = include_str!("firewall_helper.ps1");
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Scope {
+    remote_addresses: Vec<String>,
+    profiles: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct RuleSpec {
+    name: String,
+    program: String,
+    local_address: Ipv4Addr,
+    local_ports: Vec<u16>,
+    remote_addresses: Vec<String>,
+    profile_mask: u8,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct Observed {
+    spec: RuleSpec,
+    owned: bool,
+}
+
+#[derive(Serialize)]
+struct Preview {
+    spec: RuleSpec,
+    binary_sha256: String,
+    previous: Option<RuleSpec>,
+    conflict: bool,
+    matching: bool,
+    fingerprint: String,
+}
+
+fn digest(bytes: impl AsRef<[u8]>) -> String {
+    format!("{:x}", Sha256::digest(bytes.as_ref()))
+}
+
+fn private(ip: Ipv4Addr) -> bool {
+    ip.is_private()
+}
+
+fn subnet(value: &str) -> Result<String, String> {
+    let (ip, prefix) = value.split_once('/').unwrap_or((value, "32"));
+    let ip: Ipv4Addr = ip
+        .parse()
+        .map_err(|_| "接続元は社内IPv4またはCIDRで指定してください。")?;
+    let prefix: u32 = prefix
+        .parse()
+        .map_err(|_| "CIDRの範囲を確認してください。")?;
+    if !(8..=32).contains(&prefix) {
+        return Err("接続元はRFC1918の社内IPv4範囲に限定してください。".into());
+    }
+    let mask = u32::MAX << (32 - prefix);
+    let start = u32::from(ip) & mask;
+    let end = start | !mask;
+    if !private(Ipv4Addr::from(start)) || !private(Ipv4Addr::from(end)) {
+        return Err("接続元は10/8、172.16/12、192.168/16内に限定してください。".into());
+    }
+    if start != u32::from(ip) {
+        return Err(format!(
+            "サブネットの先頭を指定してください（{}/{prefix}）。",
+            Ipv4Addr::from(start)
+        ));
+    }
+    Ok(format!("{ip}/{prefix}"))
+}
+
+fn normalize(scope: Scope) -> Result<(Vec<String>, u8), String> {
+    if scope.remote_addresses.is_empty() || scope.remote_addresses.len() > 16 {
+        return Err("許可する接続元を1〜16件指定してください。".into());
+    }
+    let mut remote = scope
+        .remote_addresses
+        .iter()
+        .map(|v| subnet(v.trim()))
+        .collect::<Result<Vec<_>, _>>()?;
+    remote.sort();
+    remote.dedup();
+    let mut mask = 0;
+    for profile in &scope.profiles {
+        mask |= match profile.as_str() {
+            "Domain" => 1,
+            "Private" => 2,
+            _ => return Err("DomainまたはPrivateプロファイルを指定してください。".into()),
+        };
+    }
+    if mask == 0 || scope.profiles.len() > 2 {
+        return Err("信頼するネットワークプロファイルを選択してください。".into());
+    }
+    Ok((remote, mask))
+}
+
+fn rule_name(program: &str, directory: &str) -> String {
+    let identity = format!(
+        "{}\n{}",
+        program.to_lowercase(),
+        directory
+            .replace('/', "\\")
+            .trim_start_matches("\\\\?\\")
+            .to_lowercase()
+    );
+    format!("moyai-hub-inbound-v1-{}", &digest(identity)[..24])
+}
+
+fn executable() -> Result<(String, String), String> {
+    let path = std::env::current_exe().map_err(|_| "実行ファイルを確認できません。")?;
+    let path = std::fs::canonicalize(path).map_err(|_| "実行ファイルを確認できません。")?;
+    let program = path
+        .to_str()
+        .ok_or("実行ファイルのパスを確認できません。")?
+        .trim_start_matches("\\\\?\\")
+        .replace('/', "\\");
+    if program.contains(['"', '\r', '\n']) || program.len() > 2048 {
+        return Err("実行ファイルのパスを確認してください。".into());
+    }
+    let bytes = std::fs::read(&path).map_err(|_| "実行ファイルを読み取れません。")?;
+    Ok((program, digest(bytes)))
+}
+
+fn preview_value(
+    spec: RuleSpec,
+    binary_sha256: String,
+    observed: Option<Observed>,
+) -> Result<Preview, String> {
+    let conflict = observed.as_ref().is_some_and(|row| {
+        !row.owned
+            || row.spec.name != spec.name
+            || !row.spec.program.eq_ignore_ascii_case(&spec.program)
+    });
+    let matching = observed.as_ref().is_some_and(|row| {
+        let mut previous = row.spec.clone();
+        previous.program = spec.program.clone();
+        row.owned && row.spec.program.eq_ignore_ascii_case(&spec.program) && previous == spec
+    });
+    let previous = observed.map(|row| row.spec);
+    let fingerprint = digest(
+        serde_json::to_vec(&(&spec, &binary_sha256, &previous, conflict))
+            .map_err(|_| "確認内容を作成できません。")?,
+    );
+    Ok(Preview {
+        spec,
+        binary_sha256,
+        previous,
+        conflict,
+        matching,
+        fingerprint,
+    })
+}
+
+fn encoded_script(script: &str) -> String {
+    base64::engine::general_purpose::STANDARD.encode(
+        script
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn payload(value: &impl Serialize) -> Result<String, String> {
+    Ok(base64::engine::general_purpose::STANDARD
+        .encode(serde_json::to_vec(value).map_err(|_| "確認内容を作成できません。")?))
+}
+
+fn elevation_script(encoded: &str) -> String {
+    format!(
+        "try {{ $p=Start-Process -FilePath (Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe') -ArgumentList '-NoProfile -NonInteractive -EncodedCommand {encoded}' -Verb RunAs -WindowStyle Hidden -PassThru -Wait; exit $p.ExitCode }} catch {{ $cause=$_.Exception; for($i=0; $i -lt 4 -and $null -ne $cause; $i++) {{ if ($cause -is [ComponentModel.Win32Exception] -and $cause.NativeErrorCode -eq 1223) {{ exit 20 }}; $cause=$cause.InnerException }}; exit 23 }}"
+    )
+}
+
+#[cfg(windows)]
+fn powershell() -> Result<PathBuf, String> {
+    Ok(
+        PathBuf::from(std::env::var_os("SystemRoot").ok_or("Windowsの場所を確認できません。")?)
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe"),
+    )
+}
+
+#[cfg(windows)]
+async fn run_script(script: &str, timeout: u64) -> Result<std::process::Output, String> {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+    let mut child = tokio::process::Command::new(powershell()?)
+        .args(["-NoProfile", "-NonInteractive", "-Command", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .creation_flags(0x08000000)
+        .spawn()
+        .map_err(|_| "Windowsファイアウォールの設定を読み取れません。")?;
+    let mut input = child.stdin.take().ok_or("確認処理の入力を開けません。")?;
+    // Windows PowerShell's line-oriented -Command - can silently leave a
+    // multiline function incomplete. Send one fixed decoding expression;
+    // the decoded source is our embedded asset, never browser-provided code.
+    let encoded = encoded_script(script);
+    let input_script = format!(
+        "& ([scriptblock]::Create([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('{encoded}'))))\n"
+    );
+    input
+        .write_all(input_script.as_bytes())
+        .await
+        .map_err(|_| "確認内容を送れません。")?;
+    drop(input);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(timeout),
+        child.wait_with_output(),
+    )
+    .await
+    .map_err(|_| "操作の結果を確認できません。再実行せず、現在のルールを再確認してください。")?
+    .map_err(|_| "操作の結果を読み取れません。現在のルールを再確認してください。".into())
+}
+
+fn observation_script(name: &str) -> String {
+    format!(
+        "{HELPER}\n[Console]::OutputEncoding=[Text.UTF8Encoding]::new(); [pscustomobject]@{{observed=(Get-MoyaiRule '{name}')}} | ConvertTo-Json -Depth 8 -Compress"
+    )
+}
+
+fn decode_observation(bytes: &[u8]) -> Result<Option<Observed>, String> {
+    if bytes.len() > 32 * 1024 {
+        return Err("ファイアウォールからの応答が大きすぎるため、読み取れません。".into());
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Envelope {
+        observed: Value,
+    }
+    let invalid = || {
+        "既存のファイアウォールのルールと照合できません。PC管理者に確認してください。".to_owned()
+    };
+    let packet: Envelope = serde_json::from_slice(bytes).map_err(|_| invalid())?;
+    serde_json::from_value(packet.observed).map_err(|_| invalid())
+}
+
+async fn observe(name: &str) -> Result<Option<Observed>, String> {
+    #[cfg(windows)]
+    {
+        let script = observation_script(name);
+        let result = run_script(&script, 15).await?;
+        if !result.status.success() || result.stdout.len() > 32 * 1024 {
+            return Err(
+                "ファイアウォールのルールを読み取れません。PC管理者に確認してください。".into(),
+            );
+        }
+        decode_observation(&result.stdout)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = name;
+        Err("ファイアウォールの設定はWindowsのHub PCで利用できます。".into())
+    }
+}
+
+fn listener_target(endpoints: (&str, &str, &str)) -> Result<(Ipv4Addr, Vec<u16>), String> {
+    let (hub, gateway, advertised) = endpoints;
+    let hub = reqwest::Url::parse(hub).map_err(|_| "稼働中のHubを確認できません。")?;
+    let gateway = reqwest::Url::parse(gateway).map_err(|_| "稼働中のGatewayを確認できません。")?;
+    let local_address: Ipv4Addr = advertised
+        .parse()
+        .map_err(|_| "この設定は社内IPv4のHubで利用できます。")?;
+    if !private(local_address)
+        || [&hub, &gateway]
+            .iter()
+            .any(|url| url.scheme() != "https" || url.host_str() != Some(advertised))
+    {
+        return Err(
+            "この設定は社内IPv4のHubとGatewayに限定しています。PC管理者へ設定を依頼してください。"
+                .into(),
+        );
+    }
+    let mut local_ports = vec![
+        hub.port_or_known_default()
+            .ok_or("Hubのポートを確認できません。")?,
+        gateway
+            .port_or_known_default()
+            .ok_or("Gatewayのポートを確認できません。")?,
+    ];
+    local_ports.sort();
+    local_ports.dedup();
+    if local_ports.len() != 2 || local_ports.contains(&0) {
+        return Err("HubとGatewayのポートを確認してください。".into());
+    }
+    Ok((local_address, local_ports))
+}
+
+async fn prepare(
+    admin: &Admin,
+    scope: Scope,
+    endpoints: (&str, &str, &str),
+) -> Result<Preview, String> {
+    let (remote_addresses, profile_mask) = normalize(scope)?;
+    let (local_address, local_ports) = listener_target(endpoints)?;
+    let (program, binary_sha256) = executable()?;
+    let directory = std::fs::canonicalize(admin.path.parent().ok_or("保存先がありません。")?)
+        .map_err(|_| "保存先を確認できません。")?;
+    let name = rule_name(
+        &program,
+        directory.to_str().ok_or("保存先を確認できません。")?,
+    );
+    let spec = RuleSpec {
+        name,
+        program,
+        local_address,
+        local_ports,
+        remote_addresses,
+        profile_mask,
+    };
+    let observed = observe(&spec.name).await?;
+    preview_value(spec, binary_sha256, observed)
+}
+
+pub(super) async fn preview(admin: &Admin, scope: Scope) -> Result<Value, String> {
+    let server = admin.network_server.lock().await;
+    let (hub, gateway) = network_admin::firewall_endpoints(&server)?;
+    let advertised = admin
+        .network_hosting
+        .lock()
+        .map_err(|_| "公開設定を確認できません。")?
+        .configured()?
+        .advertise_ip
+        .to_string();
+    output(prepare(admin, scope, (hub, gateway, &advertised)).await?)
+}
+
+pub(super) async fn change(
+    admin: &Admin,
+    scope: Scope,
+    expected: String,
+    remove: bool,
+) -> Result<Value, String> {
+    // Keep this exact pair of listeners stable through the bounded local approval.
+    // The elevated helper expires before this lock can be released on timeout.
+    let server = admin.network_server.lock().await;
+    let (hub, gateway) = network_admin::firewall_endpoints(&server)?;
+    let advertised = admin
+        .network_hosting
+        .lock()
+        .map_err(|_| "公開設定を確認できません。")?
+        .configured()?
+        .advertise_ip
+        .to_string();
+    let current = prepare(admin, scope, (hub, gateway, &advertised)).await?;
+    if current.conflict || current.fingerprint != expected {
+        return Err(
+            "接続先・実行ファイル・ルールが変わりました。変更内容を再確認してください。".into(),
+        );
+    }
+    if (remove && current.previous.is_none()) || (!remove && current.matching) {
+        return Ok(json!({"status":"unchanged","preview":current}));
+    }
+    let request = json!({"action":if remove {"remove"} else {"apply"},"spec":current.spec,"previous":current.previous,"binary_sha256":current.binary_sha256,"expires_at_ms":now_ms()+60_000});
+    let body = payload(&request)?;
+    let child_script = format!(
+        "{HELPER}\ntry {{ $request=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{body}')) | ConvertFrom-Json; Invoke-MoyaiFirewall $request; exit 0 }} catch {{ exit 22 }}"
+    );
+    let encoded = encoded_script(&child_script);
+    if encoded.len() > 30_000 {
+        return Err("設定内容が上限を超えています。接続元の範囲を整理してください。".into());
+    }
+    #[cfg(windows)]
+    let outcome = {
+        // The child command is a fixed embedded asset plus typed base64 JSON.
+        // No temporary elevated script/result file or web-supplied path is used.
+        let launcher = elevation_script(&encoded);
+        match run_script(&launcher, 90).await {
+            Ok(result) => result.status.code(),
+            Err(_) => None,
+        }
+    };
+    #[cfg(not(windows))]
+    let outcome: Option<i32> = None;
+    let observed = observe(&current.spec.name).await;
+    match observed {
+        Ok(observed) => {
+            let after = preview_value(current.spec, current.binary_sha256, observed)?;
+            let verified = if remove {
+                after.previous.is_none()
+            } else {
+                after.matching && !after.conflict
+            };
+            let status = if outcome == Some(0) && verified {
+                "verified"
+            } else if outcome == Some(20) {
+                "cancelled"
+            } else {
+                "unconfirmed"
+            };
+            Ok(json!({"status":status,"preview":after}))
+        }
+        Err(_) => Ok(json!({"status":"unconfirmed","preview":null})),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn listener_target_consumes_the_running_https_projections_and_never_loopback_or_other_hosts() {
+        assert_eq!(
+            listener_target((
+                "https://192.168.1.2:9471",
+                "https://192.168.1.2:9472",
+                "192.168.1.2"
+            ))
+            .unwrap(),
+            ("192.168.1.2".parse().unwrap(), vec![9471, 9472])
+        );
+        assert!(
+            listener_target((
+                "https://127.0.0.1:9471",
+                "https://127.0.0.1:9472",
+                "127.0.0.1"
+            ))
+            .is_err()
+        );
+        assert!(
+            listener_target((
+                "https://192.168.1.2:9471",
+                "https://192.168.1.3:9472",
+                "192.168.1.2"
+            ))
+            .is_err()
+        );
+        assert!(
+            listener_target((
+                "http://192.168.1.2:9471",
+                "https://192.168.1.2:9472",
+                "192.168.1.2"
+            ))
+            .is_err()
+        );
+        assert!(
+            listener_target((
+                "https://192.168.1.2:9471",
+                "https://192.168.1.2:9471",
+                "192.168.1.2"
+            ))
+            .is_err()
+        );
+    }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_powershell_executes_embedded_functions_and_query_through_the_real_transport() {
+        // Override the only OS query reached by this absent-rule fixture.
+        // No NetSecurity module or host Firewall state is accessed.
+        let script = format!(
+            "{HELPER}\nfunction Get-NetFirewallRule {{ [CmdletBinding()] param($PolicyStore,$Name) return }}\n[Console]::OutputEncoding=[Text.UTF8Encoding]::new(); $r=Get-MoyaiRule 'moyai-hub-inbound-v1-aaaaaaaaaaaaaaaaaaaaaaaa'; @{{reached='末尾まで実行';absent=($null -eq $r)}} | ConvertTo-Json -Compress"
+        );
+        let result = run_script(&script, 15).await.unwrap();
+        assert!(result.status.success());
+        let value: Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(value["reached"], "末尾まで実行");
+        assert_eq!(value["absent"], true);
+        let script = format!(
+            "function Get-NetFirewallRule {{ [CmdletBinding()] param($PolicyStore,$Name) return }}\n{}",
+            observation_script("moyai-hub-inbound-v1-aaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        let absent = run_script(&script, 15).await.unwrap();
+        assert!(absent.status.success());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&absent.stdout).unwrap(),
+            json!({"observed":null})
+        );
+        assert!(decode_observation(&absent.stdout).unwrap().is_none());
+        assert!(decode_observation(b" \r\n").is_err());
+        assert!(decode_observation(b"{}").is_err());
+        assert!(decode_observation(b"null").is_err());
+        assert_eq!(
+            run_script("exit 22", 15).await.unwrap().status.code(),
+            Some(22)
+        );
+        for (code, expected) in [(1223, 20), (5, 23)] {
+            let mock = format!(
+                "function Start-Process {{ throw [InvalidOperationException]::new('launch failed',[ComponentModel.Win32Exception]::new({code})) }}\n{}",
+                elevation_script("not-executed")
+            );
+            assert_eq!(
+                run_script(&mock, 15).await.unwrap().status.code(),
+                Some(expected)
+            );
+        }
+    }
+    #[test]
+    fn scopes_are_explicit_private_and_canonical() {
+        for invalid in [
+            "Any",
+            "0.0.0.0/0",
+            "192.168.0.0/8",
+            "172.0.0.0/8",
+            "127.0.0.1",
+            "8.8.8.8",
+            "192.168.1.4/24",
+            "192.168.1.1;whoami",
+        ] {
+            assert!(subnet(invalid).is_err(), "{invalid}");
+        }
+        assert_eq!(subnet("192.168.1.4").unwrap(), "192.168.1.4/32");
+        for valid in ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"] {
+            assert_eq!(subnet(valid).unwrap(), valid);
+        }
+        assert!(
+            normalize(Scope {
+                remote_addresses: vec!["10.1.1.1".into()],
+                profiles: vec!["Public".into()]
+            })
+            .is_err()
+        );
+        assert!(
+            normalize(Scope {
+                remote_addresses: vec![],
+                profiles: vec!["Private".into()]
+            })
+            .is_err()
+        );
+    }
+    fn spec() -> RuleSpec {
+        RuleSpec {
+            name: rule_name("C:\\Hub\\moyai-hub.exe", "C:\\Data"),
+            program: "C:\\Hub\\moyai-hub.exe".into(),
+            local_address: "192.168.1.2".parse().unwrap(),
+            local_ports: vec![9471, 9472],
+            remote_addresses: vec!["192.168.1.0/24".into()],
+            profile_mask: 2,
+        }
+    }
+    #[test]
+    fn preview_tracks_exact_rule_executable_and_scopes_without_an_extra_receipt() {
+        let s = spec();
+        let a = preview_value(s.clone(), "old".into(), None).unwrap();
+        let matching = preview_value(
+            s.clone(),
+            "old".into(),
+            Some(Observed {
+                spec: s.clone(),
+                owned: true,
+            }),
+        )
+        .unwrap();
+        assert!(matching.matching);
+        assert!(!matching.conflict);
+        assert_ne!(a.fingerprint, matching.fingerprint);
+        let changed = preview_value(
+            s.clone(),
+            "new".into(),
+            matching
+                .previous
+                .clone()
+                .map(|spec| Observed { spec, owned: true }),
+        )
+        .unwrap();
+        assert_ne!(matching.fingerprint, changed.fingerprint);
+        let conflict = preview_value(
+            s.clone(),
+            "old".into(),
+            Some(Observed {
+                spec: s.clone(),
+                owned: false,
+            }),
+        )
+        .unwrap();
+        assert!(conflict.conflict);
+        let mut other = s.clone();
+        other.program = "C:\\Other\\moyai-hub.exe".into();
+        assert!(
+            preview_value(
+                s,
+                "old".into(),
+                Some(Observed {
+                    spec: other,
+                    owned: true
+                })
+            )
+            .unwrap()
+            .conflict
+        );
+    }
+    #[test]
+    fn rule_identity_separates_installations_and_profiles() {
+        assert_eq!(
+            rule_name("C:\\Hub.exe", "C:\\Data"),
+            rule_name("c:\\hub.exe", "\\\\?\\C:\\Data")
+        );
+        assert_ne!(
+            rule_name("C:\\Hub.exe", "C:\\Data"),
+            rule_name("C:\\Other.exe", "C:\\Data")
+        );
+        assert_ne!(
+            rule_name("C:\\Hub.exe", "C:\\Data"),
+            rule_name("C:\\Hub.exe", "C:\\Other")
+        );
+    }
+}

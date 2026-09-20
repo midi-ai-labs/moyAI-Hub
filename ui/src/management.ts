@@ -106,12 +106,12 @@ export async function authenticate(
         });
         const value = await response.json();
         if (expectedGeneration !== authenticationGeneration) throw staleAuthentication;
-        if (!response.ok) throw typeof value.error === "string" ? value.error : "認証操作を完了できませんでした。";
+        if (!response.ok) throw typeof value.error === "string" ? value.error : "ログイン状態を変更できませんでした。";
         const accepted = acceptSession(readSession(value), expectedGeneration);
         sessionRequest = Promise.resolve(accepted);
         return accepted;
     } catch (error) {
-        throw typeof error === "string" ? error : "認証操作の結果を確認できません。接続を確認してログイン状態を再確認してください。";
+        throw typeof error === "string" ? error : "ログイン状態を確認できません。接続を確かめて「ログイン状態を再確認」を押してください。";
     } finally { clearTimeout(timer); }
 }
 export class ManagementFailure extends Error {
@@ -126,7 +126,7 @@ async function browserInvoke<T>(command: string, args: Record<string, unknown>, 
     if (expectedGeneration !== authenticationGeneration) throw staleAuthentication;
     if (!session.authentication.login_allowed || !session.authentication.user?.administrator) throw "管理者としてログインしてください。";
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 35_000);
+    const timer = setTimeout(() => controller.abort(), command === "hub_firewall_apply" || command === "hub_firewall_remove" ? 130_000 : 35_000);
     try {
         const response = await fetch("/admin/command", {
             method: "POST", credentials: "same-origin", cache: "no-store", signal: controller.signal,
@@ -150,7 +150,7 @@ async function browserInvoke<T>(command: string, args: Record<string, unknown>, 
         throw typeof error === "string" ? error : "操作結果を確認できません。最新状態を取得して確認してください。操作は自動で再実行されません。";
     } finally { clearTimeout(timer); }
 }
-export function invokeSharedAdmin<T>(command: "hub_shared_snapshot" | "hub_shared_command" | "hub_shared_retention_preview" | "hub_shared_maintenance", args: Record<string, unknown> = {}): Promise<T> {
+export function invokeSharedAdmin<T>(command: "hub_shared_snapshot" | "hub_shared_command" | "hub_shared_retention_preview" | "hub_shared_maintenance" | "hub_join_project", args: Record<string, unknown> = {}): Promise<T> {
     return browserInvoke<T>(command, args, true);
 }
 function download(text: string, name: string, mime: string): string {
@@ -175,12 +175,12 @@ export async function copyText(text: string): Promise<void> {
 export async function invoke<T = unknown>(command: string, args: Record<string, unknown> = {}): Promise<T> {
     if (command === "hub_network_save_config") {
         const value = await browserInvoke<{ toml: string }>("hub_network_export", args);
-        return download(value.toml, "hub-config.toml", "application/toml;charset=utf-8") as T;
+        return download(value.toml, "hub-config.moyai-join", "application/toml;charset=utf-8") as T;
     }
     if (command === "hub_history_export") {
         const value = await browserInvoke<{ device_label: string; device_id: string; completed_at_ms: number | null; requested_at_ms: number; response: { markdown?: string } | null }>("hub_history_result", args);
         if (typeof value.response?.markdown !== "string") throw "履歴の詳細を取得してから保存してください。";
-        const markdown = `# Hubから取得したMCP履歴\n\n- 端末: ${value.device_label.replace(/[\r\n]/g, " ")}\n- 端末ID: \`${value.device_id}\`\n- 取得日時（Unix ms）: ${value.completed_at_ms ?? value.requested_at_ms}\n- 取得済みのスナップショットです。現在の実行状態を保証しません。\n\n${value.response.markdown}`;
+        const markdown = `# Hubから取得したMCP履歴\n\n- 端末: ${value.device_label.replace(/[\r\n]/g, " ")}\n- 端末ID: \`${value.device_id}\`\n- 取得日時（Unix ms）: ${value.completed_at_ms ?? value.requested_at_ms}\n- 取得時点の記録です。現在の実行状態はDesktopで確認してください。\n\n${value.response.markdown}`;
         return download(markdown, "moyai-mcp-history.md", "text/markdown;charset=utf-8") as T;
     }
     return browserInvoke<T>(command, args);

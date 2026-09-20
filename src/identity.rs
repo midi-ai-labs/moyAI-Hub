@@ -12,7 +12,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::num::NonZeroU32;
 mod remembered;
+mod setup;
 pub use remembered::{RememberedSession, login_remembered, logout_remembered, refresh_session};
+pub use setup::{
+    IssuedSetupCode, complete_password_setup, create_user_with_setup_code, reissue_setup_code,
+    revoke_setup_code,
+};
 
 pub const MIGRATION_SQL: &str = include_str!("../migrations/V2__shared_identity.sql");
 const PASSWORD_ITERATIONS: u32 = 600_000;
@@ -117,6 +122,7 @@ pub struct UserRecord {
     pub display_name: String,
     pub administrator: bool,
     pub disabled: bool,
+    pub setup_pending: bool,
 }
 
 /// Run once inside the database owner's forward migration transaction.
@@ -242,7 +248,7 @@ fn principal_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Principal> {
 pub fn list_users(conn: &Connection, actor: &Principal) -> Result<Vec<UserRecord>> {
     require_admin(conn, actor)?;
     let mut statement = conn.prepare(
-        "SELECT id,username,display_name,administrator,disabled FROM identity_users ORDER BY username LIMIT 4096",
+        "SELECT id,username,display_name,administrator,disabled,setup_pending FROM identity_users ORDER BY username LIMIT 4096",
     )?;
     Ok(statement
         .query_map([], |r| {
@@ -252,6 +258,7 @@ pub fn list_users(conn: &Connection, actor: &Principal) -> Result<Vec<UserRecord
                 display_name: r.get(2)?,
                 administrator: r.get(3)?,
                 disabled: r.get(4)?,
+                setup_pending: r.get(5)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?)
@@ -269,16 +276,20 @@ pub fn update_user(
     write(conn, || {
         require_admin(conn, actor)?;
         let display_name = display_name_checked(display_name)?;
-        let old: Option<(bool, bool)> = conn
+        let old: Option<(bool, bool, bool)> = conn
             .query_row(
-                "SELECT administrator,disabled FROM identity_users WHERE id=?1",
+                "SELECT administrator,disabled,setup_pending FROM identity_users WHERE id=?1",
                 [user_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        let Some((was_admin, was_disabled)) = old else {
+        let Some((was_admin, was_disabled, setup_pending)) = old else {
             return Err(IdentityError::Invalid("user"));
         };
+        // An account whose owner cannot sign in must not satisfy the last-admin rule.
+        if administrator && setup_pending {
+            return Err(IdentityError::Conflict);
+        }
         if was_admin
             && !was_disabled
             && (!administrator || disabled)
@@ -323,7 +334,7 @@ pub fn set_password(
         if conn.execute(
             "UPDATE identity_users SET password_algorithm='pbkdf2_sha256',password_iterations=?2,
              password_salt=?3,password_hash=?4,credential_generation=credential_generation+1,
-             failed_logins=0,blocked_until_ms=0,updated_at_ms=?5 WHERE id=?1",
+             failed_logins=0,blocked_until_ms=0,setup_pending=0,updated_at_ms=?5 WHERE id=?1",
             params![
                 user_id,
                 PASSWORD_ITERATIONS,

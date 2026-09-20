@@ -236,7 +236,7 @@ impl SharedWork {
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.pragma_update(None, "synchronous", "FULL")?;
         let version: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 12 {
+        if version > 13 {
             return Err(WorkError::Conflict);
         }
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -289,7 +289,12 @@ impl SharedWork {
         if version < 12 {
             tx.execute_batch(include_str!("../../migrations/V12__project_devices.sql"))?;
         }
-        tx.pragma_update(None, "user_version", 12)?;
+        if version < 13 {
+            tx.execute_batch(include_str!(
+                "../../migrations/V13__initial_password_setup.sql"
+            ))?;
+        }
+        tx.pragma_update(None, "user_version", 13)?;
         tx.commit()?;
         let check: String = db.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
         if check != "ok" {

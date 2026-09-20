@@ -27,6 +27,7 @@ type ApiResult<T> = std::result::Result<Json<T>, (StatusCode, Json<Value>)>;
 pub(crate) fn router(store: SharedStore, network: crate::network::SharedNetwork) -> Router {
     Router::new()
         .route("/v1/shared/login", post(login))
+        .route("/v1/shared/setup-password", post(setup_password))
         .route("/v1/shared/refresh", post(refresh))
         .route("/v1/shared/session", get(session))
         .route("/v1/shared/logout", post(logout))
@@ -287,6 +288,36 @@ struct Login {
     username: String,
     password: String,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PasswordSetup {
+    username: String,
+    code: String,
+    password: String,
+}
+async fn setup_password(
+    State(state): State<ApiState>,
+    Extension(device): Extension<DeviceIdentity>,
+    Json(input): Json<PasswordSetup>,
+) -> ApiResult<identity::RememberedSession> {
+    let permit = state
+        .login_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| error(WorkError::Capacity))?;
+    operation(state, device.clone(), DeviceAccess::Current, move |store| {
+        let _permit = permit;
+        Ok(identity::complete_password_setup(
+            store.identity_connection(),
+            &input.username,
+            &input.code,
+            &input.password,
+            &device.device_id,
+            crate::service::now_ms(),
+        )?)
+    })
+    .await
+}
 async fn login(
     State(state): State<ApiState>,
     Extension(device): Extension<DeviceIdentity>,
@@ -364,16 +395,18 @@ async fn session(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Extension(device): Extension<DeviceIdentity>,
-) -> ApiResult<identity::SessionStatus> {
+) -> ApiResult<Value> {
     let token = token(&headers).map_err(error)?;
     operation(state, device.clone(), DeviceAccess::Current, move |store| {
-        Ok(identity::session_status(
+        let session = identity::session_status(
             &store.db,
             &token,
             SessionAudience::SharedWork,
             Some(&device.device_id),
             crate::service::now_ms(),
-        )?)
+        )?;
+        let access = super::project_setup::project_access(&store.db, &session.principal.user_id, &device.device_id)?;
+        Ok(json!({"principal":session.principal,"expires_at_ms":session.expires_at_ms,"project_access":access}))
     })
     .await
 }

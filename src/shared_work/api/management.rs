@@ -48,7 +48,8 @@ pub(crate) fn project_device_targets(command: &ManagementCommand) -> Option<Vec<
                 .cloned()
                 .collect(),
         ),
-        ManagementRequest::RetryProjectDevice { device_id, .. } => Some(vec![device_id.clone()]),
+        ManagementRequest::RetryProjectDevice { device_id, .. }
+        | ManagementRequest::AssignProjectDevice { device_id, .. } => Some(vec![device_id.clone()]),
         _ => None,
     }
 }

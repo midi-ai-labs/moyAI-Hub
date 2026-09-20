@@ -34,7 +34,7 @@ Hubは独立したRustサーバーであり、`Admin`と`HubCore`、端末ネッ
 | 独立Web listener・設定保存、loopback HTTPと明示したHTTP/HTTPS/同一PCproxy、公開CLIの自動開始と設定復元 | [web_admin/server.rs](../src/web_admin/server.rs)、[host_process.rs](../src/host_process.rs)、[admin.rs](../src/admin.rs) | [server/tests.rs](../src/web_admin/server/tests.rs)、設定・寿命・待受失敗と復元、[導入・終了手順](web-management.md) |
 | 認証なしWeb、固定Host/Originと起動世代付きCSRF、管理command allowlist、静的画面の埋込み | [web_admin.rs](../src/web_admin.rs)、[build.rs](../build.rs)、[management.ts](../ui/src/management.ts)、[web_admin.ts](../ui/src/web_admin.ts) | [web_admin/tests.rs](../src/web_admin/tests.rs)、[browser smoke](../tests/browser/web-admin.spec.mjs)、[導入・終了手順](web-management.md) |
 | 入力 draft、focus、候補取得の generation、Grid 描画、操作 feedback | [main.ts](../ui/src/main.ts)、[state.ts](../ui/src/state.ts)、[style.css](../ui/src/style.css) | [state.test.ts](../ui/test/state.test.ts)、実ブラウザー操作 |
-| 接続端末の申請/承認/停止一覧、所属・方向付き許可の draft と revision 照合、公開設定の受け渡し | [network.ts](../ui/src/network.ts)、[network_state.ts](../ui/src/network_state.ts) | [network.test.ts](../ui/test/network.test.ts) |
+| 接続PCの申請/承認/停止一覧、所属・方向付き許可の draft と revision 照合、公開設定の受け渡し | [network.ts](../ui/src/network.ts)、[network_state.ts](../ui/src/network_state.ts) | [network.test.ts](../ui/test/network.test.ts) |
 | MCP履歴の端末・方向選択、ページと詳細、取得日時・未接続表示、遅延応答の対象照合 | [history.ts](../ui/src/history.ts)、[history_state.ts](../ui/src/history_state.ts) | [history.test.ts](../ui/test/history.test.ts)、実ブラウザー操作 |
 
 永続 catalog と現在の観測は分けて扱う。サーバー再起動で model client、lease、permit、モデル一覧の観測を復元しない。ブラウザーの再読込だけではサーバー内の状態を維持する。端末ネットワークの CA・端末 ID・グループ・許可と受入jobの認可経路・root取消は保持する。サーバー再起動時の presence と短期資格は復元せず、現在の公開先と端末証明書で再取得する。認可の保持・退役は [Gateway の実行境界](gateway.md#仕事の認可記録と診断) を参照する。画面の入力と選択は TypeScript が保持し、保存・副作用の可否はサーバーの Rust owner が判定する。

@@ -334,6 +334,11 @@ fn browser_command(command: &str) -> bool {
     matches!(
         command,
         "hub_web_status"
+            | "hub_autostart_status"
+            | "hub_autostart_set"
+            | "hub_firewall_preview"
+            | "hub_firewall_apply"
+            | "hub_firewall_remove"
             | "hub_start"
             | "hub_stop"
             | "hub_network_start"
@@ -343,7 +348,9 @@ fn browser_command(command: &str) -> bool {
             | "hub_refresh"
             | "hub_register"
             | "hub_edit"
+            | "hub_set_standard_model"
             | "hub_network_snapshot"
+            | "hub_hosting_options"
             | "hub_network_settings"
             | "hub_network_diagnostics"
             | "hub_network_renew_certificate"
@@ -362,6 +369,7 @@ fn browser_command(command: &str) -> bool {
             | "hub_shared_command"
             | "hub_shared_retention_preview"
             | "hub_shared_maintenance"
+            | "hub_join_project"
     )
 }
 async fn command(
@@ -385,6 +393,17 @@ async fn command(
     if !browser_command(&input.command) || !input.args.is_object() {
         return failure(StatusCode::FORBIDDEN);
     }
+    if matches!(
+        input.command.as_str(),
+        "hub_autostart_status"
+            | "hub_autostart_set"
+            | "hub_firewall_preview"
+            | "hub_firewall_apply"
+            | "hub_firewall_remove"
+    ) && !local.0
+    {
+        return failure(StatusCode::FORBIDDEN);
+    }
     let Ok(permit) = admin.web_access.slots.clone().try_acquire_owned() else {
         return failure(StatusCode::TOO_MANY_REQUESTS);
     };
@@ -394,6 +413,7 @@ async fn command(
             | "hub_shared_command"
             | "hub_shared_retention_preview"
             | "hub_shared_maintenance"
+            | "hub_join_project"
     ) {
         let token = match authentication::request_token(&headers) {
             Ok(token) => token,
@@ -403,12 +423,20 @@ async fn command(
     }
     // Dispatch can own blocking filesystem work. A caller timeout/disconnect must not
     // release its concurrency slot while that actual work is still running.
+    let timeout_seconds = if matches!(
+        input.command.as_str(),
+        "hub_firewall_apply" | "hub_firewall_remove"
+    ) {
+        125
+    } else {
+        30
+    };
     let operation = tokio::spawn(async move {
         let _permit = permit;
         admin.dispatch(&input.command, input.args).await
     });
     // A lost response is not replayed: revision/identity checks remain in the shared owner.
-    match tokio::time::timeout(Duration::from_secs(30), operation).await {
+    match tokio::time::timeout(Duration::from_secs(timeout_seconds), operation).await {
         Ok(Ok(Ok(value))) => {
             let Ok(bytes) = serde_json::to_vec(&json!({"result": value})) else { return failure(StatusCode::INTERNAL_SERVER_ERROR); };
             if bytes.len() > 4 * 1024 * 1024 { return failure(StatusCode::PAYLOAD_TOO_LARGE); }

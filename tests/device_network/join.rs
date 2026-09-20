@@ -1,5 +1,59 @@
 use super::*;
 
+#[test]
+fn project_assignment_resumes_from_exact_approved_join_and_rejects_a_different_key() {
+    let mut f = Fixture::new();
+    let (_, csr) = csr();
+    let request = f
+        .owner
+        .request_join("準備PC".into(), &csr, ip(), f.now)
+        .unwrap();
+    let snapshot = f.owner.snapshot(f.now);
+    let key = snapshot["join_requests"][0]["key_sha256"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        f.owner
+            .approved_join_device(&request.request_id, &key)
+            .unwrap(),
+        None
+    );
+    assert!(
+        f.owner
+            .approved_join_device(&request.request_id, &"0".repeat(64))
+            .is_err()
+    );
+    f.owner
+        .approve_join(
+            &f.owner.revision(),
+            &request.request_id,
+            "準備PC".into(),
+            BTreeSet::new(),
+            f.now,
+        )
+        .unwrap();
+    let id = f
+        .owner
+        .approved_join_device(&request.request_id, &key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        f.owner
+            .approved_join_device(&request.request_id, &key)
+            .unwrap(),
+        Some(id.clone())
+    );
+    f.owner
+        .set_admission(&f.owner.revision(), &id, true)
+        .unwrap();
+    assert!(
+        f.owner
+            .approved_join_device(&request.request_id, &key)
+            .is_err()
+    );
+}
+
 fn csr_at(key: &str, address: IpAddr, common_name: Option<&str>) -> String {
     let key = rcgen::KeyPair::from_pem(key).unwrap();
     let mut params = rcgen::CertificateParams::new(vec![address.to_string()]).unwrap();

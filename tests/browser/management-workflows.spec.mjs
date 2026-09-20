@@ -60,6 +60,13 @@ test("Model registration, profile discovery, edit and deletion use the real cata
         await expect(page.locator("#metric-revision")).toHaveText(registered.store.revision);
         await expect(page.locator("#revision-rows")).toContainText("モデル追加 1 件");
 
+        await expect(page.locator("#team-standard-status")).toContainText("未指定");
+        const standardId = registered.store.catalog.models[0].id;
+        await page.locator("#team-standard-model").selectOption(standardId);
+        await page.locator("#team-standard-save").click();
+        await expect(page.locator("#team-standard-status")).toHaveText("初めて接続するPCのモデル：Alpha <Hub> & tools。Desktopでサンプルを実行してください。");
+        expect((await hub.command("hub_snapshot")).store.catalog.team_default_model_id).toBe(standardId);
+
         await row.getByRole("button", { name: /を編集/ }).click();
         await expect(page.locator("#edit-dialog")).toBeVisible();
         await page.mouse.click(4, 4);
@@ -92,11 +99,12 @@ test("Model registration, profile discovery, edit and deletion use the real cata
         await page.locator("#close-edit").click();
         expect((await hub.command("hub_snapshot")).deployments).toHaveLength(1);
         await row.getByRole("button", { name: /を編集/ }).click();
-        await expect(page.locator("#remove-model")).toHaveText("配置を削除");
+        await expect(page.locator("#remove-model")).toHaveText("この登録先を削除");
         await page.locator("#remove-model").click();
         await page.locator("#remove-model").click();
         await expect(row).toHaveCount(0);
         await expect(page.locator("#models-empty")).toBeVisible();
+        await expect(page.locator("#team-standard-model")).toHaveValue("");
         await expect(page.locator("#revision-rows")).toContainText("モデル削除 1 件");
         await page.reload();
         await expect(page.locator("#model-rows tr")).toHaveCount(0);
@@ -198,11 +206,12 @@ test("Project drafts preserve focused input across polling and reject another br
         await expect(page.locator("#shared-admin-label")).toHaveValue("入力を保持するプロジェクト");
         await expect(page.locator("#shared-admin-label")).toBeFocused();
         await page.locator("#shared-admin-save").click();
-        await expect(page.locator("#shared-admin-form-error")).toContainText("設定が変更されています");
+        await expect(page.locator("#shared-admin-form-error")).toContainText("入力は残っています");
+        await expect(page.locator("#shared-admin-notice")).toContainText("最新の設定と比較");
         await screenshot(page,testInfo,"project-stale-revision");
         await page.locator("#shared-admin-close").click(); await page.locator("#shared-admin-refresh").click();
         await expect(page.locator("#shared-admin-content")).toContainText("別画面のプロジェクト");
-        await page.getByRole("link", { name: "接続端末", exact: false }).first().click();
+        await page.getByRole("link", { name: "接続PC", exact: false }).first().click();
         await page.locator("#network-filter").selectOption("pending");
         await expect(page.locator("#network-devices-empty")).toContainText("条件に一致する承認待ち");
         await page.locator("#network-search").fill("no-such-device"); await polls(page);
@@ -217,10 +226,13 @@ test("Network diagnostics and certificate renewal preserve expanded details and 
     await expect(page.locator("#network-diagnose")).toBeDisabled();
     const details = page.locator('details[data-details-key="network-connection-details"]');
     await details.locator("summary").click();
+    const gatewayDetails = page.locator("#network-gateway-settings");
+    await expect(page.locator("#network-settings-form")).toBeHidden();
+    await gatewayDetails.locator("summary").click();
     await page.locator("#network-gateway-port").fill("65536");
     await page.getByRole("button", { name: "ポート設定を保存", exact: true }).click();
     await expect(page.locator("#network-notice")).toContainText("1〜65535");
-    expect((await hub.command("hub_network_snapshot")).gateway_port).toBe(0);
+    expect((await hub.command("hub_network_snapshot")).gateway_port).toBe(hub.gatewayPort);
     await page.locator("#network-gateway-port").fill("0");
     await page.getByRole("button", { name: "ポート設定を保存", exact: true }).click();
     await expect(page.locator("#network-notice")).toContainText("ポート設定を保存しました");
@@ -236,6 +248,7 @@ test("Network diagnostics and certificate renewal preserve expanded details and 
     await page.locator("#network-gateway-port").fill("12345");
     await polls(page, 3);
     await expect(details).toHaveAttribute("open", "");
+    await expect(gatewayDetails).toHaveAttribute("open", "");
     await expect(page.locator("#network-gateway-port")).toBeFocused();
     await expect(page.locator("#network-gateway-port")).toHaveValue("12345");
     await expect(page.locator("#network-diagnostic-result")).toBeVisible();

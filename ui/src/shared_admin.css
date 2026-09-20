@@ -18,3 +18,7 @@
 .shared-admin-pc-table { width: 100%; border-collapse: collapse; margin-block: 12px; }
 .shared-admin-pc-table th, .shared-admin-pc-table td { padding: 10px; text-align: left; border-bottom: 1px solid var(--border); }
 .shared-admin-pc-table input { width: auto; }
+#shared-admin-comparison { border: 1px solid #b0c0a9; border-radius: 8px; padding: 14px; min-width: 0; }
+#shared-admin-comparison table { width: 100%; border-collapse: collapse; font-size: 13px; }
+#shared-admin-comparison th, #shared-admin-comparison td { text-align: left; vertical-align: top; padding: 8px; border-bottom: 1px solid #d3dccd; overflow-wrap: anywhere; }
+#shared-admin-comparison .shared-admin-changed { background: #fff1d6; }

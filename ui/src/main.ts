@@ -6,6 +6,10 @@ import { attachDeviceNetwork } from "./network.ts";
 import { attachHistory } from "./history.ts";
 import { attachWebManagement } from "./web_admin.ts";
 import { attachSharedAdmin } from "./shared_admin.ts";
+import { attachOnboarding } from "./onboarding.ts";
+import { attachJoinProject } from "./join_project.ts";
+import { attachAutostart } from "./autostart.ts";
+import { attachStandardModel } from "./standard_model.ts";
 import "./history.css";
 import "./web_admin.css";
 import "./style.css";
@@ -114,6 +118,8 @@ function render(next: Snapshot) {
     snapshot = next;
     const models = next.store.catalog.models, pools = next.store.catalog.capacity_pools;
     setText("metric-models", models.length);
+    onboarding.updateModels(models.length);
+    standardModel.update(next);
     setText("nav-model-count", models.length);
     setText("metric-hosts", `${next.deployments.length} 件の登録先`);
     const confirmed = modelCounts(next.deployments);
@@ -156,7 +162,7 @@ function render(next: Snapshot) {
         return `<tr><td><strong>${escape(client.label)}</strong><small>${escape(client.id)}</small></td><td>${escape(client.observed_ip)}</td><td><span class="badge ${color}"><i class="dot ${color}"></i>${label}</span></td><td><small>Main: ${escape(contextText("main"))}</small><small>Side Chat: ${escape(contextText("side_chat"))}</small></td><td>${time(client.last_seen_ms)}</td></tr>`;
     }).join(""));
     el("clients-empty").hidden = next.clients.length > 0;
-    markup("revision-rows", [...next.store.changes].reverse().map(change => `<div class="revision-row"><b>r${escape(change.revision)}</b><span>${escape(changeSummary(change))}</span><small>${new Date(change.changed_at_ms).toLocaleString("ja-JP")}</small></div>`).join(""));
+    markup("revision-rows", [...next.store.changes].reverse().map(change => `<div class="revision-row"><b>更新 ${escape(change.revision)}</b><span>${escape(changeSummary(change))}</span><small>${new Date(change.changed_at_ms).toLocaleString("ja-JP")}</small></div>`).join(""));
     el("revisions-empty").hidden = next.store.changes.length > 0;
 }
 async function poll() {
@@ -300,7 +306,7 @@ el<HTMLFormElement>("register-form").addEventListener("submit", async (event) =>
                 allow_tools: input("allow-tools").checked
             }
         });
-        notify("モデルを登録しました。カタログの変更は接続端末の再確認対象になります。");
+        notify("モデルを登録しました。Desktopで更新後のモデル設定を確認してください。");
         if (discoveryOwner.accepts(generation)) {
             select("model").value = "";
             input("label").value = "";
@@ -390,7 +396,7 @@ el("model-rows").addEventListener("click", event => {
     input("edit-capacity").value = String(snapshot.store.catalog.capacity_pools.find(pool => pool.id === row.deployment.capacity_pool_id)?.max_concurrent ?? 1);
     setText("edit-target", `${row.deployment.provider_model} · ${row.deployment.endpoint}`);
     setText("edit-error", "");
-    setText("remove-model", "配置を削除");
+    setText("remove-model", "この登録先を削除");
     button("remove-model").dataset.confirm = "";
     dialog.showModal();
 });
@@ -416,7 +422,7 @@ async function saveEdit(remove: boolean) {
             }
         });
         dialog.close();
-        notify(remove ? "モデル配置を削除しました。" : "配置設定を保存しました。カタログの revision を更新しました。");
+        notify(remove ? "モデルの登録先を削除しました。" : "モデルの登録先を変更しました。Desktopで更新後のモデル設定を確認してください。");
         await poll();
     }
     catch (error) {
@@ -437,22 +443,32 @@ button("remove-model").addEventListener("click", () => {
     else {
         button("remove-model").dataset.confirm = "yes";
         setText("remove-model", "削除を確定");
-        setText("edit-error", "この配置を削除します。最後の配置の場合は論理モデルも削除され、端末の再設定が必要になります。");
+        setText("edit-error", "このモデルの登録先を削除します。登録先がこれだけの場合はモデル自体も削除されます。利用中のDesktopでは、別のモデルを選び直す必要があります。");
     }
 });
 const history = attachHistory(el("mcp-history"));
 const webManagement = attachWebManagement();
+const onboardingHost = document.createElement("section");
+onboardingHost.id = "team-onboarding";
+onboardingHost.className = "panel";
+el("overview").after(onboardingHost);
+const onboarding = attachOnboarding(onboardingHost, { project: id => sharedAdministration.openProject(id), user: () => sharedAdministration.openUser() });
+attachAutostart(onboardingHost);
+const standardModel = attachStandardModel(el("models"), poll);
+const joinProject = attachJoinProject(el("management-app"), () => { void deviceNetwork.refresh(); void sharedAdministration.refresh(); });
 const sharedAdministrationHost = document.createElement("section");
 sharedAdministrationHost.id = "shared-administration";
 sharedAdministrationHost.className = "panel";
 el("device-network").before(sharedAdministrationHost);
-const sharedAdministration = attachSharedAdmin(sharedAdministrationHost);
+const sharedAdministration = attachSharedAdmin(sharedAdministrationHost, value => { onboarding.updateShared(value); joinProject.updateShared(value); });
 document.addEventListener("click", event => {
     const target = (event.target as HTMLElement).closest<HTMLButtonElement>("button[data-network-history]");
     if (target && !target.disabled) history.showDevice(target.dataset.networkHistory!);
 });
 const deviceNetwork = attachDeviceNetwork(el("device-network"), el("network-clients-management"), interactionActive, network => {
     history.updateNetwork(network);
+    onboarding.updateNetwork(network);
+    joinProject.updateNetwork(network);
     sharedAdministration.updateDevices(network.devices);
     const pendingCount = network.join_requests.filter(request => request.status === "pending").length;
     setText("metric-clients", network.devices.length);

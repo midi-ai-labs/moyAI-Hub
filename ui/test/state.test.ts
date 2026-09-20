@@ -29,7 +29,7 @@ test("revision summary carries model removal and capacity review reasons", () =>
         deployments_changed: false,
         policy_changed: true,
         software_changed: false
-    }), "モデル削除 1 件 / 同時接続数・割当ルールの変更");
+    }), "モデル削除 1 件 / 同時接続数と接続先の選び方の変更");
 });
 
 test("gateway status reports current Hub communications without claiming provider execution state", () => {
@@ -63,7 +63,7 @@ test("model counts report catalog presence without inferring loaded model counts
 });
 test("Main review does not imply Side review and revision text stays precise", () => {
     const contexts = [{context_id:"main",reviewed_revision:"9007199254740993",review_required:false,active_model_id:null}];
-    assert.equal(reviewStatus(contexts, "main"), "確認済み r9007199254740993");
+    assert.equal(reviewStatus(contexts, "main"), "確認済み（更新 9007199254740993）");
     assert.equal(reviewStatus(contexts, "side_chat"), "未確認");
     contexts[0].review_required = true;
     assert.equal(reviewStatus(contexts, "main"), "再確認が必要");

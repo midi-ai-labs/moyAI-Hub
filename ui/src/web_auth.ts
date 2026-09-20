@@ -14,7 +14,7 @@ export function authenticationError(error: unknown): string {
     };
     return typeof error === "string" && messages[error] ? messages[error]
         : typeof error === "string" && /[ぁ-んァ-ン一-龯]/.test(error) ? error
-        : "認証操作を完了できませんでした。入力と接続を確認して再試行してください。";
+        : "ログイン状態を変更できませんでした。入力と接続を確認して再試行してください。";
 }
 
 /** The management module is loaded only after an authenticated administrator is known. */
@@ -61,7 +61,7 @@ export function attachWebAuthentication(
                     ? "初回設定が必要です。Hubと同じPCで、直接接続した管理画面を開いて管理者を設定してください。"
                     : user ? "この管理画面は管理者のみ利用できます。管理者アカウントでログインしてください。"
                     : bootstrap ? "このHubを管理する最初のアカウントを作成します。"
-                    : "モデル・端末・接続の設定を管理するには、管理者アカウントでログインしてください。"}</p>
+                    : "モデル・利用者・PCの設定を管理するには、管理者アカウントでログインしてください。"}</p>
                 ${formAllowed ? `<form id="web-auth-form">
                     <label>ユーザー名<input id="web-auth-username" name="username" autocomplete="username" maxlength="64" autocapitalize="none" spellcheck="false" required autofocus></label>
                     ${bootstrap ? '<label>表示名<input id="web-auth-display-name" name="display_name" autocomplete="name" maxlength="256" required></label>' : ""}

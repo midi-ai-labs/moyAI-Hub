@@ -2,15 +2,15 @@
 
 Hub のサーバープロセスは catalog、端末、選択、revision、turn、lease、request ID と中継接続数のメタデータを扱います。管理画面は通常のWebブラウザーで開き、Rustサーバーの管理APIへ接続します。prompt / response は Desktop からさらに別 process の Gateway に送られ、Gateway が provider に転送します。サーバーが同じ `moyai-hub` 実行ファイルを `--gateway` で起動し、Gateway の秘密情報はサーバーとの stdin パイプだけで初期化します。モデルの load / unload、推論のキューとスケジューリング、生成の開始・終了は oMLX / LM Studio などの provider が所有します。Hub は provider 内の実行状態を管理・推定しません。
 
-Gateway の管理用待受は一時的な IPv4 loopback port です。従来の同一 PC 接続はこの HTTP 経路を使います。Hub の「端末ネットワーク」を開始した場合は、同じ子プロセスに別ポートの **相互 TLS が必須の生成用 listener** を開きます。Hub のメタデータ listener と生成本文を処理する listener は別で、生成用 listener に管理 API は公開しません。生成用ポートは詳細設定で固定でき、0 は自動選択です。固定ポートが使用中なら開始を拒否し、自動ポートへ切り替えません。変更は次回開始から適用します。組織の Firewall では両ポートを確認してください。アプリは Firewall 規則を作成しません。
+Gateway の管理用待受は一時的な IPv4 loopback port です。従来の同一 PC 接続はこの HTTP 経路を使います。Hub の「端末ネットワーク」を開始した場合は、同じ子プロセスに別ポートの **相互 TLS が必須の生成用 listener** を開きます。Hub のメタデータ listener と生成本文を処理する listener は別で、生成用 listener に管理 API は公開しません。生成用ポートは「PCの接続」で指定し、新規保存先では9472が標準です。既存の0は自動選択として維持します。固定ポートが使用中なら開始を拒否し、自動ポートへ切り替えません。変更は次回開始から適用します。組織の Firewall では両ポートを確認してください。WindowsのHub PCでは、[限定した受信許可](firewall.md)をローカル画面で確認し、UACを経て明示設定できます。
 
 ## 管理画面とサーバーの寿命
 
 通常起動する`moyai-hub`が保存先の排他lock、catalog / DeviceNetwork、端末認証、Web / metadata / TLS listenerとGatewayを所有します。公開CLIは保存済み設定でWeb管理を自動開始し、integration testも同じ起動経路を使います。ブラウザーを閉じたり強制終了したりしてもサーバーとGatewayは停止しません。起動・保存先・公開設定は[Web管理の手順](web-management.md)を参照してください。
 
-ブラウザー管理commandは固定Host/OriginとCSRFを照合したWeb APIから同じ`Admin`へ渡します。現在のWebには管理者ログインがありません。CLIの状態確認・終了は別のprivate loopback制御へBearer認証で接続します。この資格情報は利用者限定ファイルで保護し、Web・ログ・Desktop配布用の共通設定へ載せません。端末のmTLSと実行許可はこのWeb構成変更と独立しています。catalogと端末設定の読み書きはサーバーの`Admin`が一元所有します。
+ブラウザー管理commandは固定Host/Origin・CSRF・管理者本人の用途別セッションを照合したWeb APIから同じ`Admin`へ渡します。管理者はHub PCで初回設定し、以後はログインします。別PCからの管理にはHTTPSを使います。CLIの状態確認・終了は別のprivate loopback制御へBearer認証で接続します。この資格情報は利用者限定ファイルで保護し、Web・ログ・Desktop配布用の共通設定へ載せません。端末のmTLSと実行許可はこのWeb構成変更と独立しています。catalogと端末設定の読み書きはサーバーの`Admin`が一元所有します。
 
-ブラウザーの「ネットワークを停止」は端末向けlistenerとGatewayを停止し、サーバープロセスとWeb管理を維持します。サーバー自体を終了する操作は`--stop [--data-dir <保存先>]`、またはforegroundサーバーのCtrl+Cです。Windowsサービス登録、ログオン時の自動起動、OS再起動後の自動復旧は実装していません。
+ブラウザーの「接続の受付を停止」は端末向けlistenerとGatewayを停止し、サーバープロセスとWeb管理を維持します。サーバー自体を終了する操作は`--stop [--data-dir <保存先>]`、またはforegroundサーバーのCtrl+Cです。Windowsのログオン時には、Hub PCのローカル管理画面から任意登録した `--launch --no-browser` が保存済みのHub・Gateway設定を再開します。[チームの初期設定](team-preparation.md)を参照してください。Windowsサービス、ログオン前・サインアウト後の稼働や外部AIの自動起動は対象外です。
 
 ## 認証と実要求
 
@@ -67,7 +67,7 @@ core の期限付き permit は予約計算です。Gateway は未使用予約�
 
 Gateway process は `gateway-execution.lock` を保持して同じ保存先からの子プロセスの重複起動を防ぎます。このロックはローカルの process を表し、provider の実行状態ではありません。listener の bind や TLS 検証に失敗した場合は、その起動エラーを返します。旧版の `gateway-uncertain.json` は過去の記録として変更せずに残しますが、現行版は読み書きせず、起動・割当の条件に使いません。provider の全生成が止まったことを管理者に確認させる操作もありません。
 
-「ネットワークを停止」と Hub サーバーの明示終了は、TLS 受付・モデル管理・Gateway を同じ停止経路へ通します。ブラウザーやタブの終了はこの経路を呼びません。CA、永続端末 ID、グループ、許可、受入済みの仕事の認可経路と root 取消を保持します。通信停止では presence と60秒の短期資格を破棄し、端末が公開先を再通知してから同じ仕事の照会・停止資格を得ます。受入済みの仕事は24時間を超えても時間だけで破棄しません。受入通知が不明な intent は `recovery_required` として受入側の永続台帳を照合し、自動再実行しません。モデル client / 未使用 permit は別の一時状態です。端末失効や公開 OFF は新規受付の拒否であり、既に claim したモデル要求の終了を意味しません。
+「接続の受付を停止」と Hub サーバーの明示終了は、TLS 受付・モデル管理・Gateway を同じ停止経路へ通します。ブラウザーやタブの終了はこの経路を呼びません。CA、永続端末 ID、グループ、許可、受入済みの仕事の認可経路と root 取消を保持します。通信停止では presence と60秒の短期資格を破棄し、端末が公開先を再通知してから同じ仕事の照会・停止資格を得ます。受入済みの仕事は24時間を超えても時間だけで破棄しません。受入通知が不明な intent は `recovery_required` として受入側の永続台帳を照合し、自動再実行しません。モデル client / 未使用 permit は別の一時状態です。端末失効や公開 OFF は新規受付の拒否であり、既に claim したモデル要求の終了を意味しません。
 
 Hub サーバーの明示停止や終了、サーバープロセスの消滅によって stdin が閉じると、Gateway は新規受付を閉じ、未使用予約を失効させ、自身の HTTP 処理へ取消を通知します。ブラウザーの消滅ではサーバーと Gateway のパイプは閉じません。後始末の待機は最大2秒です。サーバーは子の完了通知を最大3秒待ち、通常終了を確認できなければローカルの Gateway 子プロセスを終了させます。provider のプロセスは終了させません。ローカル終了の確認に失敗した場合はその状態を表示し、生存中の同じ子プロセスに重ねて起動しません。
 

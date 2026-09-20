@@ -57,7 +57,7 @@ test("Every page link and explanatory disclosure opens its own current target", 
     }
     for (const summary of [
         "中継経路の詳しい説明", "従来の手動接続（Hubと同じPC内）", "モデルの確認と同時接続数の詳しい説明",
-        "モデル接続の生存確認（詳細）",
+        "モデルを利用するPCの接続状態（詳細）",
     ]) {
         const control = page.getByText(summary, { exact: true });
         const details = control.locator("..");
@@ -295,11 +295,12 @@ test("Network bind validation and explicit automatic Gateway setting preserve st
         await expect(page.locator("#network-ip")).toHaveValue(ip); await expect(page.locator("#network-port")).toHaveValue(port);
     }
     await page.locator('details[data-details-key="network-connection-details"] > summary').click();
+    await page.locator("#network-gateway-settings > summary").click();
     for (const input of ["-1", "1.5", "abc"]) {
         await page.locator("#network-gateway-port").fill(input);
         await page.locator("#network-settings-form button").click();
         await expect(page.locator("#network-notice")).toContainText("1〜65535");
-        expect((await hub.command("hub_network_snapshot")).gateway_port).toBe(0);
+        expect((await hub.command("hub_network_snapshot")).gateway_port).toBe(hub.gatewayPort);
     }
     await page.locator("#network-gateway-port").fill("");
     await page.locator("#network-settings-form button").click();
@@ -338,6 +339,8 @@ test("Project PC purposes can be changed independently without inheriting anothe
     for(const label of ["PC one","PC two"]){
         const participant=await createDeviceParticipant(network,label); await page.locator("#network-clients-refresh").click();
         await page.locator(`[data-id="request:${participant.requestId}"] button[data-network-action]`).click();
+        await page.locator("#join-project-save").click();
+        await expect(page.locator("#join-project-dialog")).not.toBeVisible();
         const approval=await participant.collectApproval(); ids.push(approval.deviceId); await participant.presence();
     }
     await page.locator("#network-clients-refresh").click(); await page.locator('nav a[href="#shared-administration"]').click();
@@ -361,6 +364,8 @@ test("Device disclosure drafts remain intact while legacy rule API choices remai
     await page.locator("#network-clients-refresh").click();
     const requestRow = page.locator(`[data-id="request:${participant.requestId}"]`);
     await requestRow.locator("button[data-network-action]").click();
+    await page.locator("#join-project-save").click();
+    await expect(page.locator("#join-project-dialog")).not.toBeVisible();
     await expect(requestRow).toHaveCount(0);
     const approval = await participant.collectApproval(); expect(approval.status).toBe("approved");
     await participant.presence();

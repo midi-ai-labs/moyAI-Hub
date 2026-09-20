@@ -24,6 +24,9 @@ pub(super) async fn command(
             crate::service::now_ms(),
         )?;
         store.expire_start_deadlines(crate::service::now_ms())?;
+        if input.command == "hub_join_project" {
+            return approve_and_assign(&admin, &mut store, &actor, input.args);
+        }
         if input.command == "hub_shared_snapshot" {
             if !input.args.as_object().is_some_and(|v| v.is_empty()) {
                 return Err(WorkError::Invalid);
@@ -80,5 +83,101 @@ pub(super) async fn command(
         Ok(Ok(Ok(value))) => Json(json!({"result":value})).into_response(),
         Ok(Ok(Err(error))) => crate::shared_work::api::error(error).into_response(),
         _ => crate::shared_work::api::error(IdentityError::Unavailable.into()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct JoinProject {
+    request_id: String,
+    key_sha256: String,
+    label: String,
+    expected_network_revision: String,
+    command_id: String,
+    expected_shared_revision: String,
+    project: Option<JoinPurpose>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JoinPurpose {
+    id: String,
+    can_control: bool,
+    can_execute: bool,
+}
+
+fn approve_and_assign(
+    admin: &Admin,
+    store: &mut crate::shared_work::SharedWork,
+    actor: &identity::Principal,
+    args: Value,
+) -> crate::shared_work::Result<Value> {
+    identity::require_admin(store.identity_connection(), actor)?;
+    let input: JoinProject = serde_json::from_value(args).map_err(|_| WorkError::Invalid)?;
+    let snapshot = store.management_snapshot(actor)?;
+    let mut network = admin
+        .network
+        .lock()
+        .map_err(|_| IdentityError::Unavailable)?;
+    let approved = network
+        .approved_join_device(&input.request_id, &input.key_sha256)
+        .map_err(|_| WorkError::Conflict)?;
+    if approved.is_none() {
+        if let Some(project) = &input.project {
+            if (!project.can_control && !project.can_execute)
+                || !snapshot["projects"].as_array().is_some_and(|rows| {
+                    rows.iter().any(|row| {
+                        row["id"] == project.id
+                            && row["archived"] == false
+                            && row["legacy_devices_unrestricted"] == false
+                    })
+                })
+            {
+                return Err(WorkError::Invalid);
+            }
+        }
+    }
+    let device = if let Some(device) = approved {
+        device
+    } else {
+        network
+            .approve_join(
+                &input.expected_network_revision,
+                &input.request_id,
+                input.label,
+                Default::default(),
+                crate::service::now_ms(),
+            )
+            .map_err(|_| WorkError::Conflict)?;
+        network
+            .approved_join_device(&input.request_id, &input.key_sha256)
+            .map_err(|_| WorkError::Conflict)?
+            .ok_or(WorkError::Conflict)?
+    };
+    network
+        .self_projection(&device, crate::service::now_ms())
+        .map_err(|_| WorkError::Forbidden)?;
+    // Network JSON and shared SQLite are different owners. A project error
+    // must return the durable approved device, never pretend approval rolled back.
+    if let Some(project) = input.project {
+        let command = ManagementCommand {
+            request_id: input.command_id,
+            expected_revision: input.expected_shared_revision,
+            request: crate::shared_work::ManagementRequest::AssignProjectDevice {
+                project_id: project.id,
+                device_id: device.clone(),
+                can_control: project.can_control,
+                can_execute: project.can_execute,
+            },
+        };
+        match store.manage(actor, &command, crate::service::now_ms()) {
+            Ok(snapshot) => Ok(
+                json!({"device_id":device,"project_saved":true,"error":null,"snapshot":snapshot}),
+            ),
+            Err(error) => Ok(
+                json!({"device_id":device,"project_saved":false,"error":error.to_string(),"snapshot":store.management_snapshot(actor)?}),
+            ),
+        }
+    } else {
+        Ok(json!({"device_id":device,"project_saved":true,"error":null,"snapshot":snapshot}))
     }
 }

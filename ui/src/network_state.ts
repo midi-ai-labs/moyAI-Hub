@@ -50,6 +50,16 @@ export interface NetworkSnapshot {
     rules: NetworkRule[];
 }
 
+/** Suggestions use observed Hub facts; an online PC is not proof of a usable LAN or AI. */
+export function networkSetupStep(snapshot: NetworkSnapshot): { title: string; detail: string; anchor: string; action: string } {
+    if (!snapshot.server.running) return { title: "1. Hubの接続先を設定して開始", detail: "参加するPCと通信できるLANとHubポートを選びます。モデル通信用ポートは必要な場合だけ変更してください。", anchor: "network-step-start", action: "接続先を設定する" };
+    const pending = snapshot.join_requests.filter(request => request.status === "pending").length;
+    if (pending) return { title: `4. 参加申請が${pending}台届いています`, detail: "申請元のPCを確かめて許可し、そのDesktopで接続を診断してください。", anchor: "clients", action: "参加申請を開く" };
+    const allowed = snapshot.devices.filter(device => !device.revoked && device.admission === "allowed");
+    if (allowed.length) return { title: "4. 参加したPCで接続を診断", detail: `参加を許可したPCは${allowed.length}台、現在接続中は${allowed.filter(device => device.online).length}台です。Desktopで接続を診断し、使えることを確かめたら残りのPCへ同じ接続ファイルを渡します。`, anchor: "network-step-confirm", action: "Desktopでの確認手順を見る" };
+    return { title: "2. 受信許可を設定して最初のPCを接続", detail: "Hubは起動しています。Windowsの受信許可を設定し、接続ファイルを最初の1台へ渡してください。", anchor: "network-step-firewall", action: "受信許可の手順へ" };
+}
+
 export interface NetworkDiagnostics {
     hub_id: string;
     metadata_endpoint: string;
@@ -85,7 +95,7 @@ export function networkDiagnosticStages(result: NetworkDiagnostics, checkedAt: n
             ? `${result.gateway_endpoint} の受付と、有効なサーバー証明書を確認しました。`
             : "Gatewayの受付または有効な証明書を確認できません。稼働状態を確認してください。" },
         { label: "別端末からの到達とWindowsファイアウォール", status: "skipped", detail:
-            "Hub内の確認だけでは別端末から届くかは判定できません。Desktopの「Hubへの接続を診断」を実行してください。Windowsのファイアウォールでは、このHubの受信TCPポートとGatewayの受信TCPポートを確認してください。設定は自動で変更しません。" },
+            "接続するPCのDesktopで「Hubへの接続を診断」を実行してください。そのPCでHubのAIも使う場合は「PCの接続 → 接続の詳細・診断 → このPCでHubのAIを使う場合の診断」も実行します。接続できない場合は、HubとGatewayの受信TCPポートがファイアウォールで許可されているか確認してください。この診断は設定を変更しません。" },
     ];
 }
 
@@ -145,8 +155,8 @@ export function networkSubject(value: string): NetworkSubject | null {
     return delimiter > 0 && id && (kind === "device" || kind === "group") ? { kind, id } : null;
 }
 export function networkDeviceStatus(device: NetworkDevice): { label: string; color: string; detail: string } {
-    if (!device.online) return { label: "オフライン", color: "gray", detail: "有効な端末接続を確認できません。" };
-    return { label: "オンライン", color: "green", detail: "端末からの接続を確認しています。使い方はプロジェクトで設定します。" };
+    if (!device.online) return { label: "オフライン", color: "gray", detail: "このPCからの接続がありません。" };
+    return { label: "オンライン", color: "green", detail: "このPCはHubに接続しています。依頼や実行に使うプロジェクトを設定してください。" };
 }
 /** Capture the exact reviewed device, including when its label is duplicated. */
 export function networkDeviceDeletion(device: NetworkDevice, revision: string): {
@@ -154,9 +164,9 @@ export function networkDeviceDeletion(device: NetworkDevice, revision: string): 
 } {
     return {
         args: { expectedRevision: revision, deviceId: device.device_id },
-        identity: `${device.label}\n端末ID: ${device.device_id}\n観測IP: ${device.observed_ip ?? "未確認"}\n登録IP: ${device.registered_ip ?? "未確認"}\n接続: ${device.online ? "オンライン" : "オフライン"}\n証明書 SHA-256: ${device.certificate_sha256}`,
+        identity: `${device.label}\n端末ID: ${device.device_id}\n接続時のIPアドレス: ${device.observed_ip ?? "未確認"}\n登録IP: ${device.registered_ip ?? "未確認"}\n接続: ${device.online ? "オンライン" : "オフライン"}\n証明書 SHA-256: ${device.certificate_sha256}`,
         warning: device.unsettled_jobs ? `受入済みタスク ${device.unsettled_jobs} 件の終了が未確認です。Desktopで停止または完了を確認してから再試行してください。`
-            : "この登録と個別の接続ルールを削除し、旧証明書を失効します。過去の履歴と端末IDの帰属は保持します。再参加には新しい鍵での申請と管理者の許可が必要です。進行中のモデル通信や端末のプロセスを停止する操作ではありません。",
+            : "このPCの登録と個別の接続ルールを削除し、現在の証明書を無効にします。過去の履歴とPCの登録IDは残ります。再び接続するには、Desktopで新しい鍵を作って参加を申請し、管理者が許可する必要があります。進行中のモデル通信やPC上の処理は、この操作では止まりません。",
     };
 }
 export function networkAdmissionStatus(device: NetworkDevice): { label: string; color: string; detail: string } {
