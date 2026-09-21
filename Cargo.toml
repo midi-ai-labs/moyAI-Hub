@@ -35,4 +35,4 @@ ulid = { version = "1.2.1", features = ["serde"] }
 x509-parser = "0.18.1"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Registry", "Win32_Security"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Registry", "Win32_Security", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }

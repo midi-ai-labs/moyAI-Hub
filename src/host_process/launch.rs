@@ -282,23 +282,62 @@ pub fn browser_launch_url(url: &str, already_running: bool) -> Result<String, St
 
 pub fn open_browser(url: &str, already_running: bool) -> Result<(), String> {
     let url = browser_launch_url(url, already_running)?;
+    let error = "ブラウザーを開けません。Hub PC の moyAI Team Management を開き直してください。";
     #[cfg(windows)]
-    let mut command = {
-        let windows = std::env::var_os("WINDIR").ok_or("Windowsの場所を確認できません。")?;
-        std::process::Command::new(std::path::PathBuf::from(windows).join("explorer.exe"))
-    };
-    #[cfg(target_os = "macos")]
-    let mut command = std::process::Command::new("open");
-    #[cfg(not(any(windows, target_os = "macos")))]
-    let mut command = std::process::Command::new("xdg-open");
-    command
-        .arg(&url)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    command.spawn().map_err(|_| {
-        "ブラウザーを開けません。Hub PC の moyAI Team Management を開き直してください。".to_owned()
-    })?;
+    {
+        use windows_sys::Win32::{
+            System::Com::{
+                COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
+            },
+            UI::{
+                Shell::{
+                    SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, ShellExecuteExW,
+                },
+                WindowsAndMessaging::SW_SHOWNORMAL,
+            },
+        };
+        let operation = "open".encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+        let url = url.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+        let initialized = unsafe {
+            CoInitializeEx(
+                std::ptr::null(),
+                (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
+            )
+        };
+        if initialized < 0 {
+            return Err(error.into());
+        }
+        let mut execute = SHELLEXECUTEINFOW {
+            cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+            // The CLI exits shortly after this call. Do not opt into ASYNCOK;
+            // NOASYNC alone does not guarantee synchronous URI activation.
+            fMask: SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+            lpVerb: operation.as_ptr(),
+            lpFile: url.as_ptr(),
+            nShow: SW_SHOWNORMAL,
+            ..Default::default()
+        };
+        // Pass the validated URL directly to its Windows association, without
+        // command-shell parsing or URL-bearing OS error messages.
+        let opened = unsafe { ShellExecuteExW(&mut execute) };
+        unsafe { CoUninitialize() };
+        if opened == 0 {
+            return Err(error.into());
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        #[cfg(target_os = "macos")]
+        let mut command = std::process::Command::new("open");
+        #[cfg(not(target_os = "macos"))]
+        let mut command = std::process::Command::new("xdg-open");
+        command
+            .arg(&url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command.spawn().map_err(|_| error.to_owned())?;
+    }
     Ok(())
 }
 
@@ -339,5 +378,21 @@ mod tests {
         );
         assert!(browser_launch_url("http://example.com/admin/", true).is_err());
         assert!(browser_launch_url("http://127.0.0.1:9081/admin/#other", true).is_err());
+    }
+
+    #[test]
+    fn browser_open_rejects_invalid_targets_without_disclosing_access() {
+        let ticket = "a".repeat(64);
+        for value in [
+            format!("https://example.com/admin/#access={ticket}"),
+            format!("http://127.0.0.1:9081/admin/?redirect=elsewhere#access={ticket}"),
+            format!("http://127.0.0.1:9081/admin/#access={ticket}&extra=1"),
+            format!("http://127.0.0.1:9081/admin/#access={}g", "a".repeat(63)),
+            "http://127.0.0.1:9081/admin/#access=too-short".to_owned(),
+        ] {
+            let error = open_browser(&value, true).unwrap_err();
+            assert!(!error.contains(&ticket));
+            assert!(!error.contains("http"));
+        }
     }
 }
