@@ -1607,7 +1607,7 @@ fn schema_one_forward_load_preserves_identity_without_implicit_write() {
     assert!(owner.current_certificate(&a.receipt.device_id, &a.receipt.certificate_sha256, f.now));
     owner.set_gateway_port(&owner.revision(), 9550).unwrap();
     let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    assert_eq!(saved["schema_version"], 4);
+    assert_eq!(saved["schema_version"], 5);
     assert_eq!(saved["gateway_port"], 9550);
     let mut invalid = saved;
     invalid["authority"]["assume_all_accepted"] = json!(true);

@@ -1,4 +1,4 @@
-import { copyText, invoke } from "./management.ts";
+import { copyText, invoke, managementSession } from "./management.ts";
 
 export interface WebStatus {
     enabled: boolean;
@@ -11,7 +11,8 @@ export function attachWebManagement(): { refresh: () => Promise<void> } {
     host.className = "panel web-management"; host.id = "web-management";
     document.getElementById("device-network")!.before(host);
     host.innerHTML = `<div class="section-title"><h2>管理画面のURL</h2><span id="web-enabled-state" class="badge">接続を確認中</span></div>
-        <p>管理者としてログインしたブラウザーから、利用者・仕事の実行先・モデル・端末を管理できます。このURLは管理者用です。</p>
+        <p>Hub PC、または管理を許可されたPCのDesktopから開いたブラウザーで、プロジェクト・モデル・PCを管理できます。URLを開くだけでは管理操作はできません。</p>
+        <p id="web-local-management-required" hidden>このPCからはプロジェクトやPCの許可を管理できます。モデル接続先の探索・変更、Hubの待受、Windowsの設定は、Hub PCで「moyAI Team Management」から開いて操作してください。</p>
         <p>Desktopを接続する場合は<a href="#device-network">「PCの接続」で接続ファイルを保存</a>してください。管理画面のURLをDesktopに入力する必要はありません。</p>
         <div id="web-address" class="web-address" hidden><label>Hubと同じPCで開くURL<input id="web-url" readonly></label><button id="web-copy-url" type="button" class="secondary" disabled>URLをコピー</button></div>
         <div id="web-remote-address" class="web-address" hidden><label>別のPCで管理者が開くURL<input id="web-remote-url" readonly></label><button id="web-copy-remote-url" type="button" class="secondary" disabled>管理用URLをコピー</button></div>
@@ -27,6 +28,8 @@ export function attachWebManagement(): { refresh: () => Promise<void> } {
         refreshing = true;
         try {
             const status = await invoke<WebStatus>("hub_web_status");
+            const session = await managementSession();
+            node("web-local-management-required").hidden = session.authentication.local_management !== false;
             const currentAddresses = `${status.enabled}\n${status.local_url ?? ""}\n${status.remote_url ?? ""}`;
             if (currentAddresses !== addresses) { addresses = currentAddresses; ++statusVersion; feedback = null; }
             node("web-enabled-state").textContent = status.enabled ? "稼働中" : "停止中";
@@ -43,7 +46,7 @@ export function attachWebManagement(): { refresh: () => Promise<void> } {
             node("web-settings-error").hidden = !status.settings_error;
             node("web-settings-error").textContent = status.settings_error ?? "";
             node("web-status").textContent = feedback ?? (!status.enabled ? "Web管理は停止中です。Hubの起動状態を確認してください。"
-                : status.remote_url?.startsWith("http:") ? "他の端末からのログインにはHTTPSの管理URLが必要です。現在のHTTPのURLではログインできません。"
+                : status.remote_url?.startsWith("http:") ? "他のPCからの管理にはHTTPSの管理URLが必要です。現在のHTTPのURLでは利用できません。"
                 : status.remote_url ? "他の端末からもWeb管理を利用できます。" : "Web管理はHubと同じPCから利用できます。");
         } catch {
             node("web-enabled-state").textContent = "応答を確認できません";

@@ -113,6 +113,8 @@ pub struct Rule {
 struct Device {
     device_id: String,
     label: String,
+    #[serde(default)]
+    windows_username: Option<String>,
     groups: BTreeSet<String>,
     revoked: bool,
     deleted_at_ms: Option<u64>,
@@ -381,11 +383,14 @@ impl DeviceNetwork {
                     device.insert("deleted_at_ms".into(), serde_json::Value::Null);
                 }
             }
+            if value["schema_version"] == 4 {
+                value["schema_version"] = 5.into();
+            }
             serde_json::from_value::<Store>(value).map_err(|_| NetworkError::InvalidRequest)?
         } else {
             let (ca, key) = pki::create_ca(hub_id)?;
             Store {
-                schema_version: 4,
+                schema_version: 5,
                 hub_id: hub_id.into(),
                 revision: 1,
                 ca_certificate_pem: ca,
@@ -399,7 +404,7 @@ impl DeviceNetwork {
                 join_requests: BTreeMap::new(),
             }
         };
-        if store.schema_version != 4
+        if store.schema_version != 5
             || store.hub_id != hub_id
             || store.revision == 0
             || store.devices.len() > DEVICE_RECORD_LIMIT
@@ -411,8 +416,12 @@ impl DeviceNetwork {
                 .count()
                 > DELETED_DEVICE_LIMIT
             || store.devices.values().any(|device| {
-                device.deleted_at_ms.is_some()
-                    && (!device.revoked || !device.stopped || !device.groups.is_empty())
+                device
+                    .windows_username
+                    .as_deref()
+                    .is_some_and(|name| !text_ok(name, 256))
+                    || device.deleted_at_ms.is_some()
+                        && (!device.revoked || !device.stopped || !device.groups.is_empty())
             })
             || store.groups.len() > 64
             || store.rules.len() > 1024
@@ -741,6 +750,7 @@ impl DeviceNetwork {
         let device = Device {
             device_id: id.clone(),
             label: invitation.label,
+            windows_username: None,
             groups: invitation.groups,
             revoked: false,
             deleted_at_ms: None,
@@ -1693,7 +1703,7 @@ impl DeviceNetwork {
     pub fn snapshot(&self, now: u64) -> serde_json::Value {
         let devices:Vec<_>=self.store.devices.values().filter(|d| d.deleted_at_ms.is_none()).map(|d| {
             let p=self.presence.get(&d.device_id);
-            serde_json::json!({"device_id":d.device_id,"label":d.label,"groups":d.groups,"revoked":d.revoked,
+            serde_json::json!({"device_id":d.device_id,"label":d.label,"windows_username":d.windows_username,"groups":d.groups,"revoked":d.revoked,
                 "admission":if d.revoked {"revoked"} else if d.stopped {"stopped"} else {"allowed"},
                 "certificate_sha256":d.certificate_sha256,"expires_at_ms":d.expires_at_ms,
                 "name_conflict":Self::label_conflicts(&self.store, &d.label, Some(&d.device_id), None, now),

@@ -11,6 +11,8 @@ const JOIN_MS: u64 = 86_400_000;
 pub(super) struct JoinRequest {
     request_id: String,
     label: String,
+    #[serde(default)]
+    windows_username: Option<String>,
     observed_ip: IpAddr,
     key_sha256: String,
     csr_pem: String,
@@ -74,6 +76,10 @@ impl JoinRequest {
         if !id_ok(&self.request_id)
             || !id_ok(&self.challenge)
             || !text_ok(&self.label, 256)
+            || self
+                .windows_username
+                .as_deref()
+                .is_some_and(|name| !text_ok(name, 256))
             || self.expires_at_ms != self.created_at_ms.saturating_add(JOIN_MS)
             || self.key_sha256 != key_hash(&parsed(&self.csr_pem, self.observed_ip)?)
         {
@@ -156,7 +162,24 @@ impl DeviceNetwork {
         ip: IpAddr,
         now: u64,
     ) -> Result<JoinReceipt> {
+        self.request_join_with_user(label, None, csr, ip, now)
+    }
+
+    pub fn request_join_with_user(
+        &mut self,
+        label: String,
+        windows_username: Option<String>,
+        csr: &str,
+        ip: IpAddr,
+        now: u64,
+    ) -> Result<JoinReceipt> {
         if !text_ok(&label, 256) {
+            return Err(NetworkError::InvalidRequest);
+        }
+        if windows_username
+            .as_deref()
+            .is_some_and(|name| !text_ok(name, 256))
+        {
             return Err(NetworkError::InvalidRequest);
         }
         let key_sha256 = key_hash(&parsed(csr, ip)?);
@@ -187,6 +210,7 @@ impl DeviceNetwork {
         let request = JoinRequest {
             request_id: ulid::Ulid::new().to_string(),
             label,
+            windows_username,
             observed_ip: ip,
             key_sha256: key_sha256.clone(),
             csr_pem: csr.into(),
@@ -322,6 +346,7 @@ impl DeviceNetwork {
                 Device {
                     device_id,
                     label,
+                    windows_username: request.windows_username.clone(),
                     groups,
                     revoked: false,
                     deleted_at_ms: None,
@@ -384,7 +409,7 @@ impl DeviceNetwork {
 
     pub(super) fn pending_joins(&self, now: u64) -> serde_json::Value {
         self.store.join_requests.values().map(|r| serde_json::json!({
-            "request_id":r.request_id,"label":r.label,"observed_ip":r.observed_ip,"key_sha256":r.key_sha256,
+            "request_id":r.request_id,"label":r.label,"windows_username":r.windows_username,"observed_ip":r.observed_ip,"key_sha256":r.key_sha256,
             "created_at_ms":r.created_at_ms,"expires_at_ms":r.expires_at_ms,
             "status":if r.expires_at_ms>now {"pending"} else {"expired"}
             ,"name_conflict":Self::label_conflicts(&self.store, &r.label, None, Some(&r.request_id), now)

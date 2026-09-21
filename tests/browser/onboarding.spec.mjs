@@ -1,29 +1,13 @@
-import { test, expect, administrator } from "./fixture.mjs";
+import { test, expect } from "./fixture.mjs";
 import { createDeviceParticipant } from "./device-fixture.mjs";
 
-test("first-person code is displayed once and does not return after refresh",async({page,hub},info)=>{
+test("first setup starts with PC and project choices without user or password chores",async({page,hub},info)=>{
   await page.goto(hub.url);
   await expect(page.locator("#onboarding-steps")).toContainText("最初のプロジェクト");
-  await page.locator("#onboarding-new-user").click();
-  await page.locator("#shared-admin-username").fill("first-person");
-  await page.locator("#shared-admin-display_name").fill("初回の利用者");
-  await expect(page.locator("#shared-admin-editor input[type=password]")).toHaveCount(0);
-  await page.locator("#shared-admin-save").click();
-  await expect(page.locator("#shared-admin-setup-code")).toBeVisible();
-  await expect(page.locator("#shared-admin-setup-code-value")).toHaveValue(/^[0-9a-f]{64}$/);
-  await page.locator("#shared-admin-setup-code-close").click();
-  await expect(page.locator("#shared-admin-setup-code-value")).toHaveValue("");
-  await page.reload(); await page.locator('[data-sa-tab="users"]').click();
-  await expect(page.locator("#shared-admin-content")).toContainText("本人の初回設定待ち");
-  await expect(page.locator("#shared-admin-setup-code")).not.toBeVisible();
-  await page.locator(".shared-admin-row").filter({has:page.getByRole("heading",{name:"初回の利用者",exact:true})}).locator('[data-sa-operation="update_user"]').click();
-  await expect(page.locator('#shared-admin-editor input[name="administrator"]')).toBeDisabled();
-  await expect(page.locator("#shared-admin-editor")).toContainText("初回パスワード設定が済んでから");
-  await info.attach("person-waiting-for-setup",{body:await page.locator("#shared-administration").screenshot(),contentType:"image/png"});
-  await page.locator("#hub-autostart-refresh").evaluate(el=>el.closest("details").open=true);
-  await page.locator("#hub-autostart-refresh").click();
-  await expect(page.locator("#hub-autostart-status")).not.toContainText("確認しています");
-  // Read only: never alter the test operator's real logon registration.
+  await expect(page.locator("#onboarding-new-user")).toHaveCount(0);
+  await page.locator("#onboarding-new-project").click();
+  await expect(page.locator('#shared-admin-editor input[type=password], #shared-admin-editor [name^="participant:"]')).toHaveCount(0);
+  await info.attach("project-without-person-setup",{body:await page.locator("#shared-administration").screenshot(),contentType:"image/png"});
 });
 
 async function project(page,label) {
@@ -79,23 +63,7 @@ test("connection setup guides the first PC through start permission file and app
   await page.locator("#network-stop").click(); await expect(page.locator("#network-next-title")).toContainText("1.");
 });
 
-test("first-person creation keeps its inputs after conflict and issues a code only on explicit save",async({page,context,hub},info)=>{
-  await page.goto(hub.url); await page.locator("#onboarding-new-user").click();
-  await page.locator("#shared-admin-username").fill("retained-first-person"); await page.locator("#shared-admin-display_name").fill("入力を保持する利用者");
-  const other=await context.newPage(); await other.goto(hub.url); await project(other,"並行登録されたプロジェクト");
-  await page.locator("#shared-admin-save").click(); await expect(page.locator("#shared-admin-form-error")).toContainText("入力は残っています");
-  await page.locator("#shared-admin-review-conflict").click(); await expect(page.locator("#shared-admin-comparison")).toContainText("retained-first-person");
-  await expect(page.locator("#shared-admin-setup-code")).toBeHidden();
-  await expect(page.locator("#shared-admin-content")).not.toContainText("入力を保持する利用者");
-  await info.attach("person-conflict-comparison-before-code",{body:await page.locator("#shared-admin-editor").screenshot(),contentType:"image/png"});
-  await page.locator("#shared-admin-accept-comparison").click();
-  await expect(page.locator("#shared-admin-username")).toHaveValue("retained-first-person");
-  await expect(page.locator("#shared-admin-display_name")).toHaveValue("入力を保持する利用者");
-  await expect(page.locator("#shared-admin-setup-code")).toBeHidden();
-  await page.locator("#shared-admin-save").click(); await expect(page.locator("#shared-admin-setup-code-value")).toHaveValue(/^[0-9a-f]{64}$/);
-  await page.locator("#shared-admin-setup-code-close").click(); await expect(page.locator("#shared-admin-setup-code-value")).toHaveValue("");
-});
-test("team preparation joins and assigns one exact PC without granting business access to the administrator",async({page,hub},info)=>{
+test("team preparation registers and names an exact PC and enables project access without a human login",async({page,hub},info)=>{
   await start(page,hub);
   const id=await project(page,"初回の業務");
   const participant=await createDeviceParticipant(await hub.observeNetwork(),"準備する PC");
@@ -103,12 +71,14 @@ test("team preparation joins and assigns one exact PC without granting business 
   await page.locator(`[data-id="request:${participant.requestId}"] button[data-network-action]`).click();
   await page.locator("#join-project-project").selectOption(id);
   await page.locator("#join-project-control").check(); await page.locator("#join-project-execute").check();
+  await expect(page.locator("#join-project-dialog")).toContainText("fixture\\operator");
   await info.attach("join-and-purpose",{body:await page.locator("#join-project-dialog").screenshot(),contentType:"image/png"});
   await page.locator("#join-project-save").click(); await expect(page.locator("#join-project-dialog")).not.toBeVisible();
   const approval=await participant.collectApproval(); expect(approval.status).toBe("approved");
   expect((await participant.sharedDeviceProjects()).projects.find(p=>p.id===id)).toMatchObject({can_control:true,can_execute:true,preparation_state:"waiting_setup"});
-  await participant.sharedLogin(administrator.username,administrator.password);
-  expect(await participant.sharedCall("projects")).toEqual([]);
+  const session=await participant.sharedDeviceSession();
+  expect(session.principal.administrator).toBe(false);
+  expect((await participant.sharedCall("projects")).some(project=>project.id===id)).toBe(true);
   await page.locator("#shared-admin-refresh").click();
   await expect(page.locator("#onboarding-steps")).toContainText("実行PCの保存先・権限の確認待ち");
   await page.reload(); await expect(page.locator("#onboarding-project")).toHaveValue(id);

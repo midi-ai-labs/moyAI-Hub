@@ -263,9 +263,15 @@ pub async fn launch_server(
 }
 
 pub fn browser_launch_url(url: &str, already_running: bool) -> Result<String, String> {
-    let url = local_management_url(url)?;
+    let (base, ticket) = url
+        .split_once("#access=")
+        .ok_or("管理画面の認証を準備できません。")?;
+    let url = local_management_url(base)?;
+    if ticket.len() != 64 || !ticket.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("管理画面の認証を準備できません。".into());
+    }
     Ok(format!(
-        "{url}#{}",
+        "{url}#access={ticket}&notice={}",
         if already_running {
             "hub-already-running"
         } else {
@@ -290,9 +296,9 @@ pub fn open_browser(url: &str, already_running: bool) -> Result<(), String> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    command
-        .spawn()
-        .map_err(|_| format!("ブラウザーを開けません。次のURLを開いてください: {url}"))?;
+    command.spawn().map_err(|_| {
+        "ブラウザーを開けません。Hub PC の moyAI Team Management を開き直してください。".to_owned()
+    })?;
     Ok(())
 }
 
@@ -322,13 +328,14 @@ mod tests {
     #[test]
     fn browser_launch_notice_keeps_the_validated_local_origin() {
         let url = "http://127.0.0.1:9081/admin/";
+        let access = format!("{url}#access={}", "a".repeat(64));
         assert_eq!(
-            browser_launch_url(url, true).unwrap(),
-            format!("{url}#hub-already-running")
+            browser_launch_url(&access, true).unwrap(),
+            format!("{access}&notice=hub-already-running")
         );
         assert_eq!(
-            browser_launch_url(url, false).unwrap(),
-            format!("{url}#hub-started")
+            browser_launch_url(&access, false).unwrap(),
+            format!("{access}&notice=hub-started")
         );
         assert!(browser_launch_url("http://example.com/admin/", true).is_err());
         assert!(browser_launch_url("http://127.0.0.1:9081/admin/#other", true).is_err());

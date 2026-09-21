@@ -129,23 +129,37 @@ fn remembered_grants_and_retries_are_bounded_and_store_only_hashes() {
 
 #[test]
 fn remembered_forward_migration_preserves_old_access_and_does_not_invent_human_login() {
-    let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE shared_projects(id TEXT PRIMARY KEY,label TEXT NOT NULL);").unwrap();
-    super::super::migrate(&conn).unwrap();
-    bootstrap_admin(&conn, "admin", "Admin", PASSWORD, 1).unwrap();
-    let old = login(
-        &conn,
-        "admin",
-        PASSWORD,
-        SessionAudience::SharedWork,
-        Some("WinA"),
-        2,
-    )
-    .unwrap();
-    conn.execute_batch(include_str!(
-        "../../../migrations/V11__remembered_human_sessions.sql"
-    ))
-    .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("pre-remembered.sqlite");
+    let conn = Connection::open(&path).unwrap();
+    for sql in [
+        include_str!("../../../migrations/V1__shared_work.sql"),
+        include_str!("../../../migrations/V2__shared_identity.sql"),
+        include_str!("../../../migrations/V3__shared_attempt_observation.sql"),
+        include_str!("../../../migrations/V4__shared_approvals.sql"),
+        include_str!("../../../migrations/V5__shared_management.sql"),
+        include_str!("../../../migrations/V6__shared_data.sql"),
+        include_str!("../../../migrations/V7__shared_runner_participation.sql"),
+        include_str!("../../../migrations/V8__shared_data_retention.sql"),
+        include_str!("../../../migrations/V9__shared_managed_files.sql"),
+        include_str!("../../../migrations/V10__shared_start_deadlines.sql"),
+    ] {
+        conn.execute_batch(sql).unwrap();
+    }
+    let principal = bootstrap_admin(&conn, "admin", "Admin", PASSWORD, 1).unwrap();
+    // Seed the released V10 access-session format. Calling today's login owner
+    // against a historical schema would not exercise a supported runtime state.
+    let old = LoginSession {
+        token: "ab".repeat(32),
+        expires_at_ms: SESSION_TTL_MS + 2,
+        principal,
+    };
+    conn.execute("INSERT INTO identity_sessions(token_hash,user_id,audience,device_id,credential_generation,expires_at_ms) VALUES(?1,?2,'shared_work','WinA',1,?3)",
+        params![token_hash(&old.token),old.principal.user_id,old.expires_at_ms]).unwrap();
+    conn.pragma_update(None, "user_version", 10).unwrap();
+    drop(conn);
+    let work = crate::shared_work::SharedWork::open(&path).unwrap();
+    let conn = work.db;
     assert!(
         authenticate(
             &conn,

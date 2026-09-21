@@ -94,20 +94,20 @@ pub(super) fn save(
     id: &str,
     label: &str,
     archived: bool,
-    members: &[ProjectMember],
+    members: Option<&[ProjectMember]>,
     controllers: &[String],
     runners: &[String],
     now: u64,
 ) -> Result<()> {
     super::store::id(id)?;
     super::store::label(label)?;
-    if members.len() > 512 {
+    if members.is_some_and(|members| members.len() > 512) {
         return Err(WorkError::Capacity);
     }
     let controls = selections(controllers)?;
     let executes = selections(runners)?;
     let mut people = BTreeSet::new();
-    for member in members {
+    for member in members.unwrap_or_default() {
         super::store::id(&member.user_id)?;
         if !people.insert(&member.user_id) {
             return Err(WorkError::Invalid);
@@ -123,37 +123,44 @@ pub(super) fn save(
         return Err(WorkError::Capacity);
     }
     db.execute("INSERT INTO shared_projects(id,label,archived,legacy_devices_unrestricted) VALUES(?1,?2,?3,0) ON CONFLICT(id) DO UPDATE SET label=excluded.label,archived=excluded.archived,legacy_devices_unrestricted=0",params![id,label,archived])?;
-    // The editor starts from effective memberships. Saving that explicit list
-    // removes hidden group inheritance for this project without changing other projects.
-    db.execute(
-        "DELETE FROM identity_group_project_roles WHERE project_id=?1",
-        [id],
-    )?;
-    let old = db
-        .prepare("SELECT user_id FROM identity_project_memberships WHERE project_id=?1")?
-        .query_map([id], |r| r.get::<_, String>(0))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    for user in old {
-        if !people.contains(&user) {
-            identity::set_project_role(db, actor, id, &user, None, now)?;
+    if let Some(members) = members {
+        // The legacy editor starts from explicit memberships. Saving that explicit list
+        // removes hidden group inheritance for this project without changing other projects.
+        db.execute(
+            "DELETE FROM identity_group_project_roles WHERE project_id=?1",
+            [id],
+        )?;
+        let old = db
+            .prepare("SELECT user_id FROM identity_project_memberships WHERE project_id=?1")?
+            .query_map([id], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for user in old {
+            if !people.contains(&user) {
+                identity::set_project_role(db, actor, id, &user, None, now)?;
+            }
         }
-    }
-    for member in members {
-        let previous: Option<String> = db
+        for member in members {
+            let previous: Option<String> = db
             .query_row(
                 "SELECT role FROM identity_project_memberships WHERE project_id=?1 AND user_id=?2",
                 params![id, member.user_id],
                 |r| r.get(0),
             )
             .optional()?;
-        if previous.as_deref() != Some(member.role.as_str()) {
-            identity::set_project_role(db, actor, id, &member.user_id, Some(member.role), now)?;
+            if previous.as_deref() != Some(member.role.as_str()) {
+                identity::set_project_role(db, actor, id, &member.user_id, Some(member.role), now)?;
+            }
         }
     }
-    db.execute(
-        "UPDATE shared_project_devices SET can_control=0,can_execute=0 WHERE project_id=?1",
-        [id],
-    )?;
+    let old_devices = db
+        .prepare("SELECT device_id FROM shared_project_devices WHERE project_id=?1")?
+        .query_map([id], |r| r.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for device in old_devices {
+        if !controls.contains(device.as_str()) && !executes.contains(device.as_str()) {
+            db.execute("UPDATE shared_project_devices SET can_control=0,can_execute=0 WHERE project_id=?1 AND device_id=?2",params![id,device])?;
+        }
+    }
     for device in controls.union(&executes) {
         db.execute("INSERT INTO shared_project_devices(project_id,device_id,can_control,can_execute) VALUES(?1,?2,?3,?4) ON CONFLICT(project_id,device_id) DO UPDATE SET can_control=excluded.can_control,can_execute=excluded.can_execute",params![id,device,controls.contains(device),executes.contains(device)])?;
     }

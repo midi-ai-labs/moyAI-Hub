@@ -200,10 +200,10 @@ fn save(
             id: project.into(),
             label: "解析業務".into(),
             archived: false,
-            members: vec![ProjectMember {
+            members: Some(vec![ProjectMember {
                 user_id: f.alice.user_id.clone(),
                 role: ProjectRole::Contributor,
-            }],
+            }]),
             controller_device_ids: controllers.iter().map(|v| v.to_string()).collect(),
             runner_device_ids: runners.iter().map(|v| v.to_string()).collect(),
         },
@@ -377,10 +377,10 @@ fn project_setup_invalid_people_roll_back_the_entire_project_edit() {
             id: "invalid-new".into(),
             label: "新規".into(),
             archived: false,
-            members: vec![ProjectMember {
+            members: Some(vec![ProjectMember {
                 user_id: "missing-user".into(),
                 role: ProjectRole::Contributor,
-            }],
+            }]),
             controller_device_ids: vec!["WinA".into()],
             runner_device_ids: vec!["WinZ".into()],
         },
@@ -516,10 +516,10 @@ fn project_setup_archive_preserves_selected_pc_history_and_cancellation_but_bloc
             id: "alpha".into(),
             label: "保管した仕事".into(),
             archived: true,
-            members: vec![ProjectMember {
+            members: Some(vec![ProjectMember {
                 user_id: f.alice.user_id.clone(),
                 role: ProjectRole::Contributor,
-            }],
+            }]),
             controller_device_ids: vec!["WinA".into()],
             runner_device_ids: vec!["WinE".into()],
         },
@@ -728,7 +728,7 @@ fn project_setup_converts_only_the_saved_projects_effective_people() {
             id: "alpha".into(),
             label: "Alpha".into(),
             archived: false,
-            members: vec![
+            members: Some(vec![
                 ProjectMember {
                     user_id: f.alice.user_id.clone(),
                     role: ProjectRole::Contributor,
@@ -737,7 +737,7 @@ fn project_setup_converts_only_the_saved_projects_effective_people() {
                     user_id: f.bob.user_id.clone(),
                     role: ProjectRole::Manager,
                 },
-            ],
+            ]),
             controller_device_ids: vec!["WinA".into()],
             runner_device_ids: vec!["WinE".into(), "WinC".into()],
         },

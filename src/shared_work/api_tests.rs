@@ -85,6 +85,15 @@ impl AdmissionFixture {
         let actor =
             identity::bootstrap_admin(&work.db, "admin", "管理者", "test-password-12345", now)
                 .unwrap();
+        identity::device::bind(
+            &work.db,
+            &actor,
+            &worker.id,
+            Some(&actor.user_id),
+            "Runner",
+            now,
+        )
+        .unwrap();
         work.create_project(&actor, "project", "Project").unwrap();
         identity::set_project_role(
             &work.db,
@@ -129,6 +138,7 @@ impl AdmissionFixture {
                 network: Arc::new(Mutex::new(network)),
                 slots: Arc::new(tokio::sync::Semaphore::new(8)),
                 login_slots: Arc::new(tokio::sync::Semaphore::new(2)),
+                web_access: None,
             },
             device: DeviceIdentity {
                 device_id: worker.id,
@@ -394,6 +404,15 @@ async fn real_tls_requires_person_and_device_and_preserves_job_across_client_con
     let old_job = work
         .submit(&user, &old_request, now - DEFAULT_START_WINDOW_MS - 1)
         .unwrap();
+    identity::device::bind(
+        &work.db,
+        &admin,
+        &desktop.id,
+        Some(&user.user_id),
+        "Desktop",
+        now,
+    )
+    .unwrap();
     let store = Arc::new(Mutex::new(work));
     let network = Arc::new(Mutex::new(network));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -420,7 +439,7 @@ async fn real_tls_requires_person_and_device_and_preserves_job_across_client_con
     let anonymous = client(&ca, None);
     assert_eq!(
         anonymous
-            .post(format!("{endpoint}/v1/shared/login"))
+            .post(format!("{endpoint}/v1/shared/device-session"))
             .header("x-moyai-verified-device", &desktop.id)
             .json(&json!({"username":"alice","password":"test-password-12345"}))
             .send()
@@ -439,8 +458,7 @@ async fn real_tls_requires_person_and_device_and_preserves_job_across_client_con
         401
     );
     let session = body(
-        a.post(format!("{endpoint}/v1/shared/login"))
-            .json(&json!({"username":"alice","password":"test-password-12345"}))
+        a.post(format!("{endpoint}/v1/shared/device-session"))
             .send()
             .await
             .unwrap(),

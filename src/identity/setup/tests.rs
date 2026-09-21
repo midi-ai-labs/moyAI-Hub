@@ -73,7 +73,7 @@ fn only_admin_can_issue_and_expiry_reissue_revoke_disable_and_password_reset_inv
 }
 
 #[test]
-fn released_database_upgrade_preserves_existing_password_and_access_session() {
+fn released_database_upgrade_preserves_shared_access_and_retires_old_web_access() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("old.db");
     let db = Connection::open(&path).unwrap();
@@ -81,11 +81,29 @@ fn released_database_upgrade_preserves_existing_password_and_access_session() {
         .unwrap();
     migrate(&db).unwrap();
     let admin = bootstrap_admin(&db, "admin", "Admin", PASSWORD, 1).unwrap();
-    let session = login(&db, "admin", PASSWORD, SessionAudience::WebAdmin, None, 2).unwrap();
+    // Seed the released V2 shape; current login requires newer identity columns.
+    let web_token = "ab".repeat(32);
+    let shared_token = "cd".repeat(32);
+    db.execute("INSERT INTO identity_sessions(token_hash,user_id,audience,device_id,credential_generation,expires_at_ms) VALUES(?1,?2,'web_admin',NULL,1,1000)",params![token_hash(&web_token),admin.user_id]).unwrap();
+    db.execute("INSERT INTO identity_sessions(token_hash,user_id,audience,device_id,credential_generation,expires_at_ms) VALUES(?1,?2,'shared_work','WinA',1,1000)",params![token_hash(&shared_token),admin.user_id]).unwrap();
     db.pragma_update(None, "user_version", 2).unwrap();
     drop(db);
     let work = crate::shared_work::SharedWork::open(&path).unwrap();
-    assert!(authenticate(&work.db, &session.token, SessionAudience::WebAdmin, None, 3).is_ok());
+    assert!(matches!(
+        authenticate(&work.db, &web_token, SessionAudience::WebAdmin, None, 3),
+        Err(IdentityError::Unauthorized)
+    ));
+    assert_eq!(
+        authenticate(
+            &work.db,
+            &shared_token,
+            SessionAudience::SharedWork,
+            Some("WinA"),
+            3
+        )
+        .unwrap(),
+        admin
+    );
     assert!(
         list_users(&work.db, &admin)
             .unwrap()

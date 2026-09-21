@@ -41,6 +41,8 @@ pub type Result<T> = std::result::Result<T, WorkError>;
 pub enum WorkError {
     #[error("要求の内容を確認してください。")]
     Invalid,
+    #[error("{0}")]
+    Management(String),
     #[error("この仕事を操作する権限がありません。")]
     Forbidden,
     #[error("対象の仕事または環境がありません。")]

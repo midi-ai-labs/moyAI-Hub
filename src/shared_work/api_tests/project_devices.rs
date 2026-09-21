@@ -11,10 +11,10 @@ fn configure(work: &mut SharedWork, actor: &Principal, controller: Option<&str>,
             id: "project".into(),
             label: "Project".into(),
             archived: false,
-            members: vec![ProjectMember {
+            members: Some(vec![ProjectMember {
                 user_id: actor.user_id.clone(),
                 role: ProjectRole::Contributor,
-            }],
+            }]),
             controller_device_ids: controller.into_iter().map(str::to_owned).collect(),
             runner_device_ids: vec![runner.into()],
         },
@@ -55,10 +55,10 @@ async fn project_status_uses_current_device_names_for_assignments_environments_a
                 id: "project".into(),
                 label: "解析プロジェクト".into(),
                 archived: false,
-                members: vec![ProjectMember {
+                members: Some(vec![ProjectMember {
                     user_id: fixture.actor.user_id.clone(),
                     role: ProjectRole::Contributor,
-                }],
+                }]),
                 controller_device_ids: vec![fixture.device.device_id.clone()],
                 runner_device_ids: vec![fixture.device.device_id.clone(), pending.id.clone()],
             },
@@ -128,6 +128,15 @@ async fn project_device_gates_cover_human_routes_but_keep_executor_control_and_l
         Some(&pc.id),
         &fixture.device.device_id,
     );
+    identity::device::bind(
+        &fixture.state.store.lock().unwrap().db,
+        &fixture.actor,
+        &pc.id,
+        Some(&fixture.actor.user_id),
+        "Operator PC",
+        crate::service::now_ms(),
+    )
+    .unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let endpoint = format!("https://{address}/v1/shared");
@@ -152,8 +161,7 @@ async fn project_device_gates_cover_human_routes_but_keep_executor_control_and_l
     let client = client(&ca, Some(&pc));
     let session = body(
         client
-            .post(format!("{endpoint}/login"))
-            .json(&json!({"username":"admin","password":"test-password-12345"}))
+            .post(format!("{endpoint}/device-session"))
             .send()
             .await
             .unwrap(),

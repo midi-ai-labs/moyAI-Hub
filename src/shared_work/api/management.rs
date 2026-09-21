@@ -49,7 +49,8 @@ pub(crate) fn project_device_targets(command: &ManagementCommand) -> Option<Vec<
                 .collect(),
         ),
         ManagementRequest::RetryProjectDevice { device_id, .. }
-        | ManagementRequest::AssignProjectDevice { device_id, .. } => Some(vec![device_id.clone()]),
+        | ManagementRequest::AssignProjectDevice { device_id, .. }
+        | ManagementRequest::BindDevicePrincipal { device_id, .. } => Some(vec![device_id.clone()]),
         _ => None,
     }
 }
@@ -66,9 +67,24 @@ async fn command(
                 .map(DeviceAccess::Environment)
                 .unwrap_or(DeviceAccess::Current)
         });
-    authenticated(state, headers, device, access, move |store, actor| {
-        store.manage(&actor, &input, crate::service::now_ms())
-    })
+    authenticated_with_network(
+        state,
+        headers,
+        device,
+        access,
+        move |store, actor, network| {
+            let labels = project_device_targets(&input)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|id| {
+                    network
+                        .device_label(&id)
+                        .map(|label| (id.clone(), label.to_owned()))
+                })
+                .collect();
+            store.manage_with_device_labels(&actor, &input, crate::service::now_ms(), &labels)
+        },
+    )
     .await
 }
 async fn handover_view(

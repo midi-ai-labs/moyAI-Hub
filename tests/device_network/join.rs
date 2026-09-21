@@ -639,7 +639,7 @@ fn schema_two_preserves_accepted_authority_and_strict_join_fields_on_forward_loa
         .request_join("pending".into(), &csr().1, ip(), f.now)
         .unwrap();
     let mut invalid: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    assert_eq!(invalid["schema_version"], 4);
+    assert_eq!(invalid["schema_version"], 5);
     invalid["join_requests"][&pending.request_id]["admin"] = true.into();
     let bytes = serde_json::to_vec(&invalid).unwrap();
     std::fs::write(&path, &bytes).unwrap();
@@ -807,4 +807,77 @@ async fn actual_tls_join_exposes_only_proof_endpoints_until_approval_and_stopped
     );
     stop.send(()).unwrap();
     task.await.unwrap();
+}
+
+#[test]
+fn same_windows_username_remains_metadata_on_distinct_registered_keys() {
+    let mut fixture = Fixture::new();
+    let first = fixture
+        .owner
+        .request_join_with_user(
+            "WinA".into(),
+            Some("DOMAIN\\same-user".into()),
+            &csr().1,
+            ip(),
+            fixture.now,
+        )
+        .unwrap();
+    let second = fixture
+        .owner
+        .request_join_with_user(
+            "WinB".into(),
+            Some("DOMAIN\\same-user".into()),
+            &csr().1,
+            ip(),
+            fixture.now,
+        )
+        .unwrap();
+    let pending = fixture.owner.snapshot(fixture.now);
+    let requests = pending["join_requests"].as_array().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_ne!(requests[0]["key_sha256"], requests[1]["key_sha256"]);
+    for (request, label) in [(&first, "WinA"), (&second, "WinB")] {
+        fixture
+            .owner
+            .approve_join(
+                &fixture.owner.revision(),
+                &request.request_id,
+                label.into(),
+                Default::default(),
+                fixture.now,
+            )
+            .unwrap();
+    }
+    let snapshot = fixture.owner.snapshot(fixture.now);
+    let rows = snapshot["devices"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_ne!(rows[0]["device_id"], rows[1]["device_id"]);
+    assert!(
+        rows.iter()
+            .all(|row| row["windows_username"] == "DOMAIN\\same-user")
+    );
+    for row in rows {
+        let own = fixture
+            .owner
+            .self_projection(row["device_id"].as_str().unwrap(), fixture.now)
+            .unwrap();
+        // Account labels stay in administrator views. Existing Desktop clients
+        // deserialize this device-authentication response with strict fields.
+        assert_eq!(
+            own,
+            json!({
+                "hub_id": "hub-test", "device_id": row["device_id"],
+                "label": row["label"], "groups": row["groups"],
+                "revision": snapshot["revision"], "admission": "allowed",
+                "certificate_sha256": row["certificate_sha256"],
+                "expires_at_ms": row["expires_at_ms"], "cancelled_lineages": [],
+            })
+        );
+    }
+    let path = fixture.directory.path().join("network.json");
+    let reopened = DeviceNetwork::open(&path, "hub-test").unwrap();
+    assert_eq!(
+        reopened.snapshot(fixture.now)["devices"],
+        snapshot["devices"]
+    );
 }

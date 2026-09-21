@@ -296,6 +296,12 @@ impl Manager {
                 return Err(error);
             }
         };
+        admin.web_access.set_remote_origin(
+            remote_policy
+                .as_ref()
+                .filter(|policy| policy.secure)
+                .map(|policy| policy.origin.clone()),
+        )?;
         let local_endpoint = serve_http(local, router(Arc::downgrade(admin), local_policy));
         let mut running = Running {
             local_url: format!("{local_origin}/admin/"),
@@ -459,6 +465,33 @@ pub(crate) async fn controls(
             manager.stop(&admin).await;
         }
         match command.as_str() {
+            "hub_web_open" => {
+                if !args.as_object().is_some_and(|args| args.is_empty()) {
+                    return Err("操作の引数を確認してください。".into());
+                }
+                let local_url = manager
+                    .running
+                    .as_ref()
+                    .ok_or("管理画面は停止中です。")?
+                    .local_url
+                    .clone();
+                let origin = reqwest::Url::parse(&local_url)
+                    .map_err(|_| "管理画面のURLを確認できません。")?
+                    .origin()
+                    .ascii_serialization();
+                let store = admin
+                    .shared_work
+                    .lock()
+                    .map_err(|_| "Hubの保存情報を確認できません。")?;
+                let owner = crate::identity::web_access::local_owner(
+                    store.identity_connection(),
+                    crate::service::now_ms(),
+                )
+                .map_err(|_| "Hub PC の管理権限を確認できません。")?;
+                return Ok(
+                    json!({"url":admin.web_access.issue_ticket(&origin,owner.user_id,None)?}),
+                );
+            }
             "hub_web_enable" => {
                 let settings = match args.get("settings") {
                     None | Some(Value::Null) => {

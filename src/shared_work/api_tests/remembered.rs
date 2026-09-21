@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test]
-async fn remembered_login_refresh_logout_and_revocation_use_real_device_tls() {
+async fn passwordless_session_binding_expiry_logout_and_revocation_use_real_device_tls() {
     let directory = tempfile::tempdir().unwrap();
     let now = crate::service::now_ms();
     let mut network =
@@ -51,27 +51,73 @@ async fn remembered_login_refresh_logout_and_revocation_use_real_device_tls() {
     let a = client(&ca, Some(&first));
     let b = client(&ca, Some(&second));
     let anonymous = client(&ca, None);
+    assert_eq!(
+        anonymous
+            .post(format!("{endpoint}/device-session"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    assert_eq!(
+        a.post(format!("{endpoint}/device-session"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    {
+        let work = store.lock().unwrap();
+        identity::device::bind(
+            &work.db,
+            &admin,
+            &first.id,
+            Some(&alice.user_id),
+            "WinA",
+            now,
+        )
+        .unwrap();
+        identity::device::enroll(&work.db, &second.id, "WinB", now).unwrap();
+    }
+    for route in ["login", "setup-password", "refresh"] {
+        assert_eq!(
+            a.post(format!("{endpoint}/{route}"))
+                .json(&json!({"username":"alice","password":"test-password-12345"}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            410
+        );
+    }
     let session = body(
-        a.post(format!("{endpoint}/login"))
-            .json(&json!({"username":"alice","password":"test-password-12345"}))
+        a.post(format!("{endpoint}/device-session"))
             .send()
             .await
             .unwrap(),
     )
     .await;
-    let renewal = json!({"refresh_token":session["refresh_token"]});
-    for client in [&anonymous, &b] {
-        assert_eq!(
-            client
-                .post(format!("{endpoint}/refresh"))
-                .json(&renewal)
-                .send()
-                .await
-                .unwrap()
-                .status(),
-            401
-        );
-    }
+    let token = session["token"].as_str().unwrap();
+    assert_eq!(session["principal"]["user_id"], alice.user_id);
+    assert_eq!(
+        b.get(format!("{endpoint}/session"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    let second_session = body(
+        b.post(format!("{endpoint}/device-session"))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_ne!(second_session["principal"]["user_id"], alice.user_id);
     store
         .lock()
         .unwrap()
@@ -80,7 +126,7 @@ async fn remembered_login_refresh_logout_and_revocation_use_real_device_tls() {
         .unwrap();
     assert_eq!(
         a.get(format!("{endpoint}/session"))
-            .bearer_auth(session["token"].as_str().unwrap())
+            .bearer_auth(token)
             .send()
             .await
             .unwrap()
@@ -88,17 +134,16 @@ async fn remembered_login_refresh_logout_and_revocation_use_real_device_tls() {
         401
     );
     let fresh = body(
-        a.post(format!("{endpoint}/refresh"))
-            .json(&renewal)
+        a.post(format!("{endpoint}/device-session"))
             .send()
             .await
             .unwrap(),
     )
     .await;
-    assert_eq!(fresh["principal"]["user_id"], alice.user_id);
+    let fresh_token = fresh["token"].as_str().unwrap();
     body(
         a.get(format!("{endpoint}/session"))
-            .bearer_auth(fresh["token"].as_str().unwrap())
+            .bearer_auth(fresh_token)
             .send()
             .await
             .unwrap(),
@@ -106,98 +151,81 @@ async fn remembered_login_refresh_logout_and_revocation_use_real_device_tls() {
     .await;
     body(
         a.post(format!("{endpoint}/logout"))
-            .json(&renewal)
+            .bearer_auth(fresh_token)
+            .json(&json!({}))
             .send()
             .await
             .unwrap(),
     )
     .await;
-    assert_eq!(
-        a.post(format!("{endpoint}/refresh"))
-            .json(&renewal)
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        401
-    );
     assert_eq!(
         a.get(format!("{endpoint}/session"))
-            .bearer_auth(fresh["token"].as_str().unwrap())
+            .bearer_auth(fresh_token)
             .send()
             .await
             .unwrap()
             .status(),
         401
     );
-    let session = body(
-        a.post(format!("{endpoint}/login"))
-            .json(&json!({"username":"alice","password":"test-password-12345"}))
+    let before_rebind = body(
+        a.post(format!("{endpoint}/device-session"))
             .send()
             .await
             .unwrap(),
     )
     .await;
-    let renewal = json!({"refresh_token":session["refresh_token"]});
     {
         let work = store.lock().unwrap();
-        identity::update_user(
-            &work.db,
-            &admin,
-            &alice.user_id,
-            "Alice",
-            false,
-            true,
-            now + 1,
-        )
-        .unwrap();
+        identity::device::bind(&work.db, &admin, &first.id, None, "WinA", now + 1).unwrap();
     }
     assert_eq!(
-        a.post(format!("{endpoint}/refresh"))
-            .json(&renewal)
+        a.get(format!("{endpoint}/session"))
+            .bearer_auth(before_rebind["token"].as_str().unwrap())
             .send()
             .await
             .unwrap()
             .status(),
         401
     );
-    {
-        let work = store.lock().unwrap();
-        identity::update_user(
-            &work.db,
-            &admin,
-            &alice.user_id,
-            "Alice",
-            false,
-            false,
-            now + 2,
-        )
-        .unwrap();
-    }
-    let session = body(
-        a.post(format!("{endpoint}/login"))
-            .json(&json!({"username":"alice","password":"test-password-12345"}))
+    let changed = body(
+        a.post(format!("{endpoint}/device-session"))
             .send()
             .await
             .unwrap(),
     )
     .await;
+    assert_ne!(changed["principal"]["user_id"], alice.user_id);
     {
         let mut network = network.lock().unwrap();
-        let revision = network.revision().to_owned();
+        let revision = network.revision();
         network
             .set_device(&revision, &first.id, "WinA".into(), BTreeSet::new(), true)
             .unwrap();
     }
     assert_eq!(
-        a.post(format!("{endpoint}/refresh"))
-            .json(&json!({"refresh_token":session["refresh_token"]}))
+        a.post(format!("{endpoint}/device-session"))
             .send()
             .await
             .unwrap()
             .status(),
         403
     );
+    assert_eq!(
+        a.get(format!("{endpoint}/session"))
+            .bearer_auth(changed["token"].as_str().unwrap())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    body(
+        b.post(format!("{endpoint}/device-session"))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
     stop.send(()).unwrap();
     server.await.unwrap();
 }

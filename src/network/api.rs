@@ -102,6 +102,8 @@ async fn history_results(
 #[serde(deny_unknown_fields)]
 struct JoinRequestBody {
     label: String,
+    #[serde(default)]
+    windows_username: Option<String>,
     csr_pem: String,
 }
 async fn join_request(
@@ -109,8 +111,9 @@ async fn join_request(
     ConnectInfo(peer): ConnectInfo<TlsPeer>,
     Json(body): Json<JoinRequestBody>,
 ) -> ApiResult {
-    reply(lock(&network)?.request_join(
+    reply(lock(&network)?.request_join_with_user(
         body.label,
+        body.windows_username,
         &body.csr_pem,
         peer.address.ip(),
         crate::service::now_ms(),

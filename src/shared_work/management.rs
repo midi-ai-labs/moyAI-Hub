@@ -35,9 +35,16 @@ pub enum ManagementRequest {
         id: String,
         label: String,
         archived: bool,
-        members: Vec<ProjectMember>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        members: Option<Vec<ProjectMember>>,
         controller_device_ids: Vec<String>,
         runner_device_ids: Vec<String>,
+    },
+    BindDevicePrincipal {
+        device_id: String,
+        user_id: Option<String>,
+        #[serde(default)]
+        display_name: Option<String>,
     },
     RetryProjectDevice {
         project_id: String,
@@ -262,7 +269,7 @@ fn snapshot(db: &Connection, actor: &Principal) -> Result<Value> {
         },
     )?;
     Ok(
-        json!({"revision":revision.to_string(),"users":users,"groups":groups,"group_memberships":group_memberships,"projects":projects,"project_memberships":project_memberships,"group_project_roles":group_project_roles,"project_devices":super::project_setup::device_rows(db,None)?,"environments":environments,"resources":resources,"maintenance":maintenance["items"],"maintenance_next_before":maintenance["next_before"],"maintenance_total":maintenance["total_active"],"templates":templates,"provisioning":provisioning,"storage":super::data::storage_status(db)?}),
+        json!({"revision":revision.to_string(),"users":users,"groups":groups,"group_memberships":group_memberships,"projects":projects,"project_memberships":project_memberships,"group_project_roles":group_project_roles,"project_devices":super::project_setup::device_rows(db,None)?,"device_principals":identity::device::list(db)?,"environments":environments,"resources":resources,"maintenance":maintenance["items"],"maintenance_next_before":maintenance["next_before"],"maintenance_total":maintenance["total_active"],"templates":templates,"provisioning":provisioning,"storage":super::data::storage_status(db)?}),
     )
 }
 
@@ -392,6 +399,16 @@ impl SharedWork {
         command: &ManagementCommand,
         now: u64,
     ) -> Result<Value> {
+        self.manage_with_device_labels(actor, command, now, &Default::default())
+    }
+
+    pub(crate) fn manage_with_device_labels(
+        &mut self,
+        actor: &Principal,
+        command: &ManagementCommand,
+        now: u64,
+        device_labels: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Value> {
         super::store::id(&command.request_id)?;
         super::store::timestamp(now)?;
         let expected: u64 = command
@@ -451,15 +468,42 @@ impl SharedWork {
                 controller_device_ids,
                 runner_device_ids,
             } => {
+                for device in controller_device_ids.iter().chain(runner_device_ids) {
+                    identity::device::enroll(
+                        &tx,
+                        device,
+                        device_labels
+                            .get(device)
+                            .map(String::as_str)
+                            .unwrap_or(device),
+                        now,
+                    )?;
+                }
                 super::project_setup::save(
                     &tx,
                     actor,
                     id,
                     label,
                     *archived,
-                    members,
+                    members.as_deref(),
                     controller_device_ids,
                     runner_device_ids,
+                    now,
+                )?;
+            }
+            BindDevicePrincipal {
+                device_id,
+                user_id,
+                display_name,
+            } => {
+                // Transport/administrative boundary verifies this registered PC
+                // under the network lock before this durable actor association.
+                identity::device::bind(
+                    &tx,
+                    actor,
+                    device_id,
+                    user_id.as_deref(),
+                    display_name.as_deref().unwrap_or(device_id),
                     now,
                 )?;
             }
@@ -469,6 +513,15 @@ impl SharedWork {
                 can_control,
                 can_execute,
             } => {
+                identity::device::enroll(
+                    &tx,
+                    device_id,
+                    device_labels
+                        .get(device_id)
+                        .map(String::as_str)
+                        .unwrap_or(device_id),
+                    now,
+                )?;
                 super::project_setup::assign_device(
                     &tx,
                     project_id,

@@ -28,7 +28,7 @@ function csr(keys, commonName) {
     return `-----BEGIN CERTIFICATE REQUEST-----\n${body.match(/.{1,64}/g).join("\n")}\n-----END CERTIFICATE REQUEST-----\n`;
 }
 
-export async function createDeviceParticipant(network, label) {
+export async function createDeviceParticipant(network, label, windowsUsername = "fixture\\operator") {
     const keys = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
     const key = keys.privateKey.export({ type: "pkcs8", format: "pem" });
     let certificate = null;
@@ -55,7 +55,7 @@ export async function createDeviceParticipant(network, label) {
             req.end(data);
         });
     }
-    const receipt = await request("join/request", { label, csr_pem: csr(keys, "Browser test participant") }, false);
+    const receipt = await request("join/request", { label, windows_username: windowsUsername, csr_pem: csr(keys, "Browser test participant") }, false);
     const proof = csr(keys, `moyAI join ${receipt.hub_id} ${receipt.request_id} ${receipt.challenge}`);
     let humanToken = null;
     return {
@@ -66,16 +66,21 @@ export async function createDeviceParticipant(network, label) {
             return { status: result.status, deviceId: certificate?.device_id };
         },
         presence: () => request("presence", {}),
-        async sharedLogin(username, password) {
-            if (!certificate) throw new Error("Shared fixture login requires an enrolled device");
-            const session = await request("login", { username, password }, true, null, "shared");
+        async sharedDeviceSession() {
+            if (!certificate) throw new Error("Shared session requires an enrolled device");
+            const session = await request("device-session", {}, true, null, "shared");
             humanToken = session.token;
             return { principal: session.principal, expires_at_ms: session.expires_at_ms };
         },
         async sharedCall(operation, body) {
-            const routes = { snapshot: "admin/snapshot", createUser: "admin/users", createProject: "admin/projects", membership: "admin/memberships", environment: "admin/environments", projects: "projects", submit: "jobs", claim: "runner/claim", report: "runner/report" };
+            const routes = { snapshot: "admin/snapshot", command: "admin/command", createUser: "admin/users", createProject: "admin/projects", membership: "admin/memberships", environment: "admin/environments", projects: "projects", submit: "jobs", claim: "runner/claim", report: "runner/report" };
             if (!Object.hasOwn(routes, operation) || !humanToken) throw new Error("Unknown or unauthenticated shared fixture operation");
             return request(routes[operation], body, true, humanToken, "shared");
+        },
+        async sharedCommand(operation) {
+            if (!humanToken) throw new Error("Shared command requires a device session");
+            const snapshot = await request("admin/snapshot", undefined, true, humanToken, "shared");
+            return request("admin/command", { request_id: randomUUID(), expected_revision: snapshot.revision, request: operation }, true, humanToken, "shared");
         },
         sharedAssignments(environmentIds) {
             if (!certificate || !Array.isArray(environmentIds) || environmentIds.length === 0 || environmentIds.length > 32 || environmentIds.some(id => typeof id !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(id))) throw new Error("Assignments require an enrolled runner and bounded environment IDs");

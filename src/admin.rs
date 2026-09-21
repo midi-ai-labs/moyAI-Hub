@@ -25,6 +25,7 @@ mod autostart;
 mod firewall;
 mod hosting_options;
 mod network_admin;
+pub(crate) use network_admin::dispatch_network_locked;
 mod network_hosting;
 
 #[cfg(test)]
@@ -50,7 +51,7 @@ struct Evidence {
 }
 pub struct Admin {
     pub(crate) shared_work: crate::shared_work::SharedStore,
-    pub(crate) web_access: crate::web_admin::WebAccess,
+    pub(crate) web_access: Arc<crate::web_admin::WebAccess>,
     pub(crate) web_server: tokio::sync::Mutex<crate::web_admin::server::Manager>,
     core: SharedCore,
     path: PathBuf,
@@ -146,7 +147,7 @@ impl Admin {
             return Err("操作の引数を確認してください。".into());
         }
         match command {
-            "hub_web_status" | "hub_web_enable" | "hub_web_disable" => {
+            "hub_web_status" | "hub_web_enable" | "hub_web_disable" | "hub_web_open" => {
                 crate::web_admin::server::controls(self, command, args).await
             }
             "hub_snapshot" => hub_snapshot(self).await,
@@ -250,59 +251,22 @@ impl Admin {
                 argument(args, "id")?,
             )?),
             "hub_history_result" => output(hub_history_result(self, argument(args, "requestId")?)?),
-            "hub_network_settings" => output(hub_network_settings(
-                self,
-                argument(args, "expectedRevision")?,
-                argument(args, "gatewayPort")?,
-            )?),
-            "hub_network_invite" => hub_network_invite(
-                self,
-                argument(args, "expectedRevision")?,
-                argument(args, "label")?,
-                argument(args, "groups")?,
-            ),
-            "hub_network_approve" => output(hub_network_approve(
-                self,
-                argument(args, "expectedRevision")?,
-                argument(args, "requestId")?,
-                argument(args, "label")?,
-                argument(args, "groups")?,
-            )?),
-            "hub_network_admission" => output(hub_network_admission(
-                self,
-                argument(args, "expectedRevision")?,
-                argument(args, "deviceId")?,
-                argument(args, "stopped")?,
-            )?),
-            "hub_network_group" => output(hub_network_group(
-                self,
-                argument(args, "expectedRevision")?,
-                argument(args, "id")?,
-                argument(args, "label")?,
-            )?),
-            "hub_network_device" => output(hub_network_device(
-                self,
-                argument(args, "expectedRevision")?,
-                argument(args, "deviceId")?,
-                argument(args, "label")?,
-                argument(args, "groups")?,
-                argument(args, "revoked")?,
-            )?),
-            "hub_network_rule" => output(hub_network_rule(
-                self,
-                argument(args, "expectedRevision")?,
-                argument(args, "rule")?,
-            )?),
-            "hub_network_delete_device" => output(hub_network_delete_device(
-                self,
-                argument(args, "expectedRevision")?,
-                argument(args, "deviceId")?,
-            )?),
-            "hub_network_delete_rule" => output(hub_network_delete_rule(
-                self,
-                argument(args, "expectedRevision")?,
-                argument(args, "id")?,
-            )?),
+            "hub_network_settings"
+            | "hub_network_invite"
+            | "hub_network_approve"
+            | "hub_network_admission"
+            | "hub_network_group"
+            | "hub_network_device"
+            | "hub_network_rule"
+            | "hub_network_delete_device"
+            | "hub_network_delete_rule" => {
+                let store = self
+                    .shared_work
+                    .lock()
+                    .map_err(|_| "利用設定を開けません。")?;
+                let mut network = self.network.lock().map_err(|_| "端末設定を開けません。")?;
+                dispatch_network_locked(&store, &mut network, command, args)
+            }
             "hub_network_export" => hub_network_export(self, argument(args, "hubUrl")?),
             _ => Err("この管理操作には対応していません。".into()),
         }

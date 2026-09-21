@@ -12,6 +12,7 @@ export interface WebSession {
         session_id: string | null;
         bootstrap_allowed: boolean;
         login_allowed: boolean;
+        local_management?: boolean;
     };
 }
 let sessionRequest: Promise<WebSession> | null = null;
@@ -19,7 +20,7 @@ let currentSession: WebSession | null = null;
 let authenticationGeneration = 0;
 let authenticationRequired = false;
 const authenticationListeners = new Set<(session: WebSession | null) => void>();
-const staleAuthentication = "ログイン状態が変わりました。管理者として再度ログインしてください。";
+const staleAuthentication = "管理画面の利用許可が変わりました。Hub PCから管理画面を開き直してください。";
 
 export function onAuthenticationChange(listener: (session: WebSession | null) => void): () => void {
     authenticationListeners.add(listener);
@@ -27,7 +28,7 @@ export function onAuthenticationChange(listener: (session: WebSession | null) =>
 }
 function authenticationIdentity(session: WebSession): string {
     return JSON.stringify([session.epoch, session.authentication.session_id, session.authentication.user?.user_id,
-        session.authentication.user?.administrator, session.authentication.login_allowed]);
+        session.authentication.user?.administrator, session.authentication.login_allowed, session.authentication.local_management]);
 }
 function readSession(value: unknown): WebSession {
     const session = value as WebSession | null;
@@ -36,6 +37,7 @@ function readSession(value: unknown): WebSession {
     if (!session || typeof session.csrf !== "string" || !session.csrf || typeof session.epoch !== "string"
         || !auth || typeof auth.configured !== "boolean" || typeof auth.bootstrap_allowed !== "boolean"
         || typeof auth.login_allowed !== "boolean"
+        || !(auth.local_management === undefined || typeof auth.local_management === "boolean")
         || !(user === null ? auth.session_id === null : typeof auth.session_id === "string" && auth.session_id.length > 0)
         || !(user === null || (user && typeof user.user_id === "string" && typeof user.display_name === "string"
             && typeof user.administrator === "boolean"))) {
@@ -83,7 +85,7 @@ export async function managementSession(refresh = false): Promise<WebSession> {
     return sessionRequest;
 }
 export async function authenticate(
-    action: "login" | "bootstrap" | "logout", args: Record<string, string> = {},
+    action: "access" | "logout", args: Record<string, string> = {},
 ): Promise<WebSession> {
     const priorSession = currentSession;
     // Retain only the CSRF value needed to revoke the cookie. Old management
@@ -98,7 +100,7 @@ export async function authenticate(
         const session = priorSession ?? await fetchSession();
         if (expectedGeneration !== authenticationGeneration) throw staleAuthentication;
         if (action !== "logout" && !session.authentication.login_allowed) {
-            throw "HTTPSの管理URL、またはHubと同じPCの直接接続URLを開いてください。";
+            throw "Hub PCの「moyAI Team Management」から管理画面を開いてください。";
         }
         const response = await fetch(`/admin/${action}`, {
             method: "POST", credentials: "same-origin", cache: "no-store", signal: controller.signal,
@@ -106,12 +108,12 @@ export async function authenticate(
         });
         const value = await response.json();
         if (expectedGeneration !== authenticationGeneration) throw staleAuthentication;
-        if (!response.ok) throw typeof value.error === "string" ? value.error : "ログイン状態を変更できませんでした。";
+        if (!response.ok) throw typeof value.error === "string" ? value.error : "管理画面の利用許可を確認できませんでした。";
         const accepted = acceptSession(readSession(value), expectedGeneration);
         sessionRequest = Promise.resolve(accepted);
         return accepted;
     } catch (error) {
-        throw typeof error === "string" ? error : "ログイン状態を確認できません。接続を確かめて「ログイン状態を再確認」を押してください。";
+        throw typeof error === "string" ? error : "管理画面の利用許可を確認できません。Hub PCから管理画面を開き直してください。";
     } finally { clearTimeout(timer); }
 }
 export class ManagementFailure extends Error {
@@ -124,7 +126,7 @@ async function browserInvoke<T>(command: string, args: Record<string, unknown>, 
     const expectedGeneration = authenticationGeneration;
     const session = await managementSession();
     if (expectedGeneration !== authenticationGeneration) throw staleAuthentication;
-    if (!session.authentication.login_allowed || !session.authentication.user?.administrator) throw "管理者としてログインしてください。";
+    if (!session.authentication.login_allowed || !session.authentication.user?.administrator) throw "Hub PCから管理画面を開いてください。";
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), command === "hub_firewall_apply" || command === "hub_firewall_remove" ? 130_000 : 35_000);
     try {
@@ -136,13 +138,13 @@ async function browserInvoke<T>(command: string, args: Record<string, unknown>, 
         const value = await response.json();
         if (expectedGeneration !== authenticationGeneration) throw staleAuthentication;
         if (!response.ok) {
-            if (response.status === 401 || response.status === 403) invalidateAuthentication();
+            if (response.status === 401 || response.status === 403 && value.code !== "requires_hub_pc") invalidateAuthentication();
             if (detailed) throw new ManagementFailure(typeof value.error === "string" ? value.error : "管理操作を完了できませんでした。", response.status, typeof value.code === "string" ? value.code : "unavailable");
             throw typeof value.error === "string" ? value.error : "Web管理操作を完了できませんでした。";
         }
         if (detailed && value.result?.reauthenticate === true) {
             invalidateAuthentication();
-            throw new ManagementFailure("設定を保存しました。変更後の権限で再度ログインしてください。", 401, "unauthorized");
+            throw new ManagementFailure("設定を保存しました。Hub PCから管理画面を開き直してください。", 401, "unauthorized");
         }
         return value.result as T;
     } catch (error) {

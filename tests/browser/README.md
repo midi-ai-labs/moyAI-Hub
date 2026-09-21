@@ -1,6 +1,6 @@
 # Hubのブラウザー試験
 
-Playwrightで実際のHubサーバーとブラウザーを起動します。共有fixtureは隔離したHubの実APIで管理者を初回設定し、認証Cookieをブラウザーへ渡します。認証専用ケースはこの準備を無効にし、初回設定・ログイン・ログアウト画面から操作します。管理APIのmock、保存データの直接編集、証明書の検証無効化は行いません。モデルホストのメタデータと参加端末の応答は、明示した試験用provider・participantを使います。
+Playwrightで実際のHubサーバーとブラウザーを起動します。共有fixtureは隔離したHubのnative Hostで一度限りの起動ticketを発行し、実際の `/admin/access` で管理cookieへ交換します。認証専用ケースはこの準備を無効にし、起動URL・利用終了・再起動ticket・旧sessionの失効を画面から操作します。管理APIのmock、保存データの直接編集、証明書の検証無効化は行いません。モデルホストのメタデータと参加端末の応答は、明示した試験用provider・participantを使います。
 
 ## 準備と実行
 

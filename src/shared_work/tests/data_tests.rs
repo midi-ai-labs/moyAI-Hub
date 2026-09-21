@@ -638,7 +638,7 @@ fn data_v8_blob_migrates_only_after_verified_file_persistence_and_failed_migrati
                     .db
                     .pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
                     .unwrap(),
-                13
+                15
             );
             assert_eq!(
                 f.work

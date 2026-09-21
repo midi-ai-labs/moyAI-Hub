@@ -8,7 +8,7 @@ test("Authenticated browser manages the real Hub without a native app", { tag: "
     await expect(page).toHaveURL(hub.url);
     await expect(page.getByRole("button", { name: "ログイン", exact: true })).toHaveCount(0);
     await expect(page.getByLabel("管理キー", { exact: true })).toHaveCount(0);
-    await expect(page.getByRole("button", { name: "ログアウト", exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "この画面の利用を終了", exact: true })).toBeVisible();
     expect((await page.context().cookies(hub.url)).every(cookie => cookie.httpOnly && cookie.sameSite === "Strict")).toBe(true);
 
     await page.locator('nav a[href="#device-network"]').click();

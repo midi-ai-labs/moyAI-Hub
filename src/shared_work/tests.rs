@@ -130,6 +130,16 @@ impl Fixture {
             .db
             .execute_batch(
                 "
+            DROP VIEW identity_effective_project_memberships;
+            DROP VIEW identity_explicit_project_memberships;
+            DROP TRIGGER identity_controller_insert;
+            DROP TRIGGER identity_controller_update;
+            DROP TRIGGER identity_controller_delete;
+            DROP TABLE identity_web_session_devices;
+            DROP TABLE identity_local_admin;
+            DROP TABLE identity_device_principals;
+            ALTER TABLE identity_sessions DROP COLUMN device_binding_generation;
+            ALTER TABLE identity_users DROP COLUMN credential_kind;
             DROP TABLE shared_project_devices;
             ALTER TABLE shared_projects DROP COLUMN legacy_devices_unrestricted;
             DROP TABLE identity_setup_codes;
@@ -138,6 +148,12 @@ impl Fixture {
             DROP INDEX identity_sessions_refresh;
             ALTER TABLE identity_sessions DROP COLUMN refresh_hash;
             DROP TABLE identity_refresh_sessions;
+            -- Released V5 membership view, before device-derived grants existed.
+            CREATE VIEW identity_effective_project_memberships AS
+             SELECT user_id,project_id,CASE MAX(rank) WHEN 3 THEN 'manager' WHEN 2 THEN 'contributor' ELSE 'reader' END AS role FROM (
+             SELECT m.user_id,m.project_id,CASE m.role WHEN 'manager' THEN 3 WHEN 'contributor' THEN 2 ELSE 1 END AS rank FROM identity_project_memberships m JOIN identity_users u ON u.id=m.user_id WHERE u.disabled=0
+             UNION ALL SELECT m.user_id,p.project_id,CASE p.role WHEN 'manager' THEN 3 WHEN 'contributor' THEN 2 ELSE 1 END FROM identity_group_memberships m JOIN identity_groups g ON g.id=m.group_id JOIN identity_group_project_roles p ON p.group_id=g.id JOIN identity_users u ON u.id=m.user_id WHERE g.disabled=0 AND u.disabled=0
+             ) GROUP BY user_id,project_id;
         ",
             )
             .unwrap();

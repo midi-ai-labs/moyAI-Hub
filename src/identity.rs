@@ -11,8 +11,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::num::NonZeroU32;
+pub(crate) mod device;
 mod remembered;
 mod setup;
+pub(crate) mod web_access;
 pub use remembered::{RememberedSession, login_remembered, logout_remembered, refresh_session};
 pub use setup::{
     IssuedSetupCode, complete_password_setup, create_user_with_setup_code, reissue_setup_code,
@@ -41,6 +43,8 @@ pub enum IdentityError {
     Limit,
     #[error("identity_unavailable")]
     Unavailable,
+    #[error("device_identity_required")]
+    DeviceUnbound,
     #[error("identity_storage")]
     Storage(#[from] rusqlite::Error),
 }
@@ -372,7 +376,7 @@ pub fn login(
         .query_row(
             "SELECT id,display_name,administrator,disabled,password_iterations,password_salt,
          password_hash,credential_generation,failed_logins,blocked_until_ms
-         FROM identity_users WHERE username=?1",
+         FROM identity_users WHERE username=?1 AND credential_kind='password'",
             [&username],
             |r| {
                 Ok((
@@ -480,7 +484,13 @@ pub fn session_status(
          JOIN identity_users u ON u.id=s.user_id
          WHERE s.token_hash=?1 AND s.audience=?2 AND s.device_id IS ?3
          AND s.expires_at_ms>?4 AND u.disabled=0
-         AND s.credential_generation=u.credential_generation",
+         AND s.credential_generation=u.credential_generation
+         AND (s.audience<>'shared_work' OR (
+           (s.device_binding_generation IS NULL OR EXISTS(
+             SELECT 1 FROM identity_device_principals b WHERE b.device_id=s.device_id
+             AND b.user_id=s.user_id AND b.generation=s.device_binding_generation))
+           AND NOT EXISTS(SELECT 1 FROM identity_device_principals b WHERE b.device_id=s.device_id AND b.user_id<>s.user_id)
+         ))",
             params![
                 token_hash(token),
                 audience.as_str(),

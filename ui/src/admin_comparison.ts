@@ -16,28 +16,23 @@ export function compareAdminEdit(kind: AdminOperation, draft: AdminDraft, origin
   const person = (id: string) => { const p = latest.users.find(u => u.user_id === id); return p ? `${p.display_name}（${p.username}）` : `削除された利用者（${id}）`; };
   const pc = (id: string) => `${devices.find(d => d.device_id === id)?.label ?? "登録を確認できないPC"}（${id}）`;
   const projectName = (id: string) => `${latest.projects.find(p => p.id === id)?.label ?? "削除されたプロジェクト"}（${id}）`;
-  const users = ["create_user", "create_user_with_setup_code"];
-  if (users.includes(kind)) {
-    const existing = latest.users.find(u => u.username.toLowerCase() === value("username").trim().toLowerCase());
-    row("ログイン名", existing?.username, value("username"));
-    row("表示名", existing?.display_name, value("display_name"));
-    row("Hub管理者", existing?.administrator, kind === "create_user" && draft.administrator === true);
-    if (kind === "create_user") row("初期パスワード", "内容は表示しません", "入力を保持しています（非表示）");
-    return existing ? block("このログイン名はすでに登録されています。入力を修正し、もう一度比較してください。") : result;
+  if (kind === "bind_device_principal") {
+    const device = devices.find(d => d.device_id === value("device_id") && !d.revoked);
+    if (!device) return block("このPCの登録が削除または失効しています。対象を開き直してください。");
+    const saved = latest.device_principals?.find(p => p.device_id === device.device_id);
+    row("PC", pc(device.device_id), pc(device.device_id));
+    row("利用者", saved ? person(saved.user_id) : "このPC専用の利用者", value("user_id") ? person(value("user_id")) : "このPC専用の利用者");
+    if (value("user_id") && !latest.users.some(u => u.user_id === value("user_id") && !u.disabled && !u.setup_pending)) return block("選択した利用者は引き継げません。利用者の状態を確認してください。");
+    return result;
   }
-  if (kind === "update_user" || kind === "set_password") {
+  if (kind === "update_user") {
     const saved = latest.users.find(u => u.user_id === value("user_id"));
     if (!saved || !original.users.some(u => u.user_id === saved.user_id)) return block("この利用者は削除されたか、登録を確認できません。別の利用者へは保存しません。");
     row("利用者", `${saved.display_name}（${saved.username}）`, person(saved.user_id));
-    if (kind === "set_password") {
-      if (saved.setup_pending) return block("この利用者は本人の初回設定待ちです。対象を開き直して設定方法を確認してください。");
-      row("新しいパスワード", "内容は取得・表示しません", "入力を保持しています（非表示）");
-    } else {
-      row("表示名", saved.display_name, draft.display_name);
-      row("Hub管理者", saved.administrator, draft.administrator === true);
-      row("利用停止", saved.disabled, draft.disabled === true);
-      if (saved.setup_pending && draft.administrator === true) return block("本人の初回設定が終わるまで管理者には変更できません。管理者の選択を外して比較してください。");
-    }
+    row("表示名", saved.display_name, draft.display_name);
+    row("この利用者のPCからHubを管理できる", saved.administrator, draft.administrator === true);
+    row("利用停止", saved.disabled, draft.disabled === true);
+    if (saved.setup_pending && draft.administrator === true) return block("この利用者は旧方式の未完了登録です。利用者の状態を確認してください。");
     return result;
   }
   if (kind === "save_project") {
@@ -46,13 +41,6 @@ export function compareAdminEdit(kind: AdminOperation, draft: AdminDraft, origin
     if (!original.projects.some(p => p.id === value("id")) && saved) return block("この識別名のプロジェクトが別の操作で登録されました。対象を開き直してください。");
     row("プロジェクト名", saved?.label, draft.label);
     row("保管する", saved?.archived, draft.archived === true);
-    const memberships = latest.project_memberships.filter(m => m.project_id === value("id"));
-    const ids = new Set([...memberships.map(m => m.user_id), ...Object.keys(draft).filter(k => k.startsWith("participant:")).map(k => k.slice(12))]);
-    const role = (v: unknown) => v === "reader" || v === "contributor" || v === "manager" ? roleLabel(v) : "参加しない";
-    for (const id of ids) {
-      row(person(id), role(memberships.find(m => m.user_id === id)?.role), role(draft[`participant:${id}`]));
-      if (draft[`participant:${id}`] && !latest.users.some(u => u.user_id === id)) result.blocked = "選択した利用者が削除されました。対象を開き直してください。";
-    }
     const assigned = (latest.project_devices ?? []).filter(p => p.project_id === value("id"));
     for (const [key, flag, label] of [["controller_device_ids", "can_control", "操作に使うPC"], ["runner_device_ids", "can_execute", "仕事を実行するPC"]] as const) {
       const selected = Array.isArray(draft[key]) ? draft[key] as string[] : [];

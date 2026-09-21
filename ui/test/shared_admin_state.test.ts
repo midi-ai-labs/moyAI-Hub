@@ -6,16 +6,16 @@ test("project form with no PC checkboxes clears both previous purposes before co
   const draft={id:"project",label:"PCの再登録待ち",controller_device_ids:["deleted-pc"],runner_device_ids:["deleted-pc"]};
   const form=new FormData();
   Object.assign(draft,projectPCSelection(form));
-  assert.deepEqual(adminRequest("save_project",draft),{kind:"save_project",id:"project",label:"PCの再登録待ち",archived:false,members:[],controller_device_ids:[],runner_device_ids:[]});
+  assert.deepEqual(adminRequest("save_project",draft),{kind:"save_project",id:"project",label:"PCの再登録待ち",archived:false,controller_device_ids:[],runner_device_ids:[]});
   form.append("controller_device_ids","WinA"); form.append("runner_device_ids","WinB");
   assert.deepEqual(projectPCSelection(form),{controller_device_ids:["WinA"],runner_device_ids:["WinB"]});
 });
 
-test("a project saves people and both PC purposes in one request without environment or pool inputs", () => {
+test("a project saves PC purposes without changing existing people and group roles", () => {
   const request=adminRequest("save_project",{id:"project-one",label:"  解析  ","participant:alice":"contributor","participant:bob":"",controller_device_ids:["WinA","WinB","WinA"],runner_device_ids:["WinB","WinC"],template_id:"ignored",capacity:128});
-  assert.deepEqual(request,{kind:"save_project",id:"project-one",label:"解析",archived:false,members:[{user_id:"alice",role:"contributor"}],controller_device_ids:["WinA","WinB"],runner_device_ids:["WinB","WinC"]});
-  assert.throws(()=>adminRequest("save_project",{id:"project",label:"解析","participant:alice":"admin"}));
-  assert.deepEqual(adminTabs.map(([id])=>id),["projects","users","maintenance","storage"]);
+  assert.deepEqual(request,{kind:"save_project",id:"project-one",label:"解析",archived:false,controller_device_ids:["WinA","WinB"],runner_device_ids:["WinB","WinC"]});
+  assert.equal("members" in request, false);
+  assert.deepEqual(adminTabs.map(([id])=>id),["projects","maintenance","storage"]);
 });
 
 test("an environment reuses the selected Runner's one existing pool and exact capacity without granting projects", () => {
@@ -58,11 +58,12 @@ test("environment registration contains shared identity and only selected projec
   for (const value of ["0", "1.5", "129", "1e2", "2suffix"]) assert.throws(() => adminRequest("set_resource", { id: "resource", capacity: value }));
 });
 
-test("password updates preserve literal password and do not carry unrelated draft fields", () => {
-  const password = "  very long password  ";
-  assert.deepEqual(adminRequest("set_password", { user_id: "alice", password, administrator: true }),
-    { kind: "set_password", user_id: "alice", password });
-  assert.throws(() => adminRequest("create_user", { username: "alice", display_name: "Alice", password: "short" }));
+test("device principal assignment uses exact device and user identities with no credentials", () => {
+  assert.deepEqual(adminRequest("bind_device_principal", { device_id: "pc-a", user_id: "alice", password: "ignored" }),
+    { kind: "bind_device_principal", device_id: "pc-a", user_id: "alice" });
+  assert.deepEqual(adminRequest("bind_device_principal", { device_id: "pc-b", user_id: "", display_name: "WinB" }),
+    { kind: "bind_device_principal", device_id: "pc-b", user_id: null, display_name: "WinB" });
+  assert.throws(() => adminRequest("bind_device_principal", { user_id: "alice" }));
 });
 
 test("uncertain effect settlement requires the exact attempt generation and explicit confirmation", () => {

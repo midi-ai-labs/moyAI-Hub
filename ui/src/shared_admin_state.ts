@@ -1,9 +1,9 @@
 export type ProjectRole = "reader" | "contributor" | "manager";
 export interface SharedAdminUser { user_id: string; username: string; display_name: string; administrator: boolean; disabled: boolean; setup_pending?: boolean }
 export interface SharedAdminSnapshot {
-  issued_setup_code?: { user_id: string; username: string; code: string; expires_at_ms: number };
   revision: string;
   users: SharedAdminUser[];
+  device_principals?: { device_id: string; user_id: string; display_name: string }[];
   groups: { id: string; label: string; disabled: boolean }[];
   group_memberships: { group_id: string; user_id: string }[];
   projects: { id: string; label: string; archived: boolean; legacy_devices_unrestricted?: boolean }[];
@@ -21,10 +21,9 @@ export interface SharedAdminSnapshot {
 }
 export type SharedAdminTab = "users" | "groups" | "projects" | "environments" | "resources" | "maintenance" | "storage";
 export const adminTabs: [SharedAdminTab, string][] = [
-  ["projects", "プロジェクト"], ["users", "利用者"], ["maintenance", "停止状態の確認"], ["storage", "保存と保守"],
+  ["projects", "プロジェクト"], ["maintenance", "停止状態の確認"], ["storage", "保存と保守"],
 ];
-export type AdminOperation = "create_user" | "update_user" | "set_password" | "delete_user"
-  | "create_user_with_setup_code" | "reissue_setup_code" | "revoke_setup_code"
+export type AdminOperation = "update_user" | "delete_user" | "bind_device_principal"
   | "save_project" | "retry_project_device"
   | "create_group" | "update_group" | "delete_group" | "group_member"
   | "create_project" | "update_project" | "delete_project" | "project_member" | "group_project_role"
@@ -40,9 +39,9 @@ export function environmentDefaults(snapshot: Pick<SharedAdminSnapshot, "environ
   return { runner_id: runnerId, resource_id: resource?.id ?? (ids.length === 0 ? newResourceId : ""), capacity: String(resource?.capacity ?? 1), template_id: "" };
 }
 export const operationLabels: Record<AdminOperation, string> = {
-  create_user_with_setup_code: "本人設定コードで利用者を追加", reissue_setup_code: "本人設定コードを再発行", revoke_setup_code: "本人設定コードを失効",
+  bind_device_principal: "このPCの利用者を設定",
   save_project: "プロジェクトを保存", retry_project_device: "実行PCのフォルダー作成を再試行",
-  create_user: "利用者を追加", update_user: "利用者を編集", set_password: "パスワードを再設定", delete_user: "利用者を削除",
+  update_user: "利用者を編集", delete_user: "利用者を削除",
   create_group: "グループを追加", update_group: "グループを編集", delete_group: "グループを削除", group_member: "グループの所属を設定",
   create_project: "プロジェクトを追加", update_project: "プロジェクトを編集", delete_project: "プロジェクトを削除",
   project_member: "利用者の役割を設定", group_project_role: "グループの役割を設定",
@@ -62,11 +61,6 @@ function capacity(draft: AdminDraft): number {
   if (!/^[1-9]\d*$/.test(value) || Number(value) > 128) throw "同時利用枠は1〜128で指定してください。";
   return Number(value);
 }
-function password(draft: AdminDraft): string {
-  const value = String(draft.password ?? "");
-  if ([...value].length < 12 || new TextEncoder().encode(value).length > 1024) throw "パスワードは12文字以上、UTF-8で1024バイト以内にしてください。";
-  return value;
-}
 function role(draft: AdminDraft): ProjectRole | null {
   const value = text(draft, "role");
   if (!value) return null;
@@ -77,20 +71,14 @@ export function adminRequest(kind: AdminOperation, draft: AdminDraft): Record<st
   const id = () => required(draft, "id");
   const user_id = () => required(draft, "user_id");
   switch (kind) {
-    case "create_user_with_setup_code": return { kind, username: required(draft,"username"), display_name: required(draft,"display_name") };
-    case "reissue_setup_code": case "revoke_setup_code": return { kind, user_id:user_id() };
+    case "bind_device_principal": return { kind, device_id: required(draft, "device_id"), user_id: text(draft, "user_id") || null, ...(text(draft, "display_name") ? { display_name: text(draft, "display_name") } : {}) };
     case "save_project": {
-      const members = Object.entries(draft).filter(([key,value]) => key.startsWith("participant:") && value !== "").map(([key,value]) => {
-        if (!["reader","contributor","manager"].includes(String(value))) throw "参加者の役割を確認してください。";
-        return { user_id:key.slice("participant:".length), role:String(value) };
-      });
       const selected = (key:string) => Array.isArray(draft[key]) ? [...new Set(draft[key] as string[])] : [];
-      return { kind,id:id(),label:required(draft,"label"),archived:flag(draft,"archived"),members,controller_device_ids:selected("controller_device_ids"),runner_device_ids:selected("runner_device_ids") };
+      // This editor owns PC purposes, not the preserved individual/group roles.
+      return { kind,id:id(),label:required(draft,"label"),archived:flag(draft,"archived"),controller_device_ids:selected("controller_device_ids"),runner_device_ids:selected("runner_device_ids") };
     }
     case "retry_project_device": return {kind,project_id:required(draft,"project_id"),device_id:required(draft,"device_id")};
-    case "create_user": return { kind, username: required(draft, "username"), display_name: required(draft, "display_name"), password: password(draft), administrator: flag(draft, "administrator") };
     case "update_user": return { kind, user_id: user_id(), display_name: required(draft, "display_name"), administrator: flag(draft, "administrator"), disabled: flag(draft, "disabled") };
-    case "set_password": return { kind, user_id: user_id(), password: password(draft) };
     case "delete_user": return { kind, user_id: user_id() };
     case "create_group": case "create_project": return { kind, id: id(), label: required(draft, "label") };
     case "update_group": return { kind, id: id(), label: required(draft, "label"), disabled: flag(draft, "disabled") };

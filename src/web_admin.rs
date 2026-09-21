@@ -1,5 +1,5 @@
 //! Browser management on independent HTTP and optional HTTPS/proxy listeners.
-//! Human administrator sessions protect management operations. Origin and CSRF
+//! Host/device-authorized administrator sessions protect management operations. Origin and CSRF
 //! checks remain independent of the authenticated identity.
 use crate::{admin::Admin, network::tls::TlsPeer};
 use axum::{
@@ -28,6 +28,7 @@ pub(crate) fn assets_ready() -> bool {
 mod authentication;
 pub(crate) mod server;
 mod shared;
+mod tickets;
 
 /// Server-configured origin and access generation. Request headers never select a policy.
 #[derive(Clone, Debug)]
@@ -88,11 +89,14 @@ const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self' 'unsa
 struct AccessState {
     epoch: Option<String>,
     csrf_seed: String,
+    remote_origin: Option<String>,
+    tickets: Vec<tickets::Ticket>,
 }
 pub(crate) struct WebAccess {
     state: Mutex<AccessState>,
     slots: Arc<tokio::sync::Semaphore>,
     login_slots: Arc<tokio::sync::Semaphore>,
+    read_slots: Arc<tokio::sync::Semaphore>,
 }
 impl Default for WebAccess {
     fn default() -> Self {
@@ -100,6 +104,7 @@ impl Default for WebAccess {
             state: Mutex::new(AccessState::default()),
             slots: Arc::new(tokio::sync::Semaphore::new(8)),
             login_slots: Arc::new(tokio::sync::Semaphore::new(2)),
+            read_slots: Arc::new(tokio::sync::Semaphore::new(8)),
         }
     }
 }
@@ -124,6 +129,7 @@ impl WebAccess {
         *state = AccessState {
             epoch: Some(ulid::Ulid::new().to_string()),
             csrf_seed: secret(),
+            ..Default::default()
         };
         Ok(())
     }
@@ -171,10 +177,15 @@ struct WebState {
     admin: Weak<Admin>,
     policy: WebPolicy,
 }
+fn requires_hub_pc() -> Response {
+    (StatusCode::FORBIDDEN,Json(json!({"error":"Hubの起動・公開先・AI接続の変更は、Hub PC の管理画面で行ってください。","code":"requires_hub_pc"}))).into_response()
+}
 fn failure(code: StatusCode) -> Response {
     let message = match code {
         StatusCode::FORBIDDEN => "このWeb管理操作は許可されていません。",
-        StatusCode::UNAUTHORIZED => "管理者としてログインしてください。",
+        StatusCode::UNAUTHORIZED => {
+            "Hub PC または管理権限のあるPCから管理画面を開き直してください。"
+        }
         StatusCode::TOO_MANY_REQUESTS => {
             "処理中の操作があります。少し待ってから再試行してください。"
         }
@@ -293,9 +304,8 @@ pub(crate) fn router(admin: Weak<Admin>, policy: WebPolicy) -> Router {
         .route("/admin/", get(index))
         .route("/admin/assets/{*path}", get(asset))
         .route("/admin/session", get(session))
-        .route("/admin/login", post(authentication::login))
+        .route("/admin/access", post(authentication::access))
         .route("/admin/logout", post(authentication::logout))
-        .route("/admin/bootstrap", post(authentication::bootstrap))
         .route("/admin/command", post(command))
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
@@ -318,7 +328,7 @@ async fn session(
     headers: HeaderMap,
     axum::Extension(local): axum::Extension<authentication::BootstrapAccess>,
 ) -> Response {
-    authentication::session_response(&state, &headers, local.0, None)
+    authentication::session_response(&state, &headers, local.0, None).await
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -387,11 +397,23 @@ async fn command(
     if let Err(code) = admin.web_access.session(&headers, true, &state.policy) {
         return failure(code);
     }
-    if let Err(code) = authentication::principal(&admin, &headers) {
-        return failure(code);
-    }
     if !browser_command(&input.command) || !input.args.is_object() {
         return failure(StatusCode::FORBIDDEN);
+    }
+    if !local.0
+        && !shared::owns_command(&input.command)
+        && !matches!(
+            input.command.as_str(),
+            "hub_web_status"
+                | "hub_snapshot"
+                | "hub_network_snapshot"
+                | "hub_hosting_options"
+                | "hub_network_diagnostics"
+                | "hub_network_export"
+                | "hub_history_result"
+        )
+    {
+        return requires_hub_pc();
     }
     if matches!(
         input.command.as_str(),
@@ -407,20 +429,6 @@ async fn command(
     let Ok(permit) = admin.web_access.slots.clone().try_acquire_owned() else {
         return failure(StatusCode::TOO_MANY_REQUESTS);
     };
-    if matches!(
-        input.command.as_str(),
-        "hub_shared_snapshot"
-            | "hub_shared_command"
-            | "hub_shared_retention_preview"
-            | "hub_shared_maintenance"
-            | "hub_join_project"
-    ) {
-        let token = match authentication::request_token(&headers) {
-            Ok(token) => token,
-            Err(code) => return failure(code),
-        };
-        return shared::command(admin, input, token, permit).await;
-    }
     // Dispatch can own blocking filesystem work. A caller timeout/disconnect must not
     // release its concurrency slot while that actual work is still running.
     let timeout_seconds = if matches!(
@@ -432,17 +440,60 @@ async fn command(
         30
     };
     let operation = tokio::spawn(async move {
+        // Authentication may wait on the same database/network owner as a
+        // queued command. Never block the async executor on those std mutexes.
+        // This task retains the request slot even after a caller disconnects.
+        let owner = admin.clone();
+        let auth_headers = headers.clone();
+        match tokio::task::spawn_blocking(move || authentication::principal(&owner, &auth_headers))
+            .await
+        {
+            Ok(Ok((_, native))) => {
+                if !native
+                    && !shared::owns_command(&input.command)
+                    && !matches!(
+                        input.command.as_str(),
+                        "hub_web_status"
+                            | "hub_snapshot"
+                            | "hub_network_snapshot"
+                            | "hub_hosting_options"
+                            | "hub_network_diagnostics"
+                            | "hub_network_export"
+                            | "hub_history_result"
+                    )
+                {
+                    return requires_hub_pc();
+                }
+            }
+            Ok(Err(code)) => return failure(code),
+            Err(_) => return failure(StatusCode::SERVICE_UNAVAILABLE),
+        }
+        if shared::owns_command(&input.command) {
+            let token = match authentication::request_token(&headers) {
+                Ok(token) => token,
+                Err(code) => return failure(code),
+            };
+            return shared::command(admin, input, token, permit).await;
+        }
         let _permit = permit;
-        admin.dispatch(&input.command, input.args).await
+        match admin.dispatch(&input.command, input.args).await {
+            Ok(value) => {
+                let Ok(bytes) = serde_json::to_vec(&json!({"result":value})) else {
+                    return failure(StatusCode::INTERNAL_SERVER_ERROR);
+                };
+                if bytes.len() > 4 * 1024 * 1024 {
+                    return failure(StatusCode::PAYLOAD_TOO_LARGE);
+                }
+                ([(header::CONTENT_TYPE, "application/json")], bytes).into_response()
+            }
+            Err(message) => {
+                (StatusCode::BAD_REQUEST, Json(json!({"error":message}))).into_response()
+            }
+        }
     });
     // A lost response is not replayed: revision/identity checks remain in the shared owner.
     match tokio::time::timeout(Duration::from_secs(timeout_seconds), operation).await {
-        Ok(Ok(Ok(value))) => {
-            let Ok(bytes) = serde_json::to_vec(&json!({"result": value})) else { return failure(StatusCode::INTERNAL_SERVER_ERROR); };
-            if bytes.len() > 4 * 1024 * 1024 { return failure(StatusCode::PAYLOAD_TOO_LARGE); }
-            ([(header::CONTENT_TYPE, "application/json")], bytes).into_response()
-        }
-        Ok(Ok(Err(message))) => (StatusCode::BAD_REQUEST, Json(json!({"error": message}))).into_response(),
+        Ok(Ok(response)) => response,
         Ok(Err(_)) => failure(StatusCode::SERVICE_UNAVAILABLE),
         Err(_) => (StatusCode::GATEWAY_TIMEOUT, Json(json!({"error": "操作結果を確認できません。最新状態を取得してください。操作は自動再実行されません。"}))).into_response(),
     }

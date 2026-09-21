@@ -438,28 +438,32 @@ fn response_cookie(response: &reqwest::Response, secure: bool) -> String {
     attributes[0].to_owned()
 }
 
-#[tokio::test]
-async fn browser_bootstrap_requires_local_origin_and_csrf_and_only_runs_once() {
-    let fixture = Fixture::unconfigured_http().await;
-    let response = fixture
-        .client
-        .get(format!("{}/admin/session", fixture.url))
-        .send()
-        .await
+fn access_payload(fixture: &Fixture) -> Value {
+    let user = {
+        let store = fixture.admin.shared_work.lock().unwrap();
+        crate::identity::web_access::local_owner(
+            store.identity_connection(),
+            crate::service::now_ms(),
+        )
+        .unwrap()
+    };
+    let url = fixture
+        .admin
+        .web_access
+        .issue_ticket(&fixture.url, user.user_id, None)
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    assert!(!response.headers().contains_key(header::SET_COOKIE));
-    let session: Value = response.json().await.unwrap();
-    assert_eq!(
-        session["authentication"],
-        json!({"configured":false,"user":null,"session_id":null,"bootstrap_allowed":true,"login_allowed":true})
-    );
-    let csrf = session["csrf"].as_str().unwrap();
-    let payload = json!({"username":ADMIN_USERNAME,"display_name":"Initial administrator","password":ADMIN_PASSWORD});
+    json!({"ticket":url.split_once("#access=").unwrap().1})
+}
+
+#[tokio::test]
+async fn browser_access_requires_host_ticket_origin_csrf_and_single_use() {
+    let fixture = Fixture::unconfigured_http().await;
+    let csrf = fixture.csrf().await;
+    let payload = access_payload(&fixture);
     assert_eq!(
         fixture
             .post("/admin/command")
-            .header("x-moyai-csrf", csrf)
+            .header("x-moyai-csrf", &csrf)
             .json(&json!({"command":"hub_snapshot","args":{}}))
             .send()
             .await
@@ -469,7 +473,7 @@ async fn browser_bootstrap_requires_local_origin_and_csrf_and_only_runs_once() {
     );
     assert_eq!(
         fixture
-            .post("/admin/bootstrap")
+            .post("/admin/access")
             .json(&payload)
             .send()
             .await
@@ -479,8 +483,8 @@ async fn browser_bootstrap_requires_local_origin_and_csrf_and_only_runs_once() {
     );
     assert_eq!(
         fixture
-            .post("/admin/bootstrap")
-            .header("x-moyai-csrf", csrf)
+            .post("/admin/access")
+            .header("x-moyai-csrf", &csrf)
             .header("x-forwarded-for", "127.0.0.1")
             .json(&payload)
             .send()
@@ -489,331 +493,235 @@ async fn browser_bootstrap_requires_local_origin_and_csrf_and_only_runs_once() {
             .status(),
         StatusCode::FORBIDDEN
     );
-    let forwarded: Value = fixture
-        .client
-        .get(format!("{}/admin/session", fixture.url))
-        .header("x-forwarded-for", "127.0.0.1")
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(forwarded["authentication"]["bootstrap_allowed"], false);
-    assert_eq!(fixture.post("/admin/bootstrap").header("x-moyai-csrf", csrf)
-        .json(&json!({"username":ADMIN_USERNAME,"display_name":"Initial administrator","password":"short"}))
-        .send().await.unwrap().status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        fixture
+            .post("/admin/access")
+            .header("x-moyai-csrf", &csrf)
+            .json(&json!({"ticket":"bad"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    for retired in ["/admin/login", "/admin/bootstrap"] {
+        assert_eq!(
+            fixture
+                .post(retired)
+                .header("x-moyai-csrf", &csrf)
+                .json(&json!({"username":"x","password":"x"}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
     let response = fixture
-        .post("/admin/bootstrap")
-        .header("x-moyai-csrf", csrf)
+        .post("/admin/access")
+        .header("x-moyai-csrf", &csrf)
         .json(&payload)
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let cookie = response_cookie(&response, false);
-    let signed_in: Value = response.json().await.unwrap();
-    assert_eq!(signed_in["authentication"]["configured"], true);
-    assert_eq!(signed_in["authentication"]["bootstrap_allowed"], false);
-    assert_eq!(signed_in["authentication"]["user"]["administrator"], true);
+    let signed: Value = response.json().await.unwrap();
+    assert_eq!(signed["authentication"]["user"]["administrator"], true);
+    assert_eq!(signed["authentication"]["bootstrap_allowed"], false);
+    assert!(signed.get("token").is_none());
+    let session = signed["authentication"]["session_id"].as_str().unwrap();
+    let command = |sid: &str| {
+        fixture
+            .post("/admin/command")
+            .header("x-moyai-csrf", &csrf)
+            .header("cookie", &cookie)
+            .header("x-moyai-session", sid)
+            .json(&json!({"command":"hub_snapshot","args":{}}))
+    };
     assert_eq!(
-        signed_in["authentication"]["user"]["display_name"],
-        "Initial administrator"
+        command(session).send().await.unwrap().status(),
+        StatusCode::OK
     );
-    assert!(signed_in.get("token").is_none());
-    assert!(signed_in["authentication"].get("token").is_none());
+    assert_eq!(
+        command("stale-document").send().await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        fixture
+            .post("/admin/access")
+            .header("x-moyai-csrf", &csrf)
+            .json(&payload)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    // A browser cannot ask the trusted native Host for another ticket.
     assert_eq!(
         fixture
             .post("/admin/command")
-            .header("x-moyai-csrf", csrf)
-            .header(header::COOKIE, &cookie)
+            .header("x-moyai-csrf", &csrf)
+            .header("cookie", &cookie)
+            .header("x-moyai-session", session)
+            .json(&json!({"command":"hub_web_open","args":{}}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let response = fixture
+        .post("/admin/logout")
+        .header("x-moyai-csrf", &csrf)
+        .header("cookie", &cookie)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_cookie(&response, false), "moyai_admin=");
+    assert_eq!(
+        command(session).send().await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let reopened = fixture
+        .post("/admin/access")
+        .header("x-moyai-csrf", &csrf)
+        .json(&access_payload(&fixture))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reopened.status(), StatusCode::OK);
+    let next: Value = reopened.json().await.unwrap();
+    assert_eq!(
+        next["authentication"]["user"],
+        signed["authentication"]["user"]
+    );
+    assert_ne!(
+        next["authentication"]["session_id"],
+        signed["authentication"]["session_id"]
+    );
+}
+
+#[tokio::test]
+async fn https_administrator_access_sets_secure_cookie_and_rechecks_current_role() {
+    let fixture = Fixture::new().await;
+    let csrf = fixture.csrf().await;
+    let payload = access_payload(&fixture);
+    let response = fixture
+        .post("/admin/access")
+        .header("x-moyai-csrf", &csrf)
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let cookie = response_cookie(&response, true);
+    let session: Value = response.json().await.unwrap();
+    let user = session["authentication"]["user"]["user_id"]
+        .as_str()
+        .unwrap();
+    {
+        let store = fixture.admin.shared_work.lock().unwrap();
+        store
+            .identity_connection()
+            .execute(
+                "UPDATE identity_users SET administrator=0 WHERE id=?1",
+                [user],
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        fixture
+            .post("/admin/command")
+            .header("x-moyai-csrf", &csrf)
+            .header("cookie", &cookie)
             .header(
                 "x-moyai-session",
-                signed_in["authentication"]["session_id"].as_str().unwrap()
+                session["authentication"]["session_id"].as_str().unwrap()
             )
             .json(&json!({"command":"hub_snapshot","args":{}}))
             .send()
             .await
             .unwrap()
             .status(),
-        StatusCode::OK
+        StatusCode::FORBIDDEN
     );
-    assert_eq!(
-        fixture
-            .post("/admin/bootstrap")
-            .header("x-moyai-csrf", csrf)
-            .json(&payload)
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::CONFLICT
+}
+
+#[test]
+fn browser_ticket_is_origin_epoch_expiry_bound_and_single_use() {
+    let access = WebAccess::default();
+    access.enable().unwrap();
+    let local = WebPolicy::new("http://127.0.0.1:1234", access.epoch().unwrap()).unwrap();
+    let other = WebPolicy::new("https://other.example", access.epoch().unwrap()).unwrap();
+    let url = access
+        .issue_ticket(&local.origin, "actor".into(), None)
+        .unwrap();
+    let token = url.split_once("#access=").unwrap().1;
+    assert!(access.consume_ticket(token, &other).is_err());
+    assert!(access.consume_ticket(token, &local).is_ok());
+    assert!(access.consume_ticket(token, &local).is_err());
+    let url = access
+        .issue_ticket(&local.origin, "actor".into(), None)
+        .unwrap();
+    let token = url.split_once("#access=").unwrap().1;
+    access.state.lock().unwrap().tickets[0].expires =
+        std::time::Instant::now() - Duration::from_secs(1);
+    assert!(access.consume_ticket(token, &local).is_err());
+    let url = access
+        .issue_ticket(&local.origin, "actor".into(), None)
+        .unwrap();
+    access.enable().unwrap();
+    assert!(
+        access
+            .consume_ticket(url.split_once("#access=").unwrap().1, &local)
+            .is_err()
     );
 }
 
 #[tokio::test]
-async fn browser_login_logout_and_current_role_control_management_access() {
-    use crate::identity::{self, SessionAudience};
-    let fixture = Fixture::new_http().await;
-    let csrf = fixture.csrf().await;
-    let original_cookie = fixture.cookie.as_deref().unwrap();
-    let login = json!({"username":ADMIN_USERNAME,"password":ADMIN_PASSWORD});
-    assert_eq!(
-        fixture
-            .post("/admin/login")
-            .json(&login)
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::FORBIDDEN
-    );
-    assert_eq!(
-        fixture
-            .post("/admin/logout")
-            .json(&json!({}))
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::FORBIDDEN
-    );
-    assert_eq!(
-        fixture
-            .post("/admin/login")
-            .header("x-moyai-csrf", &csrf)
-            .json(&json!({"username":ADMIN_USERNAME,"password":"incorrect password"}))
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::UNAUTHORIZED
-    );
-    let response = fixture
-        .post("/admin/logout")
-        .header("x-moyai-csrf", &csrf)
-        .json(&json!({}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    assert!(
-        response.headers()[header::SET_COOKIE]
-            .to_str()
-            .unwrap()
-            .split(';')
-            .any(|v| v.trim() == "Max-Age=0")
-    );
-    assert_eq!(response_cookie(&response, false), "moyai_admin=");
-    let logged_out: Value = response.json().await.unwrap();
-    assert!(logged_out["authentication"]["user"].is_null());
-    let command = |cookie: &str| {
-        fixture
-            .post("/admin/command")
-            .header("x-moyai-csrf", &csrf)
-            .header(header::COOKIE, cookie)
-            .header("x-moyai-session", cookie_session(cookie))
-            .json(&json!({"command":"hub_snapshot","args":{}}))
+async fn session_reads_wait_off_executor_and_keep_a_bounded_slot_after_disconnect() {
+    let fixture = Fixture::unconfigured_http().await;
+    let state = WebState {
+        admin: Arc::downgrade(&fixture.admin),
+        policy: fixture.policy.clone(),
     };
-    assert_eq!(
-        command(original_cookie).send().await.unwrap().status(),
-        StatusCode::UNAUTHORIZED
-    );
-    let session: Value = fixture
-        .client
-        .get(format!("{}/admin/session", fixture.url))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(
-        session["authentication"],
-        json!({"configured":true,"user":null,"session_id":null,"bootstrap_allowed":false,"login_allowed":true})
-    );
-    let response = fixture
-        .post("/admin/login")
-        .header("x-moyai-csrf", &csrf)
-        .json(&login)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let renewed_cookie = response_cookie(&response, false);
-    assert_ne!(original_cookie, renewed_cookie);
-    assert_eq!(
-        command(&renewed_cookie).send().await.unwrap().status(),
-        StatusCode::OK
-    );
-    let mut missing_session = command(&renewed_cookie).build().unwrap();
-    missing_session.headers_mut().remove("x-moyai-session");
-    let anonymous_client = reqwest::Client::builder().no_proxy().build().unwrap();
-    assert_eq!(
-        anonymous_client
-            .execute(missing_session)
+    let headers = HeaderMap::new();
+    let owner = fixture.admin.shared_work.lock().unwrap();
+    for _ in 0..8 {
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(5),
+                authentication::session_response(&state, &headers, true, None)
+            )
             .await
-            .unwrap()
-            .status(),
-        StatusCode::UNAUTHORIZED
-    );
-    let mut stale_session = command(&renewed_cookie).build().unwrap();
-    stale_session.headers_mut().insert(
-        "x-moyai-session",
-        cookie_session(original_cookie).parse().unwrap(),
-    );
-    assert_eq!(
-        fixture
-            .client
-            .execute(stale_session)
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::UNAUTHORIZED
-    );
-    assert_eq!(
-        command(&renewed_cookie)
-            .header("x-forwarded-for", "127.0.0.1")
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::FORBIDDEN
-    );
-    assert_eq!(
-        fixture
-            .post("/admin/login")
-            .header("x-moyai-csrf", &csrf)
-            .header("x-forwarded-for", "127.0.0.1")
-            .json(&login)
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::FORBIDDEN
-    );
-    let insecure: Value = fixture
-        .client
-        .get(format!("{}/admin/session", fixture.url))
-        .header(header::COOKIE, &renewed_cookie)
-        .header("x-forwarded-for", "127.0.0.1")
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(insecure["authentication"]["login_allowed"], false);
-    assert!(insecure["authentication"]["user"].is_null());
-    assert_eq!(
-        command(&format!("{renewed_cookie}; {renewed_cookie}"))
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::UNAUTHORIZED
-    );
-    let (operator, administrator, shared_token) = {
-        let store = fixture.admin.shared_work.lock().unwrap();
-        let db = store.identity_connection();
-        let now = crate::service::now_ms();
-        let admin_session = identity::login(
-            db,
-            ADMIN_USERNAME,
-            ADMIN_PASSWORD,
-            SessionAudience::WebAdmin,
-            None,
-            now,
-        )
-        .unwrap();
-        let operator = identity::create_user(
-            db,
-            &admin_session.principal,
-            "operator",
-            "Operator",
-            ADMIN_PASSWORD,
-            false,
-            now,
-        )
-        .unwrap();
-        let shared = identity::login(
-            db,
-            ADMIN_USERNAME,
-            ADMIN_PASSWORD,
-            SessionAudience::SharedWork,
-            Some("fixture-device"),
-            now,
-        )
-        .unwrap();
-        (operator, admin_session.principal, shared.token)
-    };
-    assert_eq!(
-        command(&format!("moyai_admin={shared_token}"))
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::UNAUTHORIZED
-    );
-    assert_eq!(
-        fixture
-            .post("/admin/login")
-            .header("x-moyai-csrf", &csrf)
-            .json(&json!({"username":"operator","password":ADMIN_PASSWORD}))
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::FORBIDDEN
-    );
-    {
-        let store = fixture.admin.shared_work.lock().unwrap();
-        let db = store.identity_connection();
-        let now = crate::service::now_ms();
-        identity::update_user(
-            db,
-            &administrator,
-            &operator.user_id,
-            "Operator",
-            true,
-            false,
-            now,
-        )
-        .unwrap();
-        identity::update_user(
-            db,
-            &administrator,
-            &administrator.user_id,
-            "Former administrator",
-            false,
-            false,
-            now,
-        )
-        .unwrap();
+            .is_err()
+        );
     }
     assert_eq!(
-        command(&renewed_cookie).send().await.unwrap().status(),
-        StatusCode::UNAUTHORIZED
+        authentication::session_response(&state, &headers, true, None)
+            .await
+            .status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    drop(owner);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while fixture.admin.web_access.read_slots.available_permits() != 8 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        authentication::session_response(&state, &headers, true, None)
+            .await
+            .status(),
+        StatusCode::OK
     );
 }
-
-#[tokio::test]
-async fn https_administrator_login_sets_secure_cookie() {
-    let fixture = Fixture::new().await;
-    let csrf = fixture.csrf().await;
-    let response = fixture
-        .post("/admin/login")
-        .header("x-moyai-csrf", &csrf)
-        .json(&json!({"username":ADMIN_USERNAME,"password":ADMIN_PASSWORD}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    response_cookie(&response, true);
-    let session: Value = response.json().await.unwrap();
-    assert_eq!(session["authentication"]["user"]["administrator"], true);
-}
-
 #[tokio::test]
 async fn abandoned_browser_requests_hold_slots_until_the_actual_dispatch_finishes() {
     let fixture = Fixture::new().await;
@@ -995,7 +903,7 @@ async fn tls_browser_management_uses_shared_revision_owner_and_rejects_local_onl
             StatusCode::NOT_FOUND
         );
     }
-    for mutation in ["/admin/login", "/admin/logout", "/admin/bootstrap"] {
+    for mutation in ["/admin/access", "/admin/logout"] {
         assert_eq!(
             fixture
                 .client
@@ -1010,15 +918,224 @@ async fn tls_browser_management_uses_shared_revision_owner_and_rejects_local_onl
     for command in ["hub_network_stop", "hub_stop", "hub_web_status"] {
         assert_eq!(
             request(command, json!({})).send().await.unwrap().status(),
-            StatusCode::OK
+            if command == "hub_web_status" {
+                StatusCode::OK
+            } else {
+                StatusCode::FORBIDDEN
+            }
         );
     }
     for command in ["hub_network_start", "hub_start"] {
-        // A missing required field reaches the shared command validator. The
-        // browser must not reject these server controls as native-only actions.
+        // Host lifecycle is changed from the Hub PC's native-opened browser.
         assert_eq!(
             request(command, json!({})).send().await.unwrap().status(),
-            StatusCode::BAD_REQUEST
+            StatusCode::FORBIDDEN
         );
     }
+}
+
+#[tokio::test]
+async fn queued_network_mutation_reauthenticates_remote_device_after_owner_wait() {
+    let fixture = Fixture::new_http().await;
+    let now = crate::service::now_ms();
+    let (device_id, remote_token, revision) = {
+        let store = fixture.admin.shared_work.lock().unwrap();
+        let actor = crate::identity::web_access::local_owner(&store.db, now).unwrap();
+        let mut network = fixture.admin.network.lock().unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let csr = rcgen::CertificateParams::new(vec!["127.0.0.1".into()])
+            .unwrap()
+            .serialize_request(&key)
+            .unwrap()
+            .pem()
+            .unwrap();
+        let invitation_revision = network.revision();
+        let invitation = network
+            .invite(
+                &invitation_revision,
+                "Remote admin PC".into(),
+                Default::default(),
+                now,
+            )
+            .unwrap();
+        let receipt = network
+            .enroll(
+                invitation["code"].as_str().unwrap(),
+                &csr,
+                "127.0.0.1".parse().unwrap(),
+                now,
+            )
+            .unwrap();
+        crate::identity::device::bind(
+            &store.db,
+            &actor,
+            &receipt.device_id,
+            Some(&actor.user_id),
+            "Remote admin PC",
+            now,
+        )
+        .unwrap();
+        let proof = crate::identity::web_access::device_proof(
+            &store.db,
+            &actor.user_id,
+            &receipt.device_id,
+            &receipt.certificate_sha256,
+        )
+        .unwrap();
+        let session =
+            crate::identity::web_access::issue(&store.db, &actor.user_id, Some(&proof), now)
+                .unwrap();
+        (receipt.device_id, session.token, network.revision())
+    };
+    let mut network = fixture.admin.network.lock().unwrap();
+    let permit = fixture
+        .admin
+        .web_access
+        .slots
+        .clone()
+        .try_acquire_owned()
+        .unwrap();
+    let mut operation = tokio::spawn(shared::command(
+        fixture.admin.clone(),
+        Command {
+            command: "hub_network_group".into(),
+            args: json!({"expectedRevision":revision,"id":null,"label":"Must not be created"}),
+        },
+        remote_token,
+        permit,
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), &mut operation)
+            .await
+            .is_err()
+    );
+    let revoke_revision = network.revision();
+    network
+        .set_device(
+            &revoke_revision,
+            &device_id,
+            "Remote admin PC".into(),
+            Default::default(),
+            true,
+        )
+        .unwrap();
+    drop(network);
+    let response = tokio::time::timeout(Duration::from_secs(3), operation)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(
+        fixture.admin.network.lock().unwrap().snapshot(now)["groups"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn remote_cookie_on_loopback_keeps_project_management_but_cannot_change_host_settings() {
+    let fixture = Fixture::new_http().await;
+    let now = crate::service::now_ms();
+    let (device, token) = {
+        let store = fixture.admin.shared_work.lock().unwrap();
+        let actor = crate::identity::web_access::local_owner(&store.db, now).unwrap();
+        let mut network = fixture.admin.network.lock().unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let csr = rcgen::CertificateParams::new(vec!["127.0.0.1".into()])
+            .unwrap()
+            .serialize_request(&key)
+            .unwrap()
+            .pem()
+            .unwrap();
+        let revision = network.revision();
+        let invitation = network
+            .invite(&revision, "Remote admin PC".into(), Default::default(), now)
+            .unwrap();
+        let receipt = network
+            .enroll(
+                invitation["code"].as_str().unwrap(),
+                &csr,
+                "127.0.0.1".parse().unwrap(),
+                now,
+            )
+            .unwrap();
+        crate::identity::device::bind(
+            &store.db,
+            &actor,
+            &receipt.device_id,
+            Some(&actor.user_id),
+            "Remote admin PC",
+            now,
+        )
+        .unwrap();
+        let proof = crate::identity::web_access::device_proof(
+            &store.db,
+            &actor.user_id,
+            &receipt.device_id,
+            &receipt.certificate_sha256,
+        )
+        .unwrap();
+        let session =
+            crate::identity::web_access::issue(&store.db, &actor.user_id, Some(&proof), now)
+                .unwrap();
+        (receipt.device_id, session.token)
+    };
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let cookie = format!("moyai_admin={token}");
+    let session = client
+        .get(format!("{}/admin/session", fixture.url))
+        .header(header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(session.status(), StatusCode::OK);
+    let session: Value = session.json().await.unwrap();
+    assert_eq!(session["authentication"]["local_management"], false);
+    let request = |command: &str, args: Value| {
+        client
+            .post(format!("{}/admin/command", fixture.url))
+            .header(header::COOKIE, &cookie)
+            .header(header::ORIGIN, &fixture.url)
+            .header("x-moyai-csrf", session["csrf"].as_str().unwrap())
+            .header(
+                "x-moyai-session",
+                session["authentication"]["session_id"].as_str().unwrap(),
+            )
+            .json(&json!({"command":command,"args":args}))
+    };
+    let denied = request(
+        "hub_set_standard_model",
+        json!({"revision":"1","modelId":null}),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        denied.json::<Value>().await.unwrap()["code"],
+        "requires_hub_pc"
+    );
+    let snapshot = request("hub_shared_snapshot", json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(snapshot.status(), StatusCode::OK);
+    let snapshot: Value = snapshot.json().await.unwrap();
+    let saved = request("hub_shared_command",json!({"request_id":"remote-project","expected_revision":snapshot["result"]["revision"],"request":{
+        "kind":"save_project","id":"remote-project","label":"Remote managed project","archived":false,"controller_device_ids":[device],"runner_device_ids":[]
+    }})).send().await.unwrap();
+    assert_eq!(saved.status(), StatusCode::OK);
+    let saved: Value = saved.json().await.unwrap();
+    assert!(
+        saved["result"]["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == "remote-project")
+    );
 }

@@ -107,11 +107,11 @@ pub(super) async fn hub_network_snapshot(admin: &Admin) -> Result<Value, String>
     Ok(value)
 }
 pub(super) fn hub_network_settings(
-    admin: &Admin,
+    network: &mut DeviceNetwork,
     expected_revision: String,
     gateway_port: u16,
 ) -> Result<(), String> {
-    owner(admin)?
+    network
         .set_gateway_port(&expected_revision, gateway_port)
         .map_err(message)
 }
@@ -137,64 +137,95 @@ pub(super) async fn hub_network_diagnostics(
     server.runtime.diagnostics().await.map_err(message)
 }
 pub(super) fn hub_network_invite(
-    admin: &Admin,
+    network: &mut DeviceNetwork,
     expected_revision: String,
     label: String,
     groups: BTreeSet<String>,
 ) -> Result<Value, String> {
-    owner(admin)?
+    network
         .invite(&expected_revision, label, groups, now_ms())
         .map_err(message)
 }
 pub(super) fn hub_network_approve(
-    admin: &Admin,
+    store: &crate::shared_work::SharedWork,
+    network: &mut DeviceNetwork,
     expected_revision: String,
     request_id: String,
     label: String,
     groups: BTreeSet<String>,
 ) -> Result<(), String> {
-    owner(admin)?
-        .approve_join(&expected_revision, &request_id, label, groups, now_ms())
-        .map_err(message)
+    let snapshot = network.snapshot(now_ms());
+    let key = snapshot["join_requests"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["request_id"] == request_id))
+        .and_then(|row| row["key_sha256"].as_str())
+        .ok_or("参加申請を確認してください。")?
+        .to_owned();
+    network
+        .approve_join(
+            &expected_revision,
+            &request_id,
+            label.clone(),
+            groups,
+            now_ms(),
+        )
+        .map_err(message)?;
+    let device = network
+        .approved_join_device(&request_id, &key)
+        .map_err(message)?
+        .ok_or("許可した端末を確認できません。")?;
+    crate::identity::device::enroll(store.identity_connection(),&device,&label,now_ms())
+        .map_err(|_|"端末の参加は許可済みですが、利用設定を保存できませんでした。端末の利用者設定から再保存してください。".to_string())?;
+    Ok(())
 }
 pub(super) fn hub_network_admission(
-    admin: &Admin,
+    network: &mut DeviceNetwork,
     expected_revision: String,
     device_id: String,
     stopped: bool,
 ) -> Result<(), String> {
-    owner(admin)?
+    network
         .set_admission(&expected_revision, &device_id, stopped)
         .map_err(message)
 }
 pub(super) fn hub_network_group(
-    admin: &Admin,
+    network: &mut DeviceNetwork,
     expected_revision: String,
     id: Option<String>,
     label: String,
 ) -> Result<(), String> {
-    owner(admin)?
+    network
         .set_group(&expected_revision, id, label)
         .map_err(message)
 }
 pub(super) fn hub_network_device(
-    admin: &Admin,
+    store: &crate::shared_work::SharedWork,
+    network: &mut DeviceNetwork,
     expected_revision: String,
     device_id: String,
     label: String,
     groups: BTreeSet<String>,
     revoked: bool,
 ) -> Result<(), String> {
-    owner(admin)?
+    network
         .set_device(&expected_revision, &device_id, label, groups, revoked)
-        .map_err(message)
+        .map_err(message)?;
+    // Network JSON owns the name, including normalization. Keep its derived
+    // dedicated actor name current under the same store -> network boundary.
+    // These durable stores cannot commit atomically; same-value retry repairs
+    // a failed display-name write after the device edit already succeeded.
+    let label = network
+        .device_label(&device_id)
+        .ok_or("保存したPC名を確認できません。")?;
+    crate::identity::device::rename_dedicated(store.identity_connection(), &device_id, label, now_ms())
+        .map_err(|_| "PCの設定は保存済みですが、表示名を反映できませんでした。同じ内容でもう一度保存してください。".to_string())
 }
 pub(super) fn hub_network_delete_device(
-    admin: &Admin,
+    network: &mut DeviceNetwork,
     expected_revision: String,
     device_id: String,
 ) -> Result<(), String> {
-    owner(admin)?
+    network
         .delete_device(&expected_revision, &device_id, now_ms())
         .map_err(message)
 }
@@ -210,11 +241,11 @@ pub(super) struct RuleDraft {
     profile_id: Option<String>,
 }
 pub(super) fn hub_network_rule(
-    admin: &Admin,
+    network: &mut DeviceNetwork,
     expected_revision: String,
     rule: RuleDraft,
 ) -> Result<(), String> {
-    owner(admin)?
+    network
         .set_rule(
             &expected_revision,
             Rule {
@@ -230,11 +261,11 @@ pub(super) fn hub_network_rule(
         .map_err(message)
 }
 pub(super) fn hub_network_delete_rule(
-    admin: &Admin,
+    network: &mut DeviceNetwork,
     expected_revision: String,
     id: String,
 ) -> Result<(), String> {
-    owner(admin)?
+    network
         .delete_rule(&expected_revision, &id)
         .map_err(message)
 }
@@ -392,9 +423,10 @@ async fn start_network(
         Some(gateway_control),
         runtime.clone(),
     )
-    .merge(crate::shared_work::api::router(
+    .merge(crate::shared_work::api::router_with_web_access(
         admin.shared_work.clone(),
         admin.network.clone(),
+        Some(admin.web_access.clone()),
     ));
     let listener = network::tls::NetworkListener::new(listener, acceptor)
         .with_identity(identity)
@@ -481,4 +513,87 @@ fn export_value(admin: &Admin, hub_url: &str) -> Result<Value, String> {
 }
 pub(super) fn hub_network_export(admin: &Admin, hub_url: String) -> Result<Value, String> {
     export_value(admin, &hub_url)
+}
+
+/// The caller owns store -> network locks and keeps caller authentication valid
+/// through this synchronous registry mutation. Native and browser commands share
+/// this adapter instead of reacquiring an owner inside an authenticated command.
+pub(crate) fn dispatch_network_locked(
+    store: &crate::shared_work::SharedWork,
+    network: &mut DeviceNetwork,
+    command: &str,
+    args: &Value,
+) -> Result<Value, String> {
+    match command {
+        "hub_network_settings" => output(hub_network_settings(
+            network,
+            argument(args, "expectedRevision")?,
+            argument(args, "gatewayPort")?,
+        )?),
+        "hub_network_invite" => hub_network_invite(
+            network,
+            argument(args, "expectedRevision")?,
+            argument(args, "label")?,
+            argument(args, "groups")?,
+        ),
+        "hub_network_approve" => output(hub_network_approve(
+            store,
+            network,
+            argument(args, "expectedRevision")?,
+            argument(args, "requestId")?,
+            argument(args, "label")?,
+            argument(args, "groups")?,
+        )?),
+        "hub_network_admission" => output(hub_network_admission(
+            network,
+            argument(args, "expectedRevision")?,
+            argument(args, "deviceId")?,
+            argument(args, "stopped")?,
+        )?),
+        "hub_network_group" => output(hub_network_group(
+            network,
+            argument(args, "expectedRevision")?,
+            argument(args, "id")?,
+            argument(args, "label")?,
+        )?),
+        "hub_network_device" => output(hub_network_device(
+            store,
+            network,
+            argument(args, "expectedRevision")?,
+            argument(args, "deviceId")?,
+            argument(args, "label")?,
+            argument(args, "groups")?,
+            argument(args, "revoked")?,
+        )?),
+        "hub_network_delete_device" => output(hub_network_delete_device(
+            network,
+            argument(args, "expectedRevision")?,
+            argument(args, "deviceId")?,
+        )?),
+        "hub_network_rule" => output(hub_network_rule(
+            network,
+            argument(args, "expectedRevision")?,
+            argument(args, "rule")?,
+        )?),
+        "hub_network_delete_rule" => output(hub_network_delete_rule(
+            network,
+            argument(args, "expectedRevision")?,
+            argument(args, "id")?,
+        )?),
+        "hub_history_request" => output(
+            network
+                .request_history(
+                    &argument::<String>(args, "deviceId")?,
+                    network::history::HistoryQuery {
+                        direction: argument(args, "direction")?,
+                        offset: argument(args, "offset")?,
+                        anchor: argument(args, "anchor")?,
+                        id: argument(args, "id")?,
+                    },
+                    now_ms(),
+                )
+                .map_err(history_message)?,
+        ),
+        _ => Err("この端末管理操作には対応していません。".into()),
+    }
 }

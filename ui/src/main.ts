@@ -452,7 +452,7 @@ const onboardingHost = document.createElement("section");
 onboardingHost.id = "team-onboarding";
 onboardingHost.className = "panel";
 el("overview").after(onboardingHost);
-const onboarding = attachOnboarding(onboardingHost, { project: id => sharedAdministration.openProject(id), user: () => sharedAdministration.openUser() });
+const onboarding = attachOnboarding(onboardingHost, { project: id => sharedAdministration.openProject(id) });
 attachAutostart(onboardingHost);
 const standardModel = attachStandardModel(el("models"), poll);
 const joinProject = attachJoinProject(el("management-app"), () => { void deviceNetwork.refresh(); void sharedAdministration.refresh(); });

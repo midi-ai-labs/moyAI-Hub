@@ -28,6 +28,16 @@ test("pending joins take the user to approval and expired requests never count a
     assert.equal(networkSetupStep(current).anchor,"network-step-firewall");
 });
 
+test("Windows username finds distinct registered PCs without merging their identities", () => {
+    const current = snapshot();
+    current.devices[0].windows_username = "ACME\\same-user";
+    current.devices.push({...current.devices[0],device_id:"device-b",label:"WinB"});
+    const rows = networkClients(current,"same-user");
+    assert.equal(rows.length,2);
+    assert.deepEqual(rows.map(row => row.kind === "device" && row.device.device_id),["device-a","device-b"]);
+    assert.notDeepEqual(networkClientAction(rows[0],current.revision),networkClientAction(rows[1],current.revision));
+});
+
 test("saved hosting restores its public address while stopped and preserves a dirty server editor across polls", () => {
     const current = snapshot();
     assert.equal(networkHostingAddress(current), null);

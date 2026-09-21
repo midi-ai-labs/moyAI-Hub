@@ -19,16 +19,28 @@ struct ApiState {
     store: SharedStore,
     network: crate::network::SharedNetwork,
     slots: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
     login_slots: Arc<tokio::sync::Semaphore>,
+    web_access: Option<Arc<crate::web_admin::WebAccess>>,
 }
 type ApiResult<T> = std::result::Result<Json<T>, (StatusCode, Json<Value>)>;
 
 /// This router must stay behind the real device-certificate middleware.
+#[cfg(test)]
 pub(crate) fn router(store: SharedStore, network: crate::network::SharedNetwork) -> Router {
+    router_with_web_access(store, network, None)
+}
+pub(crate) fn router_with_web_access(
+    store: SharedStore,
+    network: crate::network::SharedNetwork,
+    web_access: Option<Arc<crate::web_admin::WebAccess>>,
+) -> Router {
     Router::new()
-        .route("/v1/shared/login", post(login))
-        .route("/v1/shared/setup-password", post(setup_password))
-        .route("/v1/shared/refresh", post(refresh))
+        .route("/v1/shared/device-session", post(device_session))
+        .route("/v1/shared/admin/web-access", post(web_access_ticket))
+        .route("/v1/shared/login", post(retired_authentication))
+        .route("/v1/shared/setup-password", post(retired_authentication))
+        .route("/v1/shared/refresh", post(retired_authentication))
         .route("/v1/shared/session", get(session))
         .route("/v1/shared/logout", post(logout))
         .route("/v1/shared/projects", get(projects))
@@ -64,12 +76,60 @@ pub(crate) fn router(store: SharedStore, network: crate::network::SharedNetwork)
             store,
             network: network.clone(),
             slots: Arc::new(tokio::sync::Semaphore::new(8)),
+            #[cfg(test)]
             login_slots: Arc::new(tokio::sync::Semaphore::new(2)),
+            web_access,
         })
         .layer(axum::middleware::from_fn_with_state(
             network,
             crate::network::tls::guard,
         ))
+}
+
+async fn web_access_ticket(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Extension(device): Extension<DeviceIdentity>,
+    Json(input): Json<Value>,
+) -> ApiResult<Value> {
+    if !input.as_object().is_some_and(|v| v.is_empty()) {
+        return Err(error(WorkError::Invalid));
+    }
+    let access = state
+        .web_access
+        .clone()
+        .ok_or_else(|| error(WorkError::NotFound))?;
+    let proof_device = device.clone();
+    authenticated(
+        state,
+        headers,
+        device,
+        DeviceAccess::NewUsage,
+        move |store, actor| {
+            let db = store.identity_connection();
+            identity::require_admin(db, &actor)?;
+            let proof = identity::web_access::device_proof(
+                db,
+                &actor.user_id,
+                &proof_device.device_id,
+                &proof_device.certificate_sha256,
+            )?;
+            let url = access
+                .remote_ticket(actor.user_id, proof)
+                .map_err(|_| WorkError::Invalid)?;
+            Ok(json!({"url":url}))
+        },
+    )
+    .await
+}
+
+async fn retired_authentication() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::GONE,
+        Json(
+            json!({"code":"password_login_removed","error":"Hubで許可されたPCから、そのまま利用できます。Desktopを更新してください。"}),
+        ),
+    )
 }
 enum DeviceAccess {
     Current,
@@ -137,13 +197,14 @@ impl DeviceAccess {
 }
 pub(crate) fn error(e: WorkError) -> (StatusCode, Json<Value>) {
     let status = match &e {
-        WorkError::Forbidden | WorkError::Identity(IdentityError::Forbidden) => {
+        WorkError::Forbidden
+        | WorkError::Identity(IdentityError::Forbidden | IdentityError::DeviceUnbound) => {
             StatusCode::FORBIDDEN
         }
         WorkError::Identity(IdentityError::Unauthorized) => StatusCode::UNAUTHORIZED,
-        WorkError::Invalid | WorkError::Identity(IdentityError::Invalid(_)) => {
-            StatusCode::BAD_REQUEST
-        }
+        WorkError::Invalid
+        | WorkError::Management(_)
+        | WorkError::Identity(IdentityError::Invalid(_)) => StatusCode::BAD_REQUEST,
         WorkError::Conflict
         | WorkError::StartDeadline
         | WorkError::Identity(IdentityError::Conflict) => StatusCode::CONFLICT,
@@ -158,14 +219,18 @@ pub(crate) fn error(e: WorkError) -> (StatusCode, Json<Value>) {
         }
         _ => StatusCode::SERVICE_UNAVAILABLE,
     };
-    let code = match status {
-        StatusCode::FORBIDDEN => "forbidden",
-        StatusCode::UNAUTHORIZED => "unauthorized",
-        StatusCode::BAD_REQUEST => "invalid",
-        StatusCode::CONFLICT => "conflict",
-        StatusCode::NOT_FOUND => "not_found",
-        StatusCode::TOO_MANY_REQUESTS => "capacity",
-        _ => "unavailable",
+    let code = if matches!(&e, WorkError::Identity(IdentityError::DeviceUnbound)) {
+        "device_identity_required"
+    } else {
+        match status {
+            StatusCode::FORBIDDEN => "forbidden",
+            StatusCode::UNAUTHORIZED => "unauthorized",
+            StatusCode::BAD_REQUEST => "invalid",
+            StatusCode::CONFLICT => "conflict",
+            StatusCode::NOT_FOUND => "not_found",
+            StatusCode::TOO_MANY_REQUESTS => "capacity",
+            _ => "unavailable",
+        }
     };
     (status, Json(json!({"error":e.to_string(),"code":code})))
 }
@@ -282,42 +347,27 @@ async fn authenticated_with_network<T: Serialize + Send + 'static>(
     })
     .await
 }
+#[cfg(test)]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Login {
     username: String,
     password: String,
 }
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PasswordSetup {
-    username: String,
-    code: String,
-    password: String,
-}
-async fn setup_password(
+async fn device_session(
     State(state): State<ApiState>,
     Extension(device): Extension<DeviceIdentity>,
-    Json(input): Json<PasswordSetup>,
-) -> ApiResult<identity::RememberedSession> {
-    let permit = state
-        .login_slots
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| error(WorkError::Capacity))?;
+) -> ApiResult<identity::LoginSession> {
     operation(state, device.clone(), DeviceAccess::Current, move |store| {
-        let _permit = permit;
-        Ok(identity::complete_password_setup(
+        Ok(identity::device::issue_session(
             store.identity_connection(),
-            &input.username,
-            &input.code,
-            &input.password,
             &device.device_id,
             crate::service::now_ms(),
         )?)
     })
     .await
 }
+#[cfg(test)]
 async fn login(
     State(state): State<ApiState>,
     Extension(device): Extension<DeviceIdentity>,
@@ -334,26 +384,6 @@ async fn login(
             store.identity_connection(),
             &input.username,
             &input.password,
-            &device.device_id,
-            crate::service::now_ms(),
-        )?)
-    })
-    .await
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Refresh {
-    refresh_token: String,
-}
-async fn refresh(
-    State(state): State<ApiState>,
-    Extension(device): Extension<DeviceIdentity>,
-    Json(input): Json<Refresh>,
-) -> ApiResult<identity::LoginSession> {
-    operation(state, device.clone(), DeviceAccess::Current, move |store| {
-        Ok(identity::refresh_session(
-            store.identity_connection(),
-            &input.refresh_token,
             &device.device_id,
             crate::service::now_ms(),
         )?)

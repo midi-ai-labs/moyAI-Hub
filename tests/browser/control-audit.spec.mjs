@@ -275,7 +275,7 @@ test.describe("Configured external Web controls", () => {
         await capture(page, testInfo, "external-web-addresses");
         await page.goto(hub.remoteUrl);
         await expect(page.locator("#management-app")).toBeHidden();
-        await expect(page.locator("#web-auth-help")).toContainText("HTTPSの管理URL");
+        await expect(page.locator("#web-auth-help")).toContainText("管理を許可されたPC");
         await expect(page.locator('#web-authentication input[type="password"]')).toHaveCount(0);
         expect(errors).toEqual([]);
     });

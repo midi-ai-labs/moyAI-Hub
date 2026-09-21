@@ -11,6 +11,7 @@ export interface NetworkRule {
 export interface NetworkDevice {
     device_id: string;
     label: string;
+    windows_username?: string | null;
     groups: string[];
     revoked: boolean;
     admission: "allowed" | "stopped" | "revoked";
@@ -27,6 +28,7 @@ export interface NetworkDevice {
 export interface NetworkJoinRequest {
     request_id: string;
     label: string;
+    windows_username?: string | null;
     observed_ip: string;
     key_sha256: string;
     created_at_ms: number;
@@ -178,7 +180,7 @@ export type NetworkClient = { kind: "request"; request: NetworkJoinRequest } | {
 export type NetworkClientFilter = "all" | "pending";
 export function networkClients(snapshot: NetworkSnapshot, search: string, filter: NetworkClientFilter = "all"): NetworkClient[] {
     const term = search.trim().toLocaleLowerCase();
-    const requests = snapshot.join_requests.filter(request => (!term || [request.label, request.request_id, request.observed_ip, request.key_sha256]
+    const requests = snapshot.join_requests.filter(request => (!term || [request.label, request.windows_username ?? "", request.request_id, request.observed_ip, request.key_sha256]
         .some(value => value.toLocaleLowerCase().includes(term))) && (filter !== "pending" || request.status === "pending"));
     return [
         ...requests.filter(request => request.status === "pending").map(request => ({ kind: "request" as const, request })),
@@ -208,7 +210,7 @@ export function networkClientAction(client: NetworkClient, revision: string): Ne
 }
 export function networkDevices(snapshot: NetworkSnapshot, search: string): NetworkDevice[] {
     const term = search.trim().toLocaleLowerCase();
-    return snapshot.devices.filter(device => !term || [device.label, device.device_id, device.observed_ip ?? "",
+    return snapshot.devices.filter(device => !term || [device.label, device.windows_username ?? "", device.device_id, device.observed_ip ?? "",
         ...device.groups.map(id => snapshot.groups.find(group => group.id === id)?.label ?? id)]
         .some(value => value.toLocaleLowerCase().includes(term)));
 }

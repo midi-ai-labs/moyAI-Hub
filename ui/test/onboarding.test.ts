@@ -4,10 +4,11 @@ import { onboardingNextStep, projectPreparation } from "../src/onboarding_state.
 import type { SharedAdminSnapshot } from "../src/shared_admin_state.ts";
 import type { NetworkSnapshot } from "../src/network_state.ts";
 
-test("preparation uses the selected project's current people and allowed PCs, without treating folders as AI success", () => {
+test("preparation uses the selected project's allowed PCs and preserved individual roles, without treating folders as AI success", () => {
   const shared = { projects:[{id:"a",label:"A",archived:false},{id:"b",label:"B",archived:false}],
     users:[{user_id:"reader",disabled:false},{user_id:"disabled",disabled:true},{user_id:"writer",disabled:false}],
     project_memberships:[{project_id:"a",user_id:"reader",role:"reader"},{project_id:"a",user_id:"disabled",role:"contributor"},{project_id:"b",user_id:"writer",role:"contributor"}],
+    device_principals:[{device_id:"controller",user_id:"writer",display_name:"Writer"}], groups:[],group_memberships:[],group_project_roles:[],
     project_devices:[{project_id:"a",device_id:"runner",can_execute:true,can_control:false,preparation_state:"ready"},{project_id:"b",device_id:"controller",can_execute:false,can_control:true,preparation_state:"not_selected"}],
   } as SharedAdminSnapshot;
   const network = { devices:[{device_id:"runner",revoked:false,admission:"allowed"},{device_id:"controller",revoked:false,admission:"allowed"}],join_requests:[] } as unknown as NetworkSnapshot;
@@ -27,6 +28,7 @@ function setup() {
     groups: [], group_memberships: [], group_project_roles: [],
     projects: [{ id: "project", label: "集計", archived: false }],
     project_memberships: [{ project_id: "project", user_id: "writer", role: "contributor" }],
+    device_principals: [{device_id:"a",user_id:"writer",display_name:"依頼する人"}],
     project_devices: [
       { project_id: "project", device_id: "a", can_control: true, can_execute: false, environment_id: null, preparation_state: "not_selected", error: null },
       { project_id: "project", device_id: "b", can_control: false, can_execute: true, environment_id: "env", preparation_state: "ready", error: null },
@@ -59,27 +61,34 @@ test("next action assigns project creation and missing writable membership to th
   const { shared, network, next } = setup();
   assert.equal(onboardingNextStep(shared, network, "missing").kind, "project");
   shared.project_memberships[0].role = "reader";
-  assert.equal(next().kind, "participants");
+  assert.equal(next().kind, "controller_access");
   shared.project_memberships[0].role = "manager";
   shared.users[0].disabled = true;
-  assert.equal(next().kind, "participants");
+  assert.equal(next().kind, "controller_access");
   shared.users = [];
-  assert.equal(next().kind, "participants");
+  assert.equal(next().kind, "controller_access");
   shared.projects[0].archived = true;
   assert.equal(next().kind, "project");
 });
 
-test("person setup names the person and their assigned control PC without requiring every participant to finish", () => {
+test("approved controller assignment permits a sample without separate people or password setup", () => {
   const { shared, next } = setup();
-  shared.users[0].setup_pending = true;
-  const step = next();
-  assert.equal(step.kind, "person_setup");
-  assert.equal(step.owner, "依頼する人");
-  assert.equal(step.location, "WinA のDesktop");
-  shared.users.push({ user_id: "second", username: "second", display_name: "設定済みの人", administrator: false, disabled: false });
-  shared.project_memberships.push({ project_id: "project", user_id: "second", role: "manager" });
-  assert.equal(next().kind, "sample");
-  assert.equal(next().owner, "設定済みの人（仕事を依頼する人）");
+  shared.project_memberships=[];
+  assert.equal(next().kind,"sample");
+  assert.equal(next().owner,"操作PCを使う人");
+  assert.equal(next().location,"WinA のDesktop");
+  shared.device_principals=[];
+  assert.equal(next().kind,"controller_access");
+});
+test("existing group reader restriction remains visible until explicitly changed", () => {
+  const { shared, next } = setup();
+  shared.project_memberships=[];
+  shared.groups=[{id:"readers",label:"Readers",disabled:false}];
+  shared.group_memberships=[{group_id:"readers",user_id:"writer"}];
+  shared.group_project_roles=[{project_id:"project",group_id:"readers",role:"reader"}];
+  assert.equal(next().kind,"controller_access");
+  shared.group_project_roles[0].role="manager";
+  assert.equal(next().kind,"sample");
 });
 
 test("stopped, revoked, and missing PCs cannot advance the handoff to the sample", () => {

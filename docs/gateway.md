@@ -8,7 +8,7 @@ Gateway の管理用待受は一時的な IPv4 loopback port です。従来の�
 
 通常起動する`moyai-hub`が保存先の排他lock、catalog / DeviceNetwork、端末認証、Web / metadata / TLS listenerとGatewayを所有します。公開CLIは保存済み設定でWeb管理を自動開始し、integration testも同じ起動経路を使います。ブラウザーを閉じたり強制終了したりしてもサーバーとGatewayは停止しません。起動・保存先・公開設定は[Web管理の手順](web-management.md)を参照してください。
 
-ブラウザー管理commandは固定Host/Origin・CSRF・管理者本人の用途別セッションを照合したWeb APIから同じ`Admin`へ渡します。管理者はHub PCで初回設定し、以後はログインします。別PCからの管理にはHTTPSを使います。CLIの状態確認・終了は別のprivate loopback制御へBearer認証で接続します。この資格情報は利用者限定ファイルで保護し、Web・ログ・Desktop配布用の共通設定へ載せません。端末のmTLSと実行許可はこのWeb構成変更と独立しています。catalogと端末設定の読み書きはサーバーの`Admin`が一元所有します。
+ブラウザー管理commandは固定Host/Origin・CSRF・管理者本人の用途別セッションを照合したWeb APIから同じ`Admin`へ渡します。Hub PCの起動操作、または管理を許可された登録PCのDesktopから、一度だけ使えるアクセス情報で管理画面を開きます。ID・パスワード入力は不要です。別PCからの管理にはHTTPSを使い、PCの現在の許可と利用者との対応を再確認します。Hubの待受やモデル接続先の変更はHub PCの管理画面に限定します。CLIの状態確認・終了は別のprivate loopback制御へBearer認証で接続します。この資格情報は利用者限定ファイルで保護し、Web・ログ・Desktop配布用の共通設定へ載せません。端末のmTLSと実行許可はこのWeb構成変更と独立しています。catalogと端末設定の読み書きはサーバーの`Admin`が一元所有します。
 
 ブラウザーの「接続の受付を停止」は端末向けlistenerとGatewayを停止し、サーバープロセスとWeb管理を維持します。サーバー自体を終了する操作は`--stop [--data-dir <保存先>]`、またはforegroundサーバーのCtrl+Cです。Windowsのログオン時には、Hub PCのローカル管理画面から任意登録した `--launch --no-browser` が保存済みのHub・Gateway設定を再開します。[チームの初期設定](team-preparation.md)を参照してください。Windowsサービス、ログオン前・サインアウト後の稼働や外部AIの自動起動は対象外です。
 

@@ -56,7 +56,7 @@ test("authenticated commands use CSRF and never replay an uncertain mutation", a
         assert.deepEqual(JSON.parse(String(calls[1].options?.body)), { command: "hub_network_group", args: { expectedRevision: "7", label: "Team" } });
         mode = "expired";
         await assert.rejects(invoke("hub_network_group"), error => error === "session expired");
-        await assert.rejects(invoke("hub_network_group"), error => typeof error === "string" && error.includes("ログイン状態が変わりました"));
+        await assert.rejects(invoke("hub_network_group"), error => typeof error === "string" && error.includes("管理画面の利用許可が変わりました"));
         assert.equal(calls.length, 3, "revoked polling does not request another session or replay the command");
         mode = "lost";
         await reconnect();
@@ -72,10 +72,29 @@ test("anonymous or non-administrator sessions cannot dispatch management command
         const paths: string[] = [];
         await withFetch(async input => { paths.push(String(input)); return Response.json(value); }, async () => {
             await reconnect();
-            await assert.rejects(invoke("hub_snapshot"), error => typeof error === "string" && error.includes("管理者としてログイン"));
+            await assert.rejects(invoke("hub_snapshot"), error => typeof error === "string" && error.includes("Hub PCから管理画面を開いて"));
             assert.deepEqual(paths, ["/admin/session"]);
         });
     }
+});
+
+test("a remote action requiring the Hub PC preserves its valid management session", async () => {
+    const changes: (WebSession | null)[] = [];
+    const dispose = onAuthenticationChange(value => changes.push(value));
+    let calls = 0;
+    try {
+        await withFetch(async input => {
+            if (input === "/admin/session") return Response.json({...session(),authentication:{...session().authentication,local_management:false}});
+            ++calls;
+            return calls === 1 ? Response.json({error:"Hub PCでこの操作を行ってください。",code:"requires_hub_pc"},{status:403}) : Response.json({result:{revision:"7"}});
+        }, async () => {
+            await reconnect(); changes.length=0;
+            await assert.rejects(invoke("hub_discover"), error => typeof error === "string" && error.includes("Hub PC"));
+            assert.equal(changes.includes(null),false);
+            assert.deepEqual(await invokeSharedAdmin("hub_shared_snapshot"),{revision:"7"});
+            assert.equal(calls,2);
+        });
+    } finally { dispose(); }
 });
 
 test("logout immediately revokes pending management results before the server responds", async () => {
@@ -94,7 +113,7 @@ test("logout immediately revokes pending management results before the server re
             const signingOut = authenticate("logout");
             await sent.promise;
             assert.equal(changes.at(-1), null);
-            const rejected = assert.rejects(pending, error => typeof error === "string" && error.includes("ログイン状態が変わりました"));
+            const rejected = assert.rejects(pending, error => typeof error === "string" && error.includes("管理画面の利用許可が変わりました"));
             command.resolve(Response.json({ result: { confidential: "old owner" } }));
             await rejected;
             logout.resolve(Response.json(session(false)));
@@ -108,7 +127,7 @@ test("an older session check cannot replace a newer anonymous session", async ()
     const old = deferred<Response>(); let calls = 0;
     await withFetch(async () => ++calls === 1 ? old.promise : Response.json(session(false)), async () => {
         const first = managementSession(true);
-        const rejected = assert.rejects(first, error => typeof error === "string" && error.includes("ログイン状態が変わりました"));
+        const rejected = assert.rejects(first, error => typeof error === "string" && error.includes("管理画面の利用許可が変わりました"));
         assert.equal((await managementSession(true)).authentication.user, null);
         old.resolve(Response.json(session()));
         await rejected;
@@ -132,7 +151,7 @@ test("logout invalidates a queued command before its cached session continuation
     });
 });
 
-test("bootstrap sends credentials only to its explicit endpoint and retains no password in session state", async () => {
+test("launch access sends its ticket only to the access endpoint and retains no ticket in session state", async () => {
     const calls: { path: string; options?: RequestInit }[] = [];
     await withFetch(async (input, options) => {
         calls.push({ path: String(input), options });
@@ -140,13 +159,13 @@ test("bootstrap sends credentials only to its explicit endpoint and retains no p
             configured: false, bootstrap_allowed: true, login_allowed: true, session_id: null, user: null } } : session());
     }, async () => {
         await reconnect();
-        const credentials = { username: "admin", display_name: "管理者", password: "twelve-character-password" };
-        const accepted = await authenticate("bootstrap", credentials);
-        assert.equal(calls[1].path, "/admin/bootstrap");
+        const credentials = { ticket: "one-use-launch-ticket" };
+        const accepted = await authenticate("access", credentials);
+        assert.equal(calls[1].path, "/admin/access");
         assert.equal(new Headers(calls[1].options?.headers).get("x-moyai-csrf"), "session-csrf");
         assert.deepEqual(JSON.parse(String(calls[1].options?.body)), credentials);
         assert.equal(accepted.authentication.user?.administrator, true);
-        assert.equal(JSON.stringify(await managementSession()).includes(credentials.password), false);
+        assert.equal(JSON.stringify(await managementSession()).includes(credentials.ticket), false);
     });
 });
 
@@ -172,7 +191,7 @@ test("legacy sessions without human authentication fail closed", async () => {
     });
 });
 
-test("a listener that disallows login receives no credentials or management commands", async () => {
+test("a listener that disallows access receives no ticket or management commands", async () => {
     const paths: string[] = [];
     await withFetch(async input => {
         paths.push(String(input));
@@ -180,13 +199,13 @@ test("a listener that disallows login receives no credentials or management comm
     }, async () => {
         await reconnect();
         await assert.rejects(invoke("hub_snapshot"));
-        await assert.rejects(authenticate("login", { username: "admin", password: "sensitive-password" }),
-            error => typeof error === "string" && error.includes("HTTPS"));
+        await assert.rejects(authenticate("access", { ticket: "sensitive-ticket" }),
+            error => typeof error === "string" && error.includes("Hub PC"));
         assert.deepEqual(paths, ["/admin/session"]);
     });
 });
 
-test("CSRF preparation for a new login never re-admits the preceding cookie session", async () => {
+test("CSRF preparation for launch access never re-admits the preceding cookie session", async () => {
     const changes: (WebSession | null)[] = [];
     const dispose = onAuthenticationChange(value => changes.push(value));
     try {
@@ -198,7 +217,7 @@ test("CSRF preparation for a new login never re-admits the preceding cookie sess
             await reconnect();
             await assert.rejects(authenticate("logout"));
             changes.length = 0;
-            await assert.rejects(authenticate("login", { username: "other", password: "wrong-password" }));
+            await assert.rejects(authenticate("access", { ticket: "expired-ticket" }));
             assert.deepEqual(changes, [null]);
             await assert.rejects(invoke("hub_snapshot"));
         });

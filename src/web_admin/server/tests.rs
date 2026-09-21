@@ -54,7 +54,7 @@ async fn local_management_is_independent_and_settings_restore_without_access() {
         .await
         .unwrap();
     assert_eq!(local_session["authentication"]["login_allowed"], true);
-    assert_eq!(local_session["authentication"]["bootstrap_allowed"], true);
+    assert_eq!(local_session["authentication"]["bootstrap_allowed"], false);
     assert!(enable(&admin, WebSettings::default()).await.is_err());
     admin.dispatch("hub_network_stop", json!({})).await.unwrap();
     assert_eq!(client().get(&url).send().await.unwrap().status(), 200);
@@ -166,7 +166,7 @@ async fn explicit_http_listener_serves_guidance_but_requires_safe_transport_for_
         session["authentication"],
         json!({
             "configured":false,"user":null,"session_id":null,
-            "bootstrap_allowed":false,"login_allowed":false
+            "bootstrap_allowed":false,"login_allowed":false,"local_management":false
         })
     );
     let csrf = session["csrf"].as_str().unwrap();
@@ -215,11 +215,11 @@ async fn explicit_http_listener_serves_guidance_but_requires_safe_transport_for_
     );
     assert_eq!(
         client()
-            .post(format!("{url}login"))
+            .post(format!("{url}access"))
             .header("host", &authority)
             .header("origin", &origin)
             .header("x-moyai-csrf", csrf)
-            .json(&json!({"username":username,"password":password}))
+            .json(&json!({"ticket":"a".repeat(64)}))
             .send()
             .await
             .unwrap()

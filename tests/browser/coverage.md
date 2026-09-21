@@ -1,22 +1,22 @@
 # Hub Web管理 GUI試験の範囲
 
-2026-09-20時点のHub Web管理にある現役の操作を対象にする。以下は再利用する試験の対応表であり、全操作の受入完了表ではない。各実行のPASS/FAIL・バイナリーSHA-256・画像の目視結果は、その実行の`project_sandbox`レポートを正とする。
+2026-09-21時点のHub Web管理にある現役の操作を対象にする。以下は再利用する試験の対応表であり、全操作の受入完了表ではない。各実行のPASS/FAIL・バイナリーSHA-256・画像の目視結果は、その実行の`project_sandbox`レポートを正とする。
 
 ## 管理画面と対応する試験
 
 | 画面／操作・状態 | 現在のブラウザーシナリオで確認する内容 | 残るGUI確認 |
 | --- | --- | --- |
-| チームの初期設定・本人設定コード | `onboarding.spec.mjs`で人追加→一度だけコード表示→閉じる／再読込で非表示、保存済みのプロジェクト・PC用途から準備状態を再表示 | 実Desktopで本人のコード使用・最初の仕事までの結合はDesktop側のシナリオ。実コードを画像へ残さない |
-| 競合した利用者・プロジェクトの編集 | `shared-management.spec.mjs`で入力保持→最新値と比較→明示継続→通常保存、入力変更後の比較無効化、再競合、削除対象、比較中のタブ無効化、遅延比較後の別管理者ログイン。`onboarding.spec.mjs`で利用者追加の入力保持と明示保存までコード未発行 | 準備した試験の実行結果はtask-local reportを参照。破壊的・世代依存の操作は再比較で継続せず対象を開き直す |
+| チームの初期設定 | `onboarding.spec.mjs`で利用者作成・password入力なしのproject作成、保存済みproject・PC用途から準備状態を再表示 | 実Desktopから最初の仕事までの結合はDesktop側のシナリオ |
+| 競合したプロジェクトの編集 | `shared-management.spec.mjs`で入力保持→最新値と比較→明示継続→通常保存、再競合、削除対象、遅延比較後の利用終了と新ticketで再開 | 実行結果はtask-local reportを参照。破壊的・世代依存の操作は対象を開き直す |
 | 最初のPCへの接続手順 | `onboarding.spec.mjs`で設定・開始→受信許可案内→ファイル取得→実TLS申請・承認→Desktop診断案内、停止時の戻り、Gateway変更が任意で開始前に見えること | このケースはloopbackのprotocol fixture。実UAC・Firewall書込み・物理LAN到達・実AI応答を確認した意味ではない |
-| PC参加と用途の一括判断 | `onboarding.spec.mjs`で同じPCの操作／実行用途、管理者への業務権限非付与、並行project更新後の部分保存と同一PC再開 | 複数の物理PC、承認時の本人との照合 |
+| PC参加と用途の一括判断 | `onboarding.spec.mjs`でWindowsユーザー名の参考表示、同じPCの操作／実行用途、非管理者の専用actor発行とPWなしのproject閲覧、並行更新後の部分保存と同一PC再開 | 複数の物理PC、申請元と現物の照合 |
 | LAN候補・固定Gateway・受信許可 | 候補読み取り、固定Gateway、`firewall.spec.mjs`のloopback拒否・取得済み社内IPv4での実ルール読取preview・入力変更時の確認無効化。試験はapply/remove/UACを操作しない | 実Firewall書込み・UAC取消／権限拒否・GPO・物理別PC到達は専用実環境の受入。模擬NetSecurityのPS5.1検証とは区別 |
 | 最初に使う共有モデル | `management-workflows.spec.mjs`で管理者の明示選択、保存値と最後のモデル削除後の指定解除 | 新規Desktopへの初期選択と保存済み選択維持はconsumer側の結合。生成成功は別確認 |
-| Hubログオン開始 | コマンド生成unit、remote management拒否、`onboarding.spec.mjs`で登録状態のread-only表示 | Windowsユーザーの実Run登録／解除・再ログオン・設置先変更は未自動化。ブラウザー試験は実PCの登録を変更しない |
+| Hubログオン開始 | コマンド生成unit、remote management拒否、unitで登録状態のread-only表示 | Windowsユーザーの実Run登録／解除・再ログオン・設置先変更は未自動化。ブラウザー試験は実PCの登録を変更しない |
 | ワンクリック起動（ブラウザー外の入口） | `tests/launch.rs` のCLI結合試験で初回・保存復帰・同時起動・ポート競合と復旧・IP変更を確認。ブラウザー試験の件数には含めない | 起動アイコンからEdgeが開きHubが稼働するところまで実操作。初回入力→停止→アイコンで再開→ブラウザー終了後の継続は追加GUI受入待ち（2026-09-12はComputer UseのURL検査で停止） |
 | 起動済みHubの案内・本体の稼働表示 | `launch-status.spec.mjs`で複数の起動要求が同じPIDを再利用し、ブラウザーに起動済みの案内を表示。モデル接続停止中も本体は稼働と表示し、本体終了後は応答未確認へ切替。案内は再読込で繰り返さない | 既定ブラウザーが開くタブの選び方はOS／ブラウザーに従う。タブ数を本体の多重起動とみなさない |
 | ページ内移動、概要、接続状態 | 直接URL起動、ネットワーク・モデル・接続PC・履歴・Web管理への移動、モデル数とrevision反映、再接続、Tab／Enterでモデルリンクへ移動 | その他のリンクのkeyboard操作、再起動を伴うepoch変更・通信途絶からの回復、稼働中Gatewayの実通信表示 |
-| 管理者認証 | `authentication.spec.mjs`で初回設定・入力不一致・ログイン失敗・ログアウト・再ログイン・遅延操作・別タブのセッション置換を確認。LAN HTTPの入口にはpassword入力を出さない | 物理別端末のHTTPS/proxy、複数OS利用者による運用 |
+| 管理者認証 | `authentication.spec.mjs`で起動ticket交換、利用終了、期限・再使用の拒否、遅延操作・別タブのsession置換を確認。未許可画面にpassword入力を出さない | 物理別PCのHTTPS/proxyと複数OS利用者の運用 |
 | Web管理 | 認証済み管理者へのローカルURL・稼働状態、760px幅、実clipboardへのローカルURLコピーと読取一致。既存HTTP公開URLは案内として表示 | clipboard拒否時のGUI、公開設定エラー表示。remote HTTPS／proxyは別の起動設定の試験が必要 |
 | 従来の手動サーバー | 詳細展開、bind入力、token生成、開始・停止、Web管理の継続、required／短いtoken／不正文字・不正bind、256文字token、Gateway checkbox両値と実起動・停止 | token全境界、使用中ポート・Gateway起動失敗の表示 |
 | モデル探索 | 四つのprofile切替、候補選択、HTTP(S)以外の拒否、404／空一覧と回復、前の接続先の遅延応答を破棄 | 認証が必要なprovider、timeout・不正JSON・巨大一覧、実oMLX／LM Studioとの組合せ |

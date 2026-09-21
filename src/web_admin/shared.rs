@@ -1,6 +1,27 @@
 use super::*;
-use crate::identity::{self, IdentityError, SessionAudience};
+use crate::identity::{self, IdentityError};
 use crate::shared_work::{ManagementCommand, WorkError};
+
+pub(super) fn owns_command(command: &str) -> bool {
+    matches!(
+        command,
+        "hub_shared_snapshot"
+            | "hub_shared_command"
+            | "hub_shared_retention_preview"
+            | "hub_shared_maintenance"
+            | "hub_join_project"
+            | "hub_network_settings"
+            | "hub_network_invite"
+            | "hub_network_approve"
+            | "hub_network_admission"
+            | "hub_network_group"
+            | "hub_network_device"
+            | "hub_network_rule"
+            | "hub_network_delete_device"
+            | "hub_network_delete_rule"
+            | "hub_history_request"
+    )
+}
 
 pub(super) async fn command(
     admin: Arc<Admin>,
@@ -16,16 +37,28 @@ pub(super) async fn command(
             .map_err(|_| IdentityError::Unavailable)?;
         // Reauthenticate after waiting for the owner: logout/session replacement cannot
         // authorize a queued management mutation with a previously captured Principal.
-        let actor = identity::authenticate(
+        let mut network = admin
+            .network
+            .lock()
+            .map_err(|_| IdentityError::Unavailable)?;
+        let actor = identity::web_access::authenticate(
             store.identity_connection(),
+            &network,
             &token,
-            SessionAudience::WebAdmin,
-            None,
             crate::service::now_ms(),
         )?;
         store.expire_start_deadlines(crate::service::now_ms())?;
+        if input.command.starts_with("hub_network_") || input.command == "hub_history_request" {
+            return crate::admin::dispatch_network_locked(
+                &store,
+                &mut network,
+                &input.command,
+                &input.args,
+            )
+            .map_err(WorkError::Management);
+        }
         if input.command == "hub_join_project" {
-            return approve_and_assign(&admin, &mut store, &actor, input.args);
+            return approve_and_assign(&mut network, &mut store, &actor, input.args);
         }
         if input.command == "hub_shared_snapshot" {
             if !input.args.as_object().is_some_and(|v| v.is_empty()) {
@@ -60,10 +93,6 @@ pub(super) async fn command(
         }
         let request: ManagementCommand =
             serde_json::from_value(input.args).map_err(|_| WorkError::Invalid)?;
-        let network = admin
-            .network
-            .lock()
-            .map_err(|_| IdentityError::Unavailable)?;
         if let Some(devices) = crate::shared_work::api::management::project_device_targets(&request)
         {
             for device in devices {
@@ -77,7 +106,16 @@ pub(super) async fn command(
                 .admission_revision(&runner, crate::service::now_ms())
                 .map_err(|_| WorkError::Forbidden)?;
         }
-        store.manage(&actor, &request, crate::service::now_ms())
+        let labels = crate::shared_work::api::management::project_device_targets(&request)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|id| {
+                network
+                    .device_label(&id)
+                    .map(|label| (id.clone(), label.to_owned()))
+            })
+            .collect();
+        store.manage_with_device_labels(&actor, &request, crate::service::now_ms(), &labels)
     });
     match tokio::time::timeout(Duration::from_secs(30), operation).await {
         Ok(Ok(Ok(value))) => Json(json!({"result":value})).into_response(),
@@ -106,7 +144,7 @@ struct JoinPurpose {
 }
 
 fn approve_and_assign(
-    admin: &Admin,
+    network: &mut crate::network::DeviceNetwork,
     store: &mut crate::shared_work::SharedWork,
     actor: &identity::Principal,
     args: Value,
@@ -114,10 +152,8 @@ fn approve_and_assign(
     identity::require_admin(store.identity_connection(), actor)?;
     let input: JoinProject = serde_json::from_value(args).map_err(|_| WorkError::Invalid)?;
     let snapshot = store.management_snapshot(actor)?;
-    let mut network = admin
-        .network
-        .lock()
-        .map_err(|_| IdentityError::Unavailable)?;
+    let shared_current =
+        snapshot["revision"].as_str() == Some(input.expected_shared_revision.as_str());
     let approved = network
         .approved_join_device(&input.request_id, &input.key_sha256)
         .map_err(|_| WorkError::Conflict)?;
@@ -156,12 +192,30 @@ fn approve_and_assign(
     network
         .self_projection(&device, crate::service::now_ms())
         .map_err(|_| WorkError::Forbidden)?;
+    let label = network.device_label(&device).unwrap_or(&device);
+    if let Err(error) = identity::device::enroll(
+        store.identity_connection(),
+        &device,
+        label,
+        crate::service::now_ms(),
+    ) {
+        return Ok(
+            json!({"device_id":device,"project_saved":false,"identity_saved":false,"error":error.to_string(),"snapshot":store.management_snapshot(actor)?}),
+        );
+    }
     // Network JSON and shared SQLite are different owners. A project error
     // must return the durable approved device, never pretend approval rolled back.
     if let Some(project) = input.project {
         let command = ManagementCommand {
             request_id: input.command_id,
-            expected_revision: input.expected_shared_revision,
+            expected_revision: if shared_current {
+                store.management_snapshot(actor)?["revision"]
+                    .as_str()
+                    .ok_or(WorkError::Conflict)?
+                    .to_owned()
+            } else {
+                input.expected_shared_revision
+            },
             request: crate::shared_work::ManagementRequest::AssignProjectDevice {
                 project_id: project.id,
                 device_id: device.clone(),
@@ -178,6 +232,8 @@ fn approve_and_assign(
             ),
         }
     } else {
-        Ok(json!({"device_id":device,"project_saved":true,"error":null,"snapshot":snapshot}))
+        Ok(
+            json!({"device_id":device,"project_saved":true,"identity_saved":true,"error":null,"snapshot":store.management_snapshot(actor)?}),
+        )
     }
 }

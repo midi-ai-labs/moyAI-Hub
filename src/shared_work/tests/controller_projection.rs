@@ -32,7 +32,7 @@ fn restricted() -> Fixture {
                 id: project.into(),
                 label: project.into(),
                 archived: false,
-                members,
+                members: Some(members),
                 controller_device_ids: vec![controller.into()],
                 runner_device_ids: vec!["WinE".into()],
             },

@@ -1,39 +1,49 @@
 import { authenticate, managementSession, onAuthenticationChange } from "./management.ts";
 import type { WebSession } from "./management.ts";
 
+/** Remove the one-use ticket before any request, management import, or UI update. */
+export function consumeAccessTicket(
+    location: Pick<Location, "hash" | "pathname" | "search">,
+    history: Pick<History, "replaceState">,
+): string | null {
+    const fragment = new URLSearchParams(location.hash.replace(/^#/, ""));
+    if (!fragment.has("access")) return null;
+    const ticket = fragment.get("access") ?? "";
+    const notice = fragment.get("notice");
+    const retained = notice === "hub-started" || notice === "hub-already-running" ? `#${notice}` : "";
+    history.replaceState(null, "", `${location.pathname}${location.search}${retained}`);
+    return ticket;
+}
+
 export function authenticationError(error: unknown): string {
     const messages: Record<string, string> = {
-        unauthorized: "ユーザー名またはパスワードを確認してください。",
-        invalid_credentials: "ユーザー名またはパスワードを確認してください。",
-        administrator_required: "管理者アカウントでログインしてください。",
-        forbidden: "この操作は許可されていません。ログイン状態を再確認してください。",
-        invalid_request: "入力内容を確認してください。",
-        already_configured: "初回設定は完了しています。ログイン状態を再確認してください。",
-        rate_limited: "試行回数が上限に達しました。しばらく待ってから再試行してください。",
-        bootstrap_not_allowed: "初回設定はHubと同じPCで、直接接続した管理画面から行ってください。",
+        unauthorized: "管理画面の利用許可が切れました。Hub PCから開き直してください。",
+        invalid_credentials: "この管理画面の起動情報は使えません。Hub PCから開き直してください。",
+        invalid_ticket: "この管理画面の起動情報は使用済み、または期限切れです。Hub PCから開き直してください。",
+        administrator_required: "Hub PCの「moyAI Team Management」から管理画面を開いてください。",
+        forbidden: "この管理画面からは操作できません。Hub PCから開き直してください。",
+        invalid_request: "管理画面の起動情報を確認できません。Hub PCから開き直してください。",
+        rate_limited: "しばらく待ってから、Hub PCで管理画面を開き直してください。",
     };
     return typeof error === "string" && messages[error] ? messages[error]
         : typeof error === "string" && /[ぁ-んァ-ン一-龯]/.test(error) ? error
-        : "ログイン状態を変更できませんでした。入力と接続を確認して再試行してください。";
+        : "Hubに接続できません。Hubの起動状態を確認し、管理画面を開き直してください。";
 }
 
-/** The management module is loaded only after an authenticated administrator is known. */
+/** The management module is loaded only after the Hub accepts its launch ticket. */
 export function attachWebAuthentication(
     root: HTMLElement,
     management: HTMLElement,
     startManagement: () => Promise<void>,
 ): { refresh: () => Promise<void> } {
+    let ticket = consumeAccessTicket(window.location, window.history);
     let session: WebSession | null = null;
-    let configured = true;
-    let bootstrapAllowed = false;
-    let loginAllowed = false;
     let checking = true;
     let busy = false;
     let error = "";
     let generation = 0;
+    let refreshGeneration = 0;
     let startedFor: string | null = null;
-    let username = "";
-    let displayName = "";
     const node = <T extends HTMLElement>(id: string) => root.querySelector<T>(`#${id}`)!;
     function concealManagement() {
         management.hidden = true;
@@ -41,69 +51,23 @@ export function attachWebAuthentication(
         for (const dialog of management.querySelectorAll<HTMLDialogElement>("dialog[open]")) dialog.close();
     }
     function render() {
-        const user = session?.authentication.user;
-        const administrator = loginAllowed && user?.administrator === true;
+        const administrator = session?.authentication.login_allowed && session.authentication.user?.administrator;
         root.className = administrator ? "web-auth-account" : "web-auth-gate";
         if (administrator) {
-            root.innerHTML = `<div class="web-auth-account-name"><span>管理者</span><strong id="web-auth-user"></strong></div>
-                <p id="web-auth-error" role="alert" hidden></p><button id="web-auth-logout" type="button" class="secondary">ログアウト</button>`;
-            node("web-auth-user").textContent = user.display_name;
+            root.innerHTML = `<div class="web-auth-account-name"><span>Hub管理</span><strong id="web-auth-user"></strong></div>
+                <p id="web-auth-error" role="alert" hidden></p><button id="web-auth-logout" type="button" class="secondary">この画面の利用を終了</button>`;
+            node("web-auth-user").textContent = session!.authentication.user!.display_name;
             node<HTMLButtonElement>("web-auth-logout").disabled = busy;
-            node("web-auth-logout").addEventListener("click", () => { void submit("logout"); });
+            node("web-auth-logout").addEventListener("click", () => { void closeAccess(); });
         } else {
-            const bootstrap = !configured && bootstrapAllowed;
-            const formAllowed = !checking && loginAllowed && !user && (configured || bootstrap);
             root.innerHTML = `<section class="web-auth-card" aria-labelledby="web-auth-title">
-                <p class="eyebrow">moyAI Hub</p><h1 id="web-auth-title">${checking ? "接続を確認しています" : bootstrap ? "初回の管理者設定" : "管理者ログイン"}</h1>
-                <p class="subtle" id="web-auth-help">${checking ? "ログイン状態を確認しています。" : !loginAllowed
-                    ? "この接続ではログインできません。HTTPSの管理URL、またはHubと同じPCの直接接続URLを開いてください。"
-                    : !configured && !bootstrapAllowed
-                    ? "初回設定が必要です。Hubと同じPCで、直接接続した管理画面を開いて管理者を設定してください。"
-                    : user ? "この管理画面は管理者のみ利用できます。管理者アカウントでログインしてください。"
-                    : bootstrap ? "このHubを管理する最初のアカウントを作成します。"
-                    : "モデル・利用者・PCの設定を管理するには、管理者アカウントでログインしてください。"}</p>
-                ${formAllowed ? `<form id="web-auth-form">
-                    <label>ユーザー名<input id="web-auth-username" name="username" autocomplete="username" maxlength="64" autocapitalize="none" spellcheck="false" required autofocus></label>
-                    ${bootstrap ? '<label>表示名<input id="web-auth-display-name" name="display_name" autocomplete="name" maxlength="256" required></label>' : ""}
-                    <label>パスワード<input id="web-auth-password" name="password" type="password" autocomplete="${bootstrap ? "new-password" : "current-password"}" maxlength="1024" required></label>
-                    ${bootstrap ? '<label>パスワードの確認<input id="web-auth-password-confirm" type="password" autocomplete="new-password" maxlength="1024" required></label>' : ""}
-                    ${bootstrap ? '<p class="subtle">ユーザー名は半角英数字と . _ - @ が使えます。パスワードは12文字以上で設定してください。</p>' : ""}
-                    <button id="web-auth-submit" type="submit" class="primary">${busy ? "確認しています…" : bootstrap ? "管理者を設定してログイン" : "ログイン"}</button>
-                </form>` : ""}
+                <p class="eyebrow">moyAI Hub</p><h1 id="web-auth-title">${checking ? "管理画面を開いています" : "Hub PCから管理画面を開いてください"}</h1>
+                <p class="subtle" id="web-auth-help">${checking ? "この画面の利用許可を確認しています。" : "管理を許可されたPCのDesktopで「Hubの管理画面を開く」を押してください。Hubを設置したPCでは、スタートメニューの「moyAI Team Management」からも開けます。IDやパスワードの入力は不要です。"}</p>
                 <p id="web-auth-error" class="web-auth-error" role="alert" hidden></p>
-                <button id="web-auth-refresh" type="button" class="secondary" ${busy || checking ? "disabled" : ""}>ログイン状態を再確認</button>
-                ${user ? '<button id="web-auth-logout" type="button" class="secondary">ログアウト</button>' : ""}
+                <button id="web-auth-refresh" type="button" class="secondary" ${busy || checking ? "disabled" : ""}>利用許可を再確認</button>
                 <p class="web-auth-footnote">ブラウザーを閉じてもHubは動作を続けます。</p>
             </section>`;
-            if (formAllowed) {
-                node<HTMLInputElement>("web-auth-username").value = username;
-                if (bootstrap) node<HTMLInputElement>("web-auth-display-name").value = displayName;
-                for (const field of root.querySelectorAll<HTMLInputElement | HTMLButtonElement>("form input, form button")) field.disabled = busy;
-                node("web-auth-form").addEventListener("submit", event => {
-                    event.preventDefault();
-                    if (busy) return;
-                    username = node<HTMLInputElement>("web-auth-username").value.trim();
-                    displayName = bootstrap ? node<HTMLInputElement>("web-auth-display-name").value.trim() : "";
-                    const password = node<HTMLInputElement>("web-auth-password").value;
-                    const confirmation = bootstrap ? node<HTMLInputElement>("web-auth-password-confirm").value : password;
-                    node<HTMLInputElement>("web-auth-password").value = "";
-                    if (bootstrap) node<HTMLInputElement>("web-auth-password-confirm").value = "";
-                    if (password !== confirmation) { error = "確認用のパスワードが一致しません。もう一度入力してください。"; render(); return; }
-                    if (bootstrap && !/^[A-Za-z0-9._@-]{1,64}$/.test(username)) {
-                        error = "ユーザー名は64文字以内の半角英数字と . _ - @ で入力してください。"; render(); return;
-                    }
-                    if (bootstrap && (!displayName || new TextEncoder().encode(displayName).length > 256 || /\p{Cc}/u.test(displayName))) {
-                        error = "表示名を入力してください。長い表示名は短くし、制御文字を除いてください。"; render(); return;
-                    }
-                    if ((bootstrap && [...password].length < 12) || new TextEncoder().encode(password).length > 1024) {
-                        error = "パスワードは12文字以上、UTF-8で1024バイト以内にしてください。"; render(); return;
-                    }
-                    void submit(bootstrap ? "bootstrap" : "login", bootstrap
-                        ? { username, display_name: displayName, password } : { username, password });
-                });
-            }
             node("web-auth-refresh").addEventListener("click", () => { void refresh(); });
-            if (user) node("web-auth-logout").addEventListener("click", () => { void submit("logout"); });
         }
         node("web-auth-error").textContent = error;
         node("web-auth-error").hidden = !error;
@@ -111,12 +75,8 @@ export function attachWebAuthentication(
     async function accept(value: WebSession | null) {
         session = value;
         checking = false;
-        if (value) {
-            configured = value.authentication.configured; bootstrapAllowed = value.authentication.bootstrap_allowed;
-            loginAllowed = value.authentication.login_allowed;
-        }
         const user = value?.authentication.user;
-        if (!value || !loginAllowed || !user?.administrator) {
+        if (!value?.authentication.login_allowed || !user?.administrator) {
             ++generation;
             startedFor = null;
             concealManagement();
@@ -141,24 +101,39 @@ export function attachWebAuthentication(
             render();
         }
     }
-    async function submit(action: "login" | "bootstrap" | "logout", args: Record<string, string> = {}) {
+    async function closeAccess() {
         if (busy) return;
+        const expected = ++refreshGeneration;
         busy = true; error = "";
-        if (action === "logout") concealManagement();
-        render();
-        try { await authenticate(action, args); }
-        catch (failure) { error = authenticationError(failure); }
-        finally { busy = false; render(); }
+        concealManagement(); render();
+        try { await authenticate("logout"); }
+        catch (failure) { if (expected === refreshGeneration) error = authenticationError(failure); }
+        finally { if (expected === refreshGeneration) { busy = false; render(); } }
     }
-    async function refresh() {
-        if (busy) return;
-        checking = true; error = "";
-        render();
-        try { await managementSession(true); }
-        catch (failure) { checking = false; error = authenticationError(failure); render(); }
+    async function refresh(replaceAccess = false) {
+        if (busy && !replaceAccess) return;
+        const expected = ++refreshGeneration;
+        busy = true; checking = true; error = ""; render();
+        const pendingTicket = ticket;
+        ticket = null;
+        try {
+            if (pendingTicket !== null) await authenticate("access", { ticket: pendingTicket });
+            else await managementSession(true);
+        } catch (failure) {
+            if (expected === refreshGeneration) { checking = false; error = authenticationError(failure); }
+        } finally {
+            if (expected === refreshGeneration) { busy = false; render(); }
+        }
     }
+    window.addEventListener("hashchange", () => {
+        const replacement = consumeAccessTicket(window.location, window.history);
+        if (replacement === null) return;
+        ticket = replacement;
+        // A launcher may navigate an existing tab by fragment only. Begin a
+        // new auth generation now so an older access response cannot reveal it.
+        void refresh(true);
+    });
     onAuthenticationChange(value => { void accept(value); });
-    concealManagement();
-    render();
+    concealManagement(); render();
     return { refresh };
 }

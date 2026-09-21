@@ -266,9 +266,10 @@ pub async fn run(action: Action) -> Result<(), String> {
             if let Some(settings) = settings {
                 web_args.extend(["--web-settings".into(), settings.into_os_string()]);
             }
+            let catalog_path = catalog(data)?;
             let report = host_process::launch::launch_server(
                 &std::env::current_exe().map_err(|e| e.to_string())?,
-                &catalog(data)?,
+                &catalog_path,
                 &web_args,
             )
             .await?;
@@ -286,7 +287,16 @@ pub async fn run(action: Action) -> Result<(), String> {
                 report.pid
             );
             if !no_browser {
-                host_process::launch::open_browser(&report.web_url, report.already_running)?;
+                let access = HostClient::connect(&catalog_path)
+                    .await?
+                    .dispatch("hub_web_open", serde_json::json!({}))
+                    .await?;
+                host_process::launch::open_browser(
+                    access["url"]
+                        .as_str()
+                        .ok_or("管理画面の認証を準備できません。")?,
+                    report.already_running,
+                )?;
             }
             if let Some(error) = report.network_error {
                 return Err(format!(

@@ -1,7 +1,7 @@
 import { test as base, expect } from "@playwright/test";
 import { startHubServer } from "./hub_server.mjs";
 
-export const administrator = Object.freeze({ username: "browser-admin", display_name: "ブラウザー検証 管理者", password: "browser-fixture-password" });
+export const administrator = Object.freeze({ display_name: "Hub PC 管理" });
 
 export const test = base.extend({
     remoteWeb: [false, { option: true }],
@@ -11,10 +11,11 @@ export const test = base.extend({
             const response = await context.request.get(new URL("/admin/session", hub.url).href);
             expect(response.ok()).toBe(true);
             const session = await response.json();
-            const action = session.authentication.configured ? "login" : "bootstrap";
-            const authenticated = await context.request.post(new URL(`/admin/${action}`, hub.url).href, {
+            const grant = await hub.command("hub_web_open");
+            const ticket = new URLSearchParams(new URL(grant.url).hash.slice(1)).get("access");
+            const authenticated = await context.request.post(new URL("/admin/access", hub.url).href, {
                 headers: { Origin: new URL(hub.url).origin, "X-Moyai-Csrf": session.csrf },
-                data: action === "bootstrap" ? administrator : { username: administrator.username, password: administrator.password },
+                data: { ticket },
             });
             expect(authenticated.ok(), await authenticated.text()).toBe(true);
             expect((await authenticated.json()).authentication.user.administrator).toBe(true);

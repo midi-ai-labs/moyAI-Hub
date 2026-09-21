@@ -62,7 +62,7 @@ async function withUi(status: () => Promise<WebStatus>, run: (value: {
 
 test("authenticated browser shows server-owned URLs without keys or listener lifecycle controls", async () => {
     await withUi(async () => running, async ({ node, ui, host, copied }) => {
-        assert.match(host().innerHTML, /管理者としてログインしたブラウザー/);
+        assert.match(host().innerHTML, /管理を許可されたPCのDesktop/);
         for (const id of ["web-enable", "web-disable", "web-key", "web-logout", "web-open"]) assert.equal(node(id), undefined);
         await ui.refresh(); assert.equal(node("web-enabled-state").textContent, "稼働中");
         assert.equal(node("web-url").value, running.local_url);
