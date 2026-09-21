@@ -23,7 +23,7 @@ export function projectPreparation(shared: SharedAdminSnapshot, network: Network
 }
 
 export interface OnboardingNextStep {
-  kind: "checking" | "network" | "project" | "legacy" | "controller_access" | "controllers" | "executors" | "execution_setup" | "preparing" | "preparation_failed" | "sample";
+  kind: "checking" | "network" | "project" | "legacy" | "controller_access" | "controllers" | "executors" | "execution_setup" | "preparing" | "preparation_failed" | "models" | "sample";
   title: string;
   owner: string;
   location: string;
@@ -32,7 +32,7 @@ export interface OnboardingNextStep {
 }
 
 /** A suggested handoff from current settings; folder preparation is not an AI test. */
-export function onboardingNextStep(shared: SharedAdminSnapshot, network: NetworkSnapshot | null, id: string): OnboardingNextStep {
+export function onboardingNextStep(shared: SharedAdminSnapshot, network: NetworkSnapshot | null, id: string, modelCount: number | null): OnboardingNextStep {
   const p = projectPreparation(shared, network, id);
   const projectAction = { kind: "project", label: "PCの用途を設定" } as const;
   const manager = { owner: "Hub管理者", location: "このHub管理画面" };
@@ -46,12 +46,14 @@ export function onboardingNextStep(shared: SharedAdminSnapshot, network: Network
   if (!p.executors.length) return { kind: "executors", title: "仕事を実行するPCを指定してください", ...manager, detail: "参加を許可したPCを、このプロジェクトの実行PCに選んで保存してください。PC側の保存先・権限は、そのPCの担当者が確認します。", action: projectAction };
   const ready = p.executors.filter(row => row.preparation_state === "ready");
   if (ready.length) {
+    if (modelCount === null) return { kind: "checking", title: "Hubの登録モデルを確認しています", ...manager, detail: "モデルの一覧が届くと、次の操作を表示します。", action: null };
+    if (modelCount === 0) return { kind: "models", title: "チームで使うAIをHubに登録してください", ...manager, detail: "作業フォルダーは作成済みですが、仕事に使うAIがHubに登録されていません。モデルを登録し、「最初に使う共有モデル」を選んでから、Desktopでサンプルを依頼してください。", action: { kind: "link", href: "#models", label: "共有AIを登録する" } };
     const unfinished = p.executors.filter(row => row.preparation_state !== "ready");
     return { kind: "sample", title: "Desktopからサンプルを依頼してください", owner: "操作PCを使う人", location: `${pcNames(p.requesters)} のDesktop`, detail: `「${p.project.label}」を開き、実行先に ${pcNames(ready)} を選んで、回答と成果ファイルを確認してください。作業フォルダーは作成済みですが、AIの接続・実行結果はこのサンプルで確認します。${unfinished.length ? ` ${pcNames(unfinished)} は準備が未完了です。まず作成済みのPCで試せます。` : ""}`, action: { kind: "first", label: "サンプルの依頼手順" } };
   }
   const failed = p.executors.filter(row => row.preparation_state === "failed");
   if (failed.length) return { kind: "preparation_failed", title: "実行PCの保存先を確認してください", owner: "実行PCの担当者 → Hub管理者", location: `${pcNames(failed)} のDesktop → このHub管理画面`, detail: "PCの担当者が保存先・権限と、下の「実行するPCとAI」にあるエラーを確認します。原因を解消したら、Hub管理者が管理画面の「プロジェクト」で「フォルダー作成を再試行」を押してください。", action: { kind: "link", href: "#shared-administration", label: "プロジェクトの管理へ" } };
   const waiting = p.executors.filter(row => row.preparation_state !== "pending");
-  if (waiting.length) return { kind: "execution_setup", title: "実行PCで保存先と権限を確認してください", owner: "実行PCの担当者", location: `${pcNames(waiting)} のDesktop`, detail: "AIの接続先とモデルを設定し、「PCの接続」の「このPCで仕事を実行」で保存先を選び、「この設定で実行を許可」を押してください。", action: null };
+  if (waiting.length) return { kind: "execution_setup", title: "実行PCで保存先と権限を確認してください", owner: "実行PCの担当者", location: `${pcNames(waiting)} のDesktop`, detail: "Hubのモデルを確認し、「PCの接続」の「このPCで仕事を実行」で保存先を選び、「この設定で実行を許可」を押してください。", action: null };
   return { kind: "preparing", title: "実行PCが作業フォルダーを作成しています", owner: "実行PCの担当者", location: `${pcNames(p.executors)} のDesktop`, detail: "Hubと実行PCを起動したままお待ちください。状態が変わらない場合は、実行PCのDesktopでHubへの接続と実行設定を確認してください。作成後は、依頼する人がサンプルを送ります。", action: null };
 }

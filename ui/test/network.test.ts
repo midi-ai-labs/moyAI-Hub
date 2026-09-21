@@ -27,6 +27,13 @@ test("pending joins take the user to approval and expired requests never count a
     current.join_requests[0].status="expired";
     assert.equal(networkSetupStep(current).anchor,"network-step-firewall");
 });
+test("observed missing or outdated inbound rules remain actionable even when a local PC is online", () => {
+    const current = snapshot(); current.server.running = true;
+    for (const state of ["missing", "mismatch", "conflict"] as const) assert.equal(networkSetupStep(current, state).anchor, "network-step-firewall");
+    assert.equal(networkSetupStep(current, "matching").anchor, "network-step-confirm");
+    current.devices = [];
+    assert.equal(networkSetupStep(current, "matching").title, "3. 接続ファイルの配布");
+});
 
 test("Windows username finds distinct registered PCs without merging their identities", () => {
     const current = snapshot();

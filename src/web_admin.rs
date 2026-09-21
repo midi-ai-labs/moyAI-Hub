@@ -347,6 +347,7 @@ fn browser_command(command: &str) -> bool {
             | "hub_autostart_status"
             | "hub_autostart_set"
             | "hub_firewall_preview"
+            | "hub_firewall_status"
             | "hub_firewall_apply"
             | "hub_firewall_remove"
             | "hub_start"
@@ -420,6 +421,7 @@ async fn command(
         "hub_autostart_status"
             | "hub_autostart_set"
             | "hub_firewall_preview"
+            | "hub_firewall_status"
             | "hub_firewall_apply"
             | "hub_firewall_remove"
     ) && !local.0

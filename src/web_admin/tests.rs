@@ -869,6 +869,7 @@ async fn tls_browser_management_uses_shared_revision_owner_and_rejects_local_onl
         "hub_autostart_status",
         "hub_autostart_set",
         "hub_firewall_preview",
+        "hub_firewall_status",
         "hub_firewall_apply",
         "hub_firewall_remove",
     ] {

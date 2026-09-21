@@ -17,7 +17,8 @@ test("Firewall preview refuses loopback without permitting an OS mutation",async
 
 test("Firewall real local-LAN preview preserves explicit scope and invalidates changed input without UAC",async({page,hub},info)=>{
   const options=await hub.command("hub_hosting_options");
-  const candidate=options.candidates.find(row=>/^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(row.ip));
+  const privateCandidates=options.candidates.filter(row=>/^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(row.ip));
+  const candidate=privateCandidates.find(row=>row.profile==="Private"||row.profile==="DomainAuthenticated") ?? privateCandidates[0];
   test.skip(!candidate,"No local RFC1918 interface: private-LAN read-only preview remains an environment acceptance item");
   await hub.allowPrivateNetworkAddress(candidate.ip);
   const mutations=[];
@@ -25,7 +26,19 @@ test("Firewall real local-LAN preview preserves explicit scope and invalidates c
   await page.goto(hub.url); await page.locator('nav a[href="#device-network"]').click();
   await page.locator("#network-ip").fill(candidate.ip); await page.locator("#network-port").fill(String(hub.networkPort)); await page.locator("#network-start").click();
   await expect(page.locator("#network-stop")).toBeVisible(); await hub.observeNetwork();
-  await page.locator("#hub-firewall > summary").click();
+  await expect(page.locator("#hub-firewall-health")).toContainText("未登録",{timeout:30000});
+  await expect(page.locator("#network-next-title")).toContainText("受信許可");
+  await info.attach("firewall-startup-status",{body:await page.locator("#network-step-firewall").screenshot(),contentType:"image/png"});
+  const suggestion = page.locator("#hub-firewall-suggestion");
+  if (candidate.profile === "Private" || candidate.profile === "DomainAuthenticated") {
+    await expect(suggestion).toBeVisible();
+    await expect(page.locator("#hub-firewall-addresses")).toBeEmpty();
+    await suggestion.focus(); await page.keyboard.press("Enter");
+    await expect(page.locator("#hub-firewall-addresses")).not.toBeEmpty();
+    await expect(page.locator("#hub-firewall-apply")).toBeDisabled();
+  }
+  // Open only if the explicit suggestion did not already open the editor.
+  if (!await page.locator("#hub-firewall").evaluate(node=>node.open)) await page.locator("#hub-firewall > summary").click();
   await page.locator("#hub-firewall-addresses").fill(candidate.ip); await page.locator("#hub-firewall-private").check();
   await page.locator("#hub-firewall-review").click();
   await expect(page.locator("#hub-firewall-preview")).toBeVisible({timeout:25000});
@@ -44,4 +57,5 @@ test("Firewall real local-LAN preview preserves explicit scope and invalidates c
   await expect(page.locator("#hub-firewall-preview")).toBeHidden(); await expect(page.locator("#hub-firewall-apply")).toBeDisabled();
   expect(mutations).toEqual([]);
   await page.locator("#network-stop").click(); await expect(page.locator("#network-start")).toBeVisible();
+  await expect(page.locator("#hub-firewall-health")).toContainText("Hubを開始すると");
 });

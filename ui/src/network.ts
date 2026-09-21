@@ -4,6 +4,7 @@ import type { NetworkClientAction, NetworkClientFilter, NetworkDiagnostics, Netw
 import "./network.css";
 import { reconcileNetworkRows } from "./network_rows.ts";
 import { attachFirewall } from "./firewall.ts";
+import type { FirewallStatus } from "./firewall.ts";
 
 const escape = (value: unknown) => String(value ?? "").replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]!);
 const when = (value: number | null) => value ? new Date(value).toLocaleString("ja-JP") : "未確認";
@@ -17,7 +18,7 @@ export function attachDeviceNetwork(host: HTMLElement, clientsHost: HTMLElement,
       <div class="network-grid network-setup-grid"><section id="network-step-start" class="network-card"><h3>1. 接続先を設定してHubを開始 <span id="network-server-status" class="badge gray">停止中</span></h3><p class="footnote">このPCでHubとモデル通信の受付を起動します。Windowsの受信許可は、実際のポートが決まった後に手順2で設定します。</p>
         <label>共有するLANの候補<select id="network-lan"><option value="">候補を確認しています…</option></select></label><p id="network-lan-status" class="footnote"></p><button id="network-lan-refresh" type="button" class="secondary">LAN候補を再取得</button>
         <p class="footnote">モデル通信は保存済みポートで開始します。変更する場合だけ下を開いて保存してください。</p>
-        <details id="network-gateway-settings" data-details-key="network-gateway-settings"><summary>モデル通信ポートを変更する（通常は変更不要）</summary><form id="network-settings-form"><label>Gatewayポート<input id="network-gateway-port" inputmode="numeric" autocomplete="off" placeholder="9472" /></label><p class="footnote">表示中の保存済み設定で開始します。通常は変更・保存せずに下の開始ボタンへ進めます。新規Hubの標準は9472です。変更するときだけ「ポート設定を保存」を押してください。稼働中の変更は次回開始時に適用し、空欄または0は再開始時にポートが変わる自動選択です。</p><p class="footnote">GatewayはHubで共有するAIとの通信に使います。実行PCに直接設定したAIで共有仕事を動かす場合、Gatewayを使うためのモデル登録・Desktop診断は不要です。Hubの開始時にはGatewayも起動します。</p><button type="submit" class="secondary">ポート設定を保存</button></form></details>
+        <details id="network-gateway-settings" data-details-key="network-gateway-settings"><summary>モデル通信ポートを変更する（通常は変更不要）</summary><form id="network-settings-form"><label>Gatewayポート<input id="network-gateway-port" inputmode="numeric" autocomplete="off" placeholder="9472" /></label><p class="footnote">表示中の保存済み設定で開始します。通常は変更・保存せずに下の開始ボタンへ進めます。新規Hubの標準は9472です。変更するときだけ「ポート設定を保存」を押してください。稼働中の変更は次回開始時に適用し、空欄または0は再開始時にポートが変わる自動選択です。</p><p class="footnote">Gatewayはチームの仕事で使うAIとの通信を中継し、Hubと一緒に起動します。使うAIをHubへ登録し、実行PCのDesktopで接続を確認してください。</p><button type="submit" class="secondary">ポート設定を保存</button></form></details>
         <form id="network-server-form"><div class="network-fields"><label>このHubのIP<input id="network-ip" placeholder="例: 192.168.1.10" required autocomplete="off" spellcheck="false" aria-describedby="network-ip-help" /></label><label>Hubポート<input id="network-port" value="9471" inputmode="numeric" required /></label></div>
         <p id="network-ip-help" class="footnote">チームで使う場合は、同じPCのDesktopも最初からLAN側IPへ接続してください。複数LAN・VPNがある場合は参加PCから届くものを選びます。127.0.0.1はこのPCだけの試用向けです。登録済みDesktopのURL変更は、同じHub・同じCAの接続ファイルで接続先を確認して行います。別Hub・CAへの差し替えは対象外です。</p>
         <p class="footnote">一度開始できたIPとポートは保存されます。次回はStart-Hub.cmdから同じ設定で再開できます。モデル接続とGatewayもまとめて開始・停止します。</p><p id="network-hosting-error" class="field-status error" role="status" hidden></p><div class="network-actions"><button id="network-start" class="primary">接続の受付を開始</button><button id="network-stop" type="button" class="danger" hidden>接続の受付を停止</button><button id="network-diagnose" type="button" class="secondary">接続状態を診断</button></div></form>
@@ -28,8 +29,8 @@ export function attachDeviceNetwork(host: HTMLElement, clientsHost: HTMLElement,
           <button id="network-renew-certificate" type="button" class="secondary">証明書を今すぐ更新</button><p class="footnote">HubとGatewayの証明書を更新します。新しい接続から適用し、進行中の通信は継続します。</p>
         </details></section>
       <section id="network-step-firewall" class="network-card"><h3>2. Windowsで受信を許可</h3><p>Hub PCで設定する場合は、下の「このHub PCで受信許可を設定する」を開いてください。Windowsの管理者権限がない場合や会社で一括管理している場合は、PC管理者へ設定を依頼します。</p><p id="network-firewall-prerequisite" class="footnote"></p>
-        <div id="network-firewall-native"></div><details><summary>受信許可の設定を管理者へ依頼</summary><p>次の実行ファイルとHub・Gatewayの受信TCPポートに限定します。利用する接続元PCまたはサブネットと、社内LANのネットワークプロファイルを管理者が確認してください。</p><pre id="network-firewall-info"></pre><button id="network-firewall-copy" type="button" class="secondary">設定依頼をコピー</button><p class="footnote">コピーした内容をPC管理者へ渡し、設定を依頼してください。設定後は参加するDesktopから接続を診断します。許可が引き続き有効になるよう、更新後もHubの実行ファイルは同じ場所に置いてください。</p></details><p><a href="#network-step-file">受信許可を設定したら、最初の1台へ接続ファイルを渡す →</a></p></section>
-      <section id="network-step-file" class="network-card"><h3>3. 最初の1台へ接続ファイルを渡す</h3>
+        <div id="network-firewall-native"></div><details><summary>受信許可の設定を管理者へ依頼</summary><p>次の実行ファイルとHub・Gatewayの受信TCPポートに限定します。利用する接続元PCまたはサブネットと、社内LANのネットワークプロファイルを管理者が確認してください。</p><pre id="network-firewall-info"></pre><button id="network-firewall-copy" type="button" class="secondary">設定依頼をコピー</button><p class="footnote">コピーした内容をPC管理者へ渡し、設定を依頼してください。設定後は参加するDesktopから接続を診断します。許可が引き続き有効になるよう、更新後もHubの実行ファイルは同じ場所に置いてください。</p></details><p><a href="#network-step-file">受信許可を設定したら、接続ファイルを配布する →</a></p></section>
+      <section id="network-step-file" class="network-card"><h3>3. 接続ファイルの配布</h3>
         <p class="subtle">hub-config.moyai-joinを保存して、まず接続を試すPCへ渡します。そのPCにmoyAIをセットアップし、ファイルをダブルクリックしてDesktopで接続先を確認してください。Desktopの「moyAI Hub → PCの接続」からも読み込めます。IPや証明書をPCごとに入力する必要はありません。</p>
         <div class="network-actions"><button id="network-save-config" type="button" class="primary">接続ファイルを保存</button><button id="network-copy-config" type="button" class="secondary">接続設定をコピー</button></div>
         <p class="footnote">接続を開始すると保存・コピーできます。含まれるのはHubのURLと公開CAです。管理画面のURLや利用者のパスワードは含みません。</p>
@@ -38,7 +39,7 @@ export function attachDeviceNetwork(host: HTMLElement, clientsHost: HTMLElement,
       <section id="network-step-confirm" class="network-card"><h3>4. 参加を許可して、Desktopで接続を診断</h3>
         <p class="subtle">Desktopが自動で申請します。PC名とIPを確認し、許可画面で既存プロジェクトへの操作・実行用途も選べます。名前は後から変更できます。</p>
         <a id="network-open-pending" href="#clients" class="primary-link">接続PC・承認待ちを確認する <span id="network-pending-summary"></span> →</a>
-        <ol><li>上の一覧で申請元のPCを確かめ、「許可」を押します。</li><li>そのPCのDesktopで「PCの接続 → 接続の詳細・診断 → Hubへの接続を診断」を実行します。</li><li>そのPCでHubのAIも使う場合は「このPCでHubのAIを使う場合の診断」も実行します。</li></ol><p>接続と必要なAIが使えることを確かめたら、手順3の同じ接続ファイルを残りのPCへ渡します。各PCの参加はそれぞれ許可してください。</p><a href="#network-step-file">チームに配る接続ファイルを保存する</a>
+        <ol><li>上の一覧で申請元のPCを確かめ、「許可」を押します。</li><li>そのPCのDesktopで「PCの接続 → 接続の詳細・診断 → Hubへの接続を診断」を実行します。</li><li>仕事を実行するPCでは「このPCでHubのAIを使う場合の診断」も実行します。</li></ol><p>接続と必要なAIが使えることを確かめたら、手順3の同じ接続ファイルを残りのPCへ渡します。各PCの参加はそれぞれ許可してください。</p><a href="#network-step-file">チームに配る接続ファイルを保存する</a>
         <p class="footnote">共有仕事を使う人とプロジェクトは先に<a href="#team-onboarding">チームの初期設定</a>から設定できます。PC参加だけを許可し、用途を後から指定することもできます。</p></section></div>
       <div hidden><div class="network-rule-introduction"><h3>PC同士で直接仕事を依頼する場合</h3><p class="subtle">端末グループと接続ルールを設定します。Hubが受け付ける共有仕事の利用者・実行先は「プロジェクト・利用者」で管理します。</p></div>
       <div class="network-grid"><section class="network-card"><h3>端末グループ</h3><p class="footnote">PCをまとめて接続許可を設定できます。例:「開発」「GPU搭載」の両方へ同じ端末を追加できます。</p>
@@ -71,7 +72,8 @@ export function attachDeviceNetwork(host: HTMLElement, clientsHost: HTMLElement,
     const node = <T extends HTMLElement = HTMLElement>(id: string) => (host.querySelector<T>(`#${id}`) ?? clientsHost.querySelector<T>(`#${id}`))!;
     const value = (id: string) => node<HTMLInputElement | HTMLSelectElement>(id).value;
     const firewallHost = node("network-firewall-native");
-    attachFirewall(firewallHost);
+    let firewallState: FirewallStatus["state"] | null = null;
+    const firewall = attachFirewall(firewallHost, state => { firewallState = state; render(); });
     const message = (text: string, error = false) => { for (const id of ["network-notice", "network-clients-notice"]) { node(id).textContent = text; node(id).classList.toggle("error", error); } };
     const owner = new NetworkEdits();
     let busy = false;
@@ -140,7 +142,8 @@ export function attachDeviceNetwork(host: HTMLElement, clientsHost: HTMLElement,
             node<HTMLTextAreaElement>("network-config-text").value = "";
         }
         node("network-server-status").textContent = snapshot.server.running ? "稼働中" : "停止中";
-        const step = networkSetupStep(snapshot);
+        firewall.refresh(networkDiagnosticTarget(snapshot), snapshot.server.running);
+        const step = networkSetupStep(snapshot, firewallState);
         node("network-next-title").textContent = step.title;
         node("network-next-detail").textContent = step.detail;
         node<HTMLAnchorElement>("network-next-link").href = `#${step.anchor}`;

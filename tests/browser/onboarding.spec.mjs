@@ -5,6 +5,8 @@ test("first setup starts with PC and project choices without user or password ch
   await page.goto(hub.url);
   await expect(page.locator("#onboarding-steps")).toContainText("最初のプロジェクト");
   await expect(page.locator("#onboarding-new-user")).toHaveCount(0);
+  await expect(page.locator("#onboarding-steps")).toContainText("チームの仕事にはHubに登録したAIが必要です");
+  await expect(page.locator("#team-onboarding")).not.toContainText("PCに直接設定したAIなら不要");
   await page.locator("#onboarding-new-project").click();
   await expect(page.locator('#shared-admin-editor input[type=password], #shared-admin-editor [name^="participant:"]')).toHaveCount(0);
   await info.attach("project-without-person-setup",{body:await page.locator("#shared-administration").screenshot(),contentType:"image/png"});
@@ -33,6 +35,7 @@ test("connection setup guides the first PC through start permission file and app
   await expect(page.locator("#network-settings-form")).toContainText("通常は変更・保存せず");
   const order=await page.locator("#device-network .network-setup-grid > section").evaluateAll(rows=>rows.map(row=>row.id));
   expect(order).toEqual(["network-step-start","network-step-firewall","network-step-file","network-step-confirm"]);
+  await expect(page.locator("#network-step-file h3")).toHaveText("3. 接続ファイルの配布");
   expect(await page.locator("#network-gateway-port").evaluate(field=>Boolean(field.compareDocumentPosition(document.querySelector("#network-start"))&Node.DOCUMENT_POSITION_FOLLOWING))).toBe(true);
   // Read geometry before fill/click/element screenshots can scroll to the start control.
   await expect.poll(()=>page.locator("#network-start").evaluate(button=>{
@@ -58,7 +61,7 @@ test("connection setup guides the first PC through start permission file and app
   await page.locator("#network-clients-refresh").click();
   await expect(page.locator("#network-next-title")).toHaveText("4. 参加したPCで接続を診断");
   await expect(page.locator("#network-next-detail")).toContainText("Desktopで接続を診断");
-  await expect(page.locator("#network-step-confirm")).toContainText("HubのAIも使う場合");
+  await expect(page.locator("#network-step-confirm")).toContainText("仕事を実行するPCでは");
   await info.attach("network-next-after-first-approval",{body:await page.locator(".network-next-action").screenshot(),contentType:"image/png"});
   await page.locator("#network-stop").click(); await expect(page.locator("#network-next-title")).toContainText("1.");
 });
@@ -83,6 +86,15 @@ test("team preparation registers and names an exact PC and enables project acces
   await expect(page.locator("#onboarding-steps")).toContainText("実行PCの保存先・権限の確認待ち");
   await page.reload(); await expect(page.locator("#onboarding-project")).toHaveValue(id);
   await expect(page.locator("#onboarding-steps")).toContainText("Desktopからサンプルを依頼し、回答と成果ファイルを開いてください。");
+  // A prepared folder is not enough to run a shared job without a Hub model.
+  // The participant simulates only the authenticated provisioning receipt.
+  await participant.sharedTemplates([{id:"desktop-default",label:"このPCの実行設定"}]);
+  const [preparation]=await participant.sharedProvisioning();
+  expect(preparation.template_id).toBe("desktop-default");
+  await participant.sharedProvisionReceipt({...preparation,success:true,error:null});
+  await page.locator("#shared-admin-refresh").click();
+  await expect(page.locator("#onboarding-next-title")).toHaveText("チームで使うAIをHubに登録してください");
+  await expect(page.locator('#onboarding-next a[href="#models"]')).toHaveText("共有AIを登録する");
   await page.locator("#onboarding-first-job > summary").click();
   await expect(page.locator("#onboarding-first-job")).toContainText("Desktopの「接続状況とサンプル」");
   await info.attach("team-preparation",{body:await page.locator("#team-onboarding").screenshot(),contentType:"image/png"});

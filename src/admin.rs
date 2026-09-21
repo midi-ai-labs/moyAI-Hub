@@ -172,6 +172,7 @@ impl Admin {
             "hub_stop" => output(hub_stop(self).await?),
             "hub_network_snapshot" => network_admin::hub_network_snapshot(self).await,
             "hub_hosting_options" => hosting_options::snapshot().await,
+            "hub_firewall_status" => firewall::status(self).await,
             "hub_firewall_preview" => firewall::preview(self, argument(&args, "scope")?).await,
             "hub_firewall_apply" | "hub_firewall_remove" => {
                 firewall::change(

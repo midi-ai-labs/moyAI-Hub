@@ -53,13 +53,15 @@ export interface NetworkSnapshot {
 }
 
 /** Suggestions use observed Hub facts; an online PC is not proof of a usable LAN or AI. */
-export function networkSetupStep(snapshot: NetworkSnapshot): { title: string; detail: string; anchor: string; action: string } {
+export function networkSetupStep(snapshot: NetworkSnapshot, firewall: "missing" | "matching" | "mismatch" | "conflict" | null = null): { title: string; detail: string; anchor: string; action: string } {
     if (!snapshot.server.running) return { title: "1. Hubの接続先を設定して開始", detail: "参加するPCと通信できるLANとHubポートを選びます。モデル通信用ポートは必要な場合だけ変更してください。", anchor: "network-step-start", action: "接続先を設定する" };
+    if (firewall && firewall !== "matching") return { title: "2. Windowsの受信許可を確認", detail: firewall === "missing" ? "この設置先でmoyAIが管理する受信許可が未登録です。会社で設定済みの場合も含め、下の確認結果を確認してください。" : "現在のHubと受信許可の内容が一致しません。下の確認結果に沿って見直してください。", anchor: "network-step-firewall", action: "受信許可を確認する" };
     const pending = snapshot.join_requests.filter(request => request.status === "pending").length;
     if (pending) return { title: `4. 参加申請が${pending}台届いています`, detail: "申請元のPCを確かめて許可し、そのDesktopで接続を診断してください。", anchor: "clients", action: "参加申請を開く" };
     const allowed = snapshot.devices.filter(device => !device.revoked && device.admission === "allowed");
     if (allowed.length) return { title: "4. 参加したPCで接続を診断", detail: `参加を許可したPCは${allowed.length}台、現在接続中は${allowed.filter(device => device.online).length}台です。Desktopで接続を診断し、使えることを確かめたら残りのPCへ同じ接続ファイルを渡します。`, anchor: "network-step-confirm", action: "Desktopでの確認手順を見る" };
-    return { title: "2. 受信許可を設定して最初のPCを接続", detail: "Hubは起動しています。Windowsの受信許可を設定し、接続ファイルを最初の1台へ渡してください。", anchor: "network-step-firewall", action: "受信許可の手順へ" };
+    if (firewall === "matching") return { title: "3. 接続ファイルの配布", detail: "現在のHubへの受信許可を確認しました。参加するPCへ接続ファイルを渡し、そのDesktopで接続を確認してください。", anchor: "network-step-file", action: "接続ファイルを保存する" };
+    return { title: "2. 受信許可を設定してPCを接続", detail: "Hubは起動しています。Windowsの受信許可を設定し、参加するPCへ接続ファイルを渡してください。", anchor: "network-step-firewall", action: "受信許可の手順へ" };
 }
 
 export interface NetworkDiagnostics {
@@ -97,7 +99,7 @@ export function networkDiagnosticStages(result: NetworkDiagnostics, checkedAt: n
             ? `${result.gateway_endpoint} の受付と、有効なサーバー証明書を確認しました。`
             : "Gatewayの受付または有効な証明書を確認できません。稼働状態を確認してください。" },
         { label: "別端末からの到達とWindowsファイアウォール", status: "skipped", detail:
-            "接続するPCのDesktopで「Hubへの接続を診断」を実行してください。そのPCでHubのAIも使う場合は「PCの接続 → 接続の詳細・診断 → このPCでHubのAIを使う場合の診断」も実行します。接続できない場合は、HubとGatewayの受信TCPポートがファイアウォールで許可されているか確認してください。この診断は設定を変更しません。" },
+            "接続するPCのDesktopで「Hubへの接続を診断」を実行してください。仕事を実行するPCでは「PCの接続 → 接続の詳細・診断 → このPCでHubのAIを使う場合の診断」も実行します。接続できない場合は、HubとGatewayの受信TCPポートがファイアウォールで許可されているか確認してください。この診断は設定を変更しません。" },
     ];
 }
 

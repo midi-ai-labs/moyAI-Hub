@@ -29,6 +29,7 @@ fn message(error: NetworkError) -> String {
         NetworkError::Revoked => "失効した端末は元に戻せません。新しい鍵での参加申請が必要です。",
         NetworkError::Full => "登録または許可の上限に達しています。",
         NetworkError::InvalidRequest => "入力内容と対象を確認してください。",
+        NetworkError::ConnectionRuleConflict => "同じ送信元・受入先・経路・公開対象の接続ルールがあります。既存ルールを変更するか、重複を削除してください。",
         NetworkError::DeviceNameConflict => "同じ端末名が登録または申請されています。前後の空白・大文字小文字を変えるだけでは区別できません。別の端末名を入力してください。",
         NetworkError::DeviceWorkUnsettled => "この端末に関係する受入済みタスクの終了を確認できないため削除できません。Desktopで停止または完了を確認し、最新情報を取得してから再試行してください。オフラインだけでは完了と判断しません。",
         _ => "端末設定を処理できませんでした。元の設定は保持されています。",

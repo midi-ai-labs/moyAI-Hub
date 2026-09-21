@@ -6,6 +6,11 @@ test("Authenticated browser manages the real Hub without a native app", { tag: "
     page.on("pageerror", error => pageErrors.push(error.message));
     await page.goto(hub.url);
     await expect(page).toHaveURL(hub.url);
+    await expect(page.locator(".brand-mark")).toBeVisible();
+    await expect.poll(() => page.locator(".brand-mark").evaluate(image => image.complete && image.naturalWidth > 0)).toBe(true);
+    const iconUrl = await page.locator('link[rel="icon"]').evaluate(link => link.href);
+    const icon = await page.request.get(iconUrl);
+    expect(icon.ok()).toBe(true); expect(icon.headers()["content-type"]).toContain("image/svg+xml");
     await expect(page.getByRole("button", { name: "ログイン", exact: true })).toHaveCount(0);
     await expect(page.getByLabel("管理キー", { exact: true })).toHaveCount(0);
     await expect(page.getByRole("button", { name: "この画面の利用を終了", exact: true })).toBeVisible();

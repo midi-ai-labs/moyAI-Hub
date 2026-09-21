@@ -41,6 +41,8 @@ pub enum NetworkError {
     InvalidRequest,
     #[error("device_name_conflict")]
     DeviceNameConflict,
+    #[error("connection_rule_conflict")]
+    ConnectionRuleConflict,
     #[error("device_work_unsettled")]
     DeviceWorkUnsettled,
     #[error("invalid_csr")]
@@ -685,6 +687,17 @@ impl DeviceNetwork {
                 || rule.profile_id.as_ref().is_some_and(|s| !id_ok(s))
             {
                 return Err(NetworkError::InvalidRequest);
+            }
+            // A scope has one decision. Effect/depth are values to edit, not
+            // separate identities that can silently conflict with each other.
+            if store.rules.values().any(|existing| {
+                existing.id != rule.id
+                    && existing.from == rule.from
+                    && existing.to == rule.to
+                    && existing.usage == rule.usage
+                    && existing.profile_id == rule.profile_id
+            }) {
+                return Err(NetworkError::ConnectionRuleConflict);
             }
             if rule.id.is_empty() {
                 rule.id = ulid::Ulid::new().to_string();

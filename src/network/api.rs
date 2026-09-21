@@ -16,6 +16,7 @@ pub(crate) fn error(error: NetworkError) -> (StatusCode, Json<Value>) {
         NetworkError::Unauthorized => StatusCode::UNAUTHORIZED,
         NetworkError::StaleRevision
         | NetworkError::DeviceNameConflict
+        | NetworkError::ConnectionRuleConflict
         | NetworkError::DeviceWorkUnsettled
         | NetworkError::RecoveryRequired
         | NetworkError::AuthorityRetired

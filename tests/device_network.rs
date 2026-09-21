@@ -20,6 +20,8 @@ mod history;
 mod join;
 #[path = "device_network/registry.rs"]
 mod registry;
+#[path = "device_network/rules.rs"]
+mod rules;
 
 struct Fixture {
     directory: tempfile::TempDir,

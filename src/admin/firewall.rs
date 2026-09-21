@@ -318,6 +318,131 @@ async fn prepare(
     preview_value(spec, binary_sha256, observed)
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Inventory {
+    current: Option<Observed>,
+    other: Vec<Observed>,
+}
+
+fn status_value(
+    program: &str,
+    local_address: Ipv4Addr,
+    local_ports: &[u16],
+    inventory: Inventory,
+    lan_scope: Option<Scope>,
+    active_profile: Option<&str>,
+) -> Value {
+    let profile_mask = match active_profile {
+        Some("DomainAuthenticated") => Some(1),
+        Some("Private") => Some(2),
+        Some("Public") => Some(4),
+        _ => None,
+    };
+    let state = match inventory.current.as_ref() {
+        None => "missing",
+        Some(row) if !row.owned || !row.spec.program.eq_ignore_ascii_case(program) => "conflict",
+        Some(row)
+            if row.spec.local_address == local_address
+                && row.spec.local_ports == local_ports
+                && profile_mask.is_none_or(|mask| row.spec.profile_mask & mask != 0) =>
+        {
+            "matching"
+        }
+        Some(_) => "mismatch",
+    };
+    let existing_scope = inventory
+        .current
+        .as_ref()
+        .filter(|row| row.owned && row.spec.program.eq_ignore_ascii_case(program))
+        .map(|row| Scope {
+            remote_addresses: row.spec.remote_addresses.clone(),
+            profiles: [(1, "Domain"), (2, "Private")]
+                .into_iter()
+                .filter(|(mask, _)| row.spec.profile_mask & mask != 0)
+                .map(|(_, label)| label.to_owned())
+                .collect(),
+        });
+    let suggestion_source = if existing_scope.is_some() {
+        "existing"
+    } else {
+        "lan"
+    };
+    let mut other_programs: Vec<_> = inventory
+        .other
+        .into_iter()
+        .filter(|row| row.owned && !row.spec.program.eq_ignore_ascii_case(program))
+        .map(|row| row.spec.program)
+        .collect();
+    other_programs.sort();
+    other_programs.dedup();
+    json!({"state":state,"program":program,"local_address":local_address,"local_ports":local_ports,"active_profile":active_profile,
+        "current":inventory.current.map(|row|row.spec),"other_programs":other_programs,
+        "suggestion":existing_scope.or(lan_scope),"suggestion_source":suggestion_source})
+}
+
+/// Read the OS owner when this page opens or its listener target changes.
+/// This observes configuration; it never claims that another PC can reach it.
+pub(super) async fn status(admin: &Admin) -> Result<Value, String> {
+    #[cfg(not(windows))]
+    {
+        let _ = admin;
+        return Err("受信許可の確認はWindowsのHub PCで利用できます。".into());
+    }
+    #[cfg(windows)]
+    {
+        let (hub, gateway) = {
+            let server = admin.network_server.lock().await;
+            let (hub, gateway) = network_admin::firewall_endpoints(&server)?;
+            (hub.to_owned(), gateway.to_owned())
+        };
+        let advertised = admin
+            .network_hosting
+            .lock()
+            .map_err(|_| "公開設定を確認できません。")?
+            .configured()?
+            .advertise_ip
+            .to_string();
+        let (local_address, local_ports) = listener_target((&hub, &gateway, &advertised))?;
+        let (program, _) = executable()?;
+        let directory = std::fs::canonicalize(admin.path.parent().ok_or("保存先がありません。")?)
+            .map_err(|_| "保存先を確認できません。")?;
+        let name = rule_name(
+            &program,
+            directory.to_str().ok_or("保存先を確認できません。")?,
+        );
+        let script = format!(
+            "{HELPER}\n[Console]::OutputEncoding=[Text.UTF8Encoding]::new(); $names=@(Get-NetFirewallRule -PolicyStore PersistentStore | Where-Object {{ $_.Group -ceq 'moyAI Hub managed inbound v1' }} | Select-Object -First 65 -ExpandProperty Name); if ($names.Count -gt 64) {{ throw 'Too many managed rules' }}; $other=@($names | Where-Object {{ $_ -cne '{name}' }} | ForEach-Object {{ Get-MoyaiRule $_ }}); [pscustomobject]@{{current=(Get-MoyaiRule '{name}');other=$other}} | ConvertTo-Json -Depth 8 -Compress"
+        );
+        let result = run_script(&script, 15).await?;
+        if !result.status.success() || result.stdout.len() > 256 * 1024 {
+            return Err("受信許可を読み取れません。PC管理者へ確認してください。".into());
+        }
+        let inventory: Inventory = serde_json::from_slice(&result.stdout)
+            .map_err(|_| "受信許可の内容を読み取れません。PC管理者へ確認してください。")?;
+        let candidate = hosting_options::inspect()
+            .await
+            .ok()
+            .and_then(|rows| rows.into_iter().find(|row| row.ip == local_address));
+        let lan_scope =
+            candidate
+                .as_ref()
+                .and_then(|row| row.trusted_scope())
+                .map(|(remote, profile)| Scope {
+                    remote_addresses: vec![remote],
+                    profiles: vec![profile],
+                });
+        Ok(status_value(
+            &program,
+            local_address,
+            &local_ports,
+            inventory,
+            lan_scope,
+            candidate.as_ref().and_then(|row| row.profile.as_deref()),
+        ))
+    }
+}
+
 pub(super) async fn preview(admin: &Admin, scope: Scope) -> Result<Value, String> {
     let server = admin.network_server.lock().await;
     let (hub, gateway) = network_admin::firewall_endpoints(&server)?;
@@ -597,5 +722,94 @@ mod tests {
             rule_name("C:\\Hub.exe", "C:\\Data"),
             rule_name("C:\\Hub.exe", "C:\\Other")
         );
+    }
+    #[test]
+    fn current_rule_status_detects_relocation_and_port_changes_without_inheriting_scope() {
+        let s = spec();
+        let mut previous = s.clone();
+        previous.program = "C:\\Old\\moyai-hub.exe".into();
+        let value = status_value(
+            &s.program,
+            s.local_address,
+            &s.local_ports,
+            Inventory {
+                current: None,
+                other: vec![Observed {
+                    spec: previous,
+                    owned: true,
+                }],
+            },
+            None,
+            Some("Private"),
+        );
+        assert_eq!(value["state"], "missing");
+        assert_eq!(value["other_programs"].as_array().unwrap().len(), 1);
+        assert!(value["suggestion"].is_null());
+        let value = status_value(
+            &s.program,
+            s.local_address,
+            &[9471, 9999],
+            Inventory {
+                current: Some(Observed {
+                    spec: s.clone(),
+                    owned: true,
+                }),
+                other: vec![],
+            },
+            None,
+            Some("Private"),
+        );
+        assert_eq!(value["state"], "mismatch");
+        assert_eq!(
+            value["suggestion"]["remote_addresses"],
+            json!(["192.168.1.0/24"])
+        );
+        assert_eq!(value["suggestion_source"], "existing");
+        let value = status_value(
+            &s.program,
+            s.local_address,
+            &s.local_ports,
+            Inventory {
+                current: Some(Observed {
+                    spec: s.clone(),
+                    owned: true,
+                }),
+                other: vec![],
+            },
+            None,
+            Some("Private"),
+        );
+        assert_eq!(value["state"], "matching");
+        let public_network = status_value(
+            &s.program,
+            s.local_address,
+            &s.local_ports,
+            Inventory {
+                current: Some(Observed {
+                    spec: s.clone(),
+                    owned: true,
+                }),
+                other: vec![],
+            },
+            None,
+            Some("Public"),
+        );
+        assert_eq!(public_network["state"], "mismatch");
+        let value = status_value(
+            &s.program,
+            s.local_address,
+            &s.local_ports,
+            Inventory {
+                current: Some(Observed {
+                    spec: s.clone(),
+                    owned: false,
+                }),
+                other: vec![],
+            },
+            None,
+            Some("Private"),
+        );
+        assert_eq!(value["state"], "conflict");
+        assert!(value["suggestion"].is_null());
     }
 }

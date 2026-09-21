@@ -44,12 +44,12 @@ function setup() {
     devices: ["a", "b"].map(id => ({ device_id: id, label: id === "a" ? "WinA" : "WinB", groups: [], revoked: false, admission: "allowed", certificate_sha256: "", expires_at_ms: 0, last_seen_ms: null, observed_ip: null, online: true, publications: [] })),
     join_requests: [], groups: [], rules: [],
   };
-  return { shared, network, next: () => onboardingNextStep(shared, network, "project") };
+  return { shared, network, next: () => onboardingNextStep(shared, network, "project", 1) };
 }
 
 test("next action waits for observed network and directs the Hub administrator to the existing network owner", () => {
   const { shared, network, next } = setup();
-  assert.equal(onboardingNextStep(shared, null, "project").kind, "checking");
+  assert.equal(onboardingNextStep(shared, null, "project", 0).kind, "checking");
   network.server.running = false;
   const step = next();
   assert.equal(step.kind, "network");
@@ -59,7 +59,7 @@ test("next action waits for observed network and directs the Hub administrator t
 
 test("next action assigns project creation and missing writable membership to the administrator", () => {
   const { shared, network, next } = setup();
-  assert.equal(onboardingNextStep(shared, network, "missing").kind, "project");
+  assert.equal(onboardingNextStep(shared, network, "missing", 0).kind, "project");
   shared.project_memberships[0].role = "reader";
   assert.equal(next().kind, "controller_access");
   shared.project_memberships[0].role = "manager";
@@ -111,6 +111,7 @@ test("executor preparation names the PC and distinguishes local setup, in-progre
   assert.equal(next().kind, "execution_setup");
   assert.equal(next().location, "WinB のDesktop");
   assert.equal(next().owner, "実行PCの担当者");
+  assert.match(next().detail, /Hubのモデルを確認/);
   shared.project_devices![1].preparation_state = "pending";
   assert.equal(next().kind, "preparing");
   shared.project_devices![1].preparation_state = "failed";
@@ -141,4 +142,20 @@ test("legacy unrestricted projects ask for review without presenting missing exp
   assert.equal(next().kind, "legacy");
   assert.equal(next().action?.kind, "project");
   assert.match(next().detail, /利用可否を判定していません/);
+});
+
+test("prepared PCs require an observed Hub model before the sample handoff", () => {
+  const { shared, network } = setup();
+  const before = JSON.stringify({ shared, network });
+  assert.equal(onboardingNextStep(shared, network, "project", null).kind, "checking");
+  const missing = onboardingNextStep(shared, network, "project", 0);
+  assert.equal(missing.kind, "models");
+  assert.equal(missing.owner, "Hub管理者");
+  assert.deepEqual(missing.action, { kind: "link", href: "#models", label: "共有AIを登録する" });
+  assert.match(missing.detail, /作業フォルダーは作成済み/);
+  assert.equal(onboardingNextStep(shared, network, "project", 1).kind, "sample");
+  assert.equal(onboardingNextStep(shared, network, "project", 0).kind, "models");
+  assert.equal(JSON.stringify({ shared, network }), before);
+  shared.project_devices![1].preparation_state = "waiting_setup";
+  assert.equal(onboardingNextStep(shared, network, "project", 0).kind, "execution_setup");
 });
