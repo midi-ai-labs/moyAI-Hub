@@ -333,9 +333,29 @@ fn leaving_and_rejoining_changes_participation_and_execution_workspace() {
 
 #[test]
 fn missing_local_folder_disables_execution_until_explicit_rebind() {
+    missing_folder_requires_current_rebind("local-folder");
+}
+
+#[test]
+fn missing_legacy_desktop_folder_disables_execution_until_explicit_rebind() {
+    missing_folder_requires_current_rebind("desktop-default");
+}
+
+fn missing_folder_requires_current_rebind(template: &str) {
     let mut f = Fixture::new();
     save(&mut f, "new-a", &["WinA"], &["WinB"]);
-    let initial = f.work.pending_provision("WinB").unwrap().remove(0);
+    let mut initial = f.work.pending_provision("WinB").unwrap().remove(0);
+    if template == "desktop-default" {
+        // Saved projects from the former automatic-folder workflow keep their receipt type.
+        f.work
+            .db
+            .execute(
+                "UPDATE shared_provisioning SET template_id=?2 WHERE environment_id=?1",
+                rusqlite::params![initial.environment_id, template],
+            )
+            .unwrap();
+        initial.template_id = template.into();
+    }
     let ready = ProvisionReceipt {
         environment_id: initial.environment_id.clone(),
         template_id: initial.template_id.clone(),
@@ -357,8 +377,27 @@ fn missing_local_folder_disables_execution_until_explicit_rebind() {
         .unwrap();
     let pending = f.work.pending_provision("WinB").unwrap().remove(0);
     assert_eq!(pending.state.as_deref(), Some("failed"));
+    assert_eq!(pending.template_id, template);
     assert_eq!(pending.generation, initial.generation + 1);
     assert!(!f.work.runner_environments("WinB").unwrap()[0].enabled);
+    f.reopen();
+    // Repeating an unacknowledged failure must neither bump again nor restore authority.
+    f.work
+        .provision_receipt(
+            "WinB",
+            &ProvisionReceipt {
+                success: false,
+                error: Some("folder missing".into()),
+                ..ready.clone()
+            },
+            43,
+        )
+        .unwrap();
+    assert_eq!(
+        f.work.pending_provision("WinB").unwrap()[0].generation,
+        pending.generation
+    );
+    assert!(f.work.provision_receipt("WinA", &ready, 43).is_err());
     assert!(matches!(
         f.work.provision_receipt("WinB", &ready, 43),
         Err(WorkError::Conflict)
@@ -380,6 +419,20 @@ fn missing_local_folder_disables_execution_until_explicit_rebind() {
     assert!(!f.work.runner_environments("WinB").unwrap()[0].enabled);
     save(&mut f, "new-a", &["WinA"], &["WinB"]);
     assert!(!f.work.runner_environments("WinB").unwrap()[0].enabled);
+    save(&mut f, "new-a", &["WinA"], &[]);
+    assert!(
+        f.work
+            .provision_receipt(
+                "WinB",
+                &ProvisionReceipt {
+                    success: false,
+                    error: Some("missing after removal".into()),
+                    ..rebound
+                },
+                46
+            )
+            .is_err()
+    );
 }
 
 #[test]

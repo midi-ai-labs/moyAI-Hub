@@ -136,7 +136,7 @@ impl SharedWork {
         Ok(())
     }
     pub fn pending_provision(&self, runner: &str) -> Result<Vec<ProvisionRequest>> {
-        let mut statement=self.db.prepare("SELECT p.environment_id,p.template_id,p.generation,p.state FROM shared_provisioning p JOIN shared_environments e ON e.id=p.environment_id WHERE p.runner_id=?1 AND e.runner_id=?1 AND (p.state='pending' OR (p.template_id='local-folder' AND p.state='failed')) ORDER BY p.created_at_ms,p.environment_id LIMIT 128")?;
+        let mut statement=self.db.prepare("SELECT p.environment_id,p.template_id,p.generation,p.state FROM shared_provisioning p JOIN shared_environments e ON e.id=p.environment_id WHERE p.runner_id=?1 AND e.runner_id=?1 AND (p.state='pending' OR (p.template_id IN ('local-folder','desktop-default') AND p.state='failed')) ORDER BY p.created_at_ms,p.environment_id LIMIT 128")?;
         Ok(statement
             .query_map([runner], |r| {
                 Ok(ProvisionRequest {
@@ -172,7 +172,12 @@ impl SharedWork {
         if template != receipt.template_id {
             return Err(WorkError::Conflict);
         }
-        let folder = template == super::project_setup::LOCAL_FOLDER_TEMPLATE;
+        // Previously generated Desktop folders have the same loss/reselection
+        // lifecycle; their durable receipt type and generation checks are preserved.
+        let folder = matches!(
+            template.as_str(),
+            super::project_setup::LOCAL_FOLDER_TEMPLATE | "desktop-default"
+        );
         if generation != receipt.generation {
             // A repeated lost-folder report is harmless, but a delayed success
             // from before that report must never re-enable the workspace.
