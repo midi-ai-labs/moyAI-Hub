@@ -32,6 +32,22 @@ function Get-MoyaiDescription($s) {
     try { $hash=([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($canonical)))).Replace('-','').ToLowerInvariant() } finally { $sha.Dispose() }
     return 'moyAI Hub inbound v1 '+$hash
 }
+function ConvertFrom-MoyaiFirewallAddress([string]$Value) {
+    if ($Value -match '^[0-9.]+$') { return "$Value/32" }
+    # NetSecurity can render CIDR as IPv4/dotted-mask. Normalize only that
+    # equivalent OS representation; invalid or changed scopes remain unowned.
+    if ($Value -cmatch '^([0-9.]+)/([0-9.]+)$') {
+        $address=$Matches[1]; $maskText=$Matches[2]; $mask=$null
+        if ([Net.IPAddress]::TryParse($maskText,[ref]$mask) -and $mask.AddressFamily -eq 'InterNetwork' -and $mask.ToString() -ceq $maskText) {
+            $bits=(@($mask.GetAddressBytes() | ForEach-Object { [Convert]::ToString($_,2).PadLeft(8,'0') }) -join '')
+            if ($bits -cmatch '^1*0*$') {
+                $prefix=$bits.TrimEnd([char]'0').Length
+                return "$address/$prefix"
+            }
+        }
+    }
+    return $Value
+}
 function Get-MoyaiRule([string]$Name) {
     if ($Name -cnotmatch '^moyai-hub-inbound-v1-[0-9a-f]{24}$') { throw 'Invalid rule name' }
     $lookupErrors=@()
@@ -41,11 +57,11 @@ function Get-MoyaiRule([string]$Name) {
     if ($rows.Count -ne 1) { throw 'Ambiguous rule' }
     $r=$rows[0]; $app=$r | Get-NetFirewallApplicationFilter; $addr=$r | Get-NetFirewallAddressFilter; $port=$r | Get-NetFirewallPortFilter
     $service=$r | Get-NetFirewallServiceFilter; $iface=$r | Get-NetFirewallInterfaceFilter; $ifaceType=$r | Get-NetFirewallInterfaceTypeFilter; $security=$r | Get-NetFirewallSecurityFilter
-    $spec=[ordered]@{name=[string]$r.Name;program=[string]$app.Program;local_address=(@($addr.LocalAddress) -join ',');local_ports=@($port.LocalPort | ForEach-Object { [int]$_ } | Sort-Object);remote_addresses=@($addr.RemoteAddress | ForEach-Object { if ($_ -match '^[0-9.]+$') { "$_/32" } else { [string]$_ } } | Sort-Object);profile_mask=[int]$r.Profile}
+    $spec=[ordered]@{name=[string]$r.Name;program=[string]$app.Program;local_address=(@($addr.LocalAddress) -join ',');local_ports=@($port.LocalPort | ForEach-Object { [int]$_ } | Sort-Object);remote_addresses=@($addr.RemoteAddress | ForEach-Object { ConvertFrom-MoyaiFirewallAddress ([string]$_) } | Sort-Object);profile_mask=[int]$r.Profile}
     $owned=$false
     try {
         Assert-MoyaiSpec $spec
-        $owned=($r.DisplayName -ceq ('moyAI Hub TCP '+$Name.Substring(21)) -and $r.Group -ceq 'moyAI Hub managed inbound v1' -and $r.Description -ceq (Get-MoyaiDescription $spec) -and [string]$r.Enabled -eq 'True' -and [string]$r.Direction -eq 'Inbound' -and [string]$r.Action -eq 'Allow' -and [string]$r.EdgeTraversalPolicy -eq 'Block' -and [string]$r.LooseSourceMapping -eq 'False' -and [string]$r.LocalOnlyMapping -eq 'False' -and [string]$port.Protocol -in @('TCP','6') -and (@($port.RemotePort) -join ',') -eq 'Any' -and $service.Service -eq 'Any' -and (@($iface.InterfaceAlias) -join ',') -eq 'Any' -and $ifaceType.InterfaceType -eq 'Any' -and $app.Package -eq 'Any' -and $security.Authentication -eq 'NotRequired' -and $security.Encryption -eq 'NotRequired' -and [string]$security.OverrideBlockRules -eq 'False' -and $security.LocalUser -eq 'Any' -and $security.RemoteUser -eq 'Any' -and $security.RemoteMachine -eq 'Any')
+        $owned=($r.DisplayName -ceq ('moyAI Hub TCP '+$Name.Substring(21)) -and $r.Group -ceq 'moyAI Hub managed inbound v1' -and $r.Description -ceq (Get-MoyaiDescription $spec) -and [string]$r.Enabled -eq 'True' -and [string]$r.Direction -eq 'Inbound' -and [string]$r.Action -eq 'Allow' -and [string]$r.EdgeTraversalPolicy -eq 'Block' -and [string]$r.LooseSourceMapping -eq 'False' -and [string]$r.LocalOnlyMapping -eq 'False' -and [string]$port.Protocol -in @('TCP','6') -and (@($port.RemotePort) -join ',') -eq 'Any' -and $service.Service -eq 'Any' -and (@($iface.InterfaceAlias) -join ',') -eq 'Any' -and $ifaceType.InterfaceType -eq 'Any' -and ($null -eq $app.Package -or $app.Package -eq 'Any') -and $security.Authentication -eq 'NotRequired' -and $security.Encryption -eq 'NotRequired' -and [string]$security.OverrideBlockRules -eq 'False' -and $security.LocalUser -eq 'Any' -and $security.RemoteUser -eq 'Any' -and $security.RemoteMachine -eq 'Any')
     } catch { $owned=$false }
     return [ordered]@{spec=$spec;owned=[bool]$owned}
 }

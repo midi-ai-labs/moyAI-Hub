@@ -4,9 +4,9 @@ $ErrorActionPreference='Stop'
 # otherwise imports its Get-FileHash function lazily over the test double.
 Import-Module Microsoft.PowerShell.Utility
 . (Join-Path $PSScriptRoot '../src/admin/firewall_helper.ps1')
-$script:rule=$null; $script:mutations=0; $script:partial=$false
+$script:rule=$null; $script:mutations=0; $script:partial=$false; $script:package='Any'
 function Get-NetFirewallRule { [CmdletBinding()] param($Name,$PolicyStore) if ($PolicyStore -ne 'PersistentStore') { throw 'Unexpected store' }; if ($script:rule -and $script:rule.Name -ceq $Name) { $script:rule } }
-function Get-NetFirewallApplicationFilter { [CmdletBinding()] param([Parameter(ValueFromPipeline)]$InputObject) process { [pscustomobject]@{Program=$script:rule.Program;Package='Any'} } }
+function Get-NetFirewallApplicationFilter { [CmdletBinding()] param([Parameter(ValueFromPipeline)]$InputObject) process { [pscustomobject]@{Program=$script:rule.Program;Package=$script:package} } }
 function Get-NetFirewallAddressFilter { [CmdletBinding()] param([Parameter(ValueFromPipeline)]$InputObject) process { [pscustomobject]@{LocalAddress=$script:rule.LocalAddress;RemoteAddress=$script:rule.RemoteAddress} } }
 function Get-NetFirewallPortFilter { [CmdletBinding()] param([Parameter(ValueFromPipeline)]$InputObject) process { [pscustomobject]@{Protocol=$script:rule.Protocol;LocalPort=$script:rule.LocalPort;RemotePort='Any'} } }
 function Get-NetFirewallServiceFilter { [CmdletBinding()] param([Parameter(ValueFromPipeline)]$InputObject) process { [pscustomobject]@{Service='Any'} } }
@@ -41,6 +41,51 @@ Assert $row.owned 'Created filters are owned'
 Assert (Test-MoyaiSame $row.spec $spec) 'Created scope matches'
 Invoke-MoyaiFirewall (Request $spec $row.spec)
 Assert ($script:mutations -eq 1) 'Exact repeat is idempotent'
+# Windows can return dotted masks and a null Package for the same desktop rule.
+# Observe those representations without rewriting the OS rule or its owner hash.
+$script:rule.RemoteAddress=@('192.168.1.0/255.255.255.0')
+Assert ((Get-MoyaiRule $spec.name).owned) 'Dotted subnet mask preserves managed ownership'
+$script:package=$null
+Assert ((Get-MoyaiRule $spec.name).owned) 'No package filter preserves desktop rule ownership'
+Invoke-MoyaiFirewall (Request $spec $row.spec)
+Assert ($script:mutations -eq 1) 'Equivalent Windows representations do not rewrite a rule'
+foreach ($package in @('', ' ', 'S-1-15-2-12345')) {
+    $script:package=$package
+    Assert (-not (Get-MoyaiRule $spec.name).owned) 'A different package filter is not owned'
+    Reject { Invoke-MoyaiFirewall (Request $spec $row.spec) } 'Package-scoped rules cannot be overwritten'
+    Reject { Invoke-MoyaiFirewall (Request $spec $row.spec 'remove') } 'Package-scoped rules cannot be removed'
+}
+$script:package=$null
+foreach ($remote in @('192.168.1.0/255.255.0.255','192.168.1.0/255.255.255.256','192.168.1.0/255.255.255.00','192.168.1.2/255.255.255.0','192.168.1.0/255.255.255.128','0.0.0.0/0.0.0.0','8.8.8.8/255.255.255.255')) {
+    $script:rule.RemoteAddress=@($remote)
+    Assert (-not (Get-MoyaiRule $spec.name).owned) "Invalid or changed observed scope $remote must remain foreign"
+    Reject { Invoke-MoyaiFirewall (Request $spec $row.spec) } 'Changed scope cannot be overwritten'
+    Reject { Invoke-MoyaiFirewall (Request $spec $row.spec 'remove') } 'Changed scope cannot be removed'
+}
+$script:rule.RemoteAddress=$spec.remote_addresses
+# Normalization belongs only to OS observation, not caller-supplied requests.
+$dotted=Spec; $dotted.remote_addresses=@('192.168.1.0/255.255.255.0')
+Reject { Invoke-MoyaiFirewall (Request $dotted $row.spec) } 'Requests still require canonical CIDR'
+foreach ($scopes in @(
+    @{cidr=@('10.0.0.0/8');os=@('10.0.0.0/255.0.0.0')},
+    @{cidr=@('172.16.0.0/12');os=@('172.16.0.0/255.240.0.0')},
+    @{cidr=@('192.168.0.0/16');os=@('192.168.0.0/255.255.0.0')},
+    @{cidr=@('192.168.1.128/25');os=@('192.168.1.128/255.255.255.128')},
+    @{cidr=@('10.1.2.3/32','192.168.1.0/24');os=@('192.168.1.0/255.255.255.0','10.1.2.3')},
+    @{cidr=@('10.1.2.3/32');os=@('10.1.2.3/255.255.255.255')}
+)) {
+    $equivalent=Spec; $equivalent.remote_addresses=$scopes.cidr
+    $script:rule.Description=Get-MoyaiDescription $equivalent
+    $script:rule.RemoteAddress=$scopes.os
+    $observed=Get-MoyaiRule $spec.name
+    Assert $observed.owned 'Valid Windows scope representation is owned'
+    Assert (Test-MoyaiSame $observed.spec $equivalent) 'Observed scope equals canonical request'
+    Invoke-MoyaiFirewall (Request $equivalent $equivalent)
+    Assert ($script:mutations -eq 1) 'Equivalent scope comparison is read-only'
+}
+$script:rule.Description=Get-MoyaiDescription $spec
+$script:rule.RemoteAddress=$spec.remote_addresses
+$script:package='Any'
 $updated=Spec; $updated.remote_addresses=@('10.1.2.3/32'); $updated.profile_mask=1
 Invoke-MoyaiFirewall (Request $updated $row.spec)
 Assert ($script:mutations -eq 2) 'Scoped update applies once'
