@@ -96,7 +96,14 @@ impl Fixture {
                 &SubmitJob {
                     request_id: key.into(),
                     project_id: "alpha".into(),
+                    project_participation: None,
+                    conversation_id: None,
+                    revises_job_id: None,
+                    expected_revised_revision: None,
                     environment_id: environment.into(),
+                    origin_session_ref: None,
+                    origin_turn_ref: None,
+                    origin_turn_epoch: None,
                     title: key.into(),
                     input: json!({"prompt":"test"}),
                     descendant_budget: budget,
@@ -130,6 +137,29 @@ impl Fixture {
             .db
             .execute_batch(
                 "
+            DROP TABLE shared_conversation_details;
+            DROP INDEX shared_jobs_controller_participation;
+            ALTER TABLE shared_jobs DROP COLUMN controller_device_id;
+            ALTER TABLE shared_jobs DROP COLUMN controller_participation_generation; ALTER TABLE shared_jobs DROP COLUMN revises_job_id;
+            ALTER TABLE shared_projects DROP COLUMN deleted_at_ms;
+            ALTER TABLE shared_project_devices DROP COLUMN participation_generation;
+            DROP INDEX shared_jobs_origin_turn;
+            DROP INDEX shared_jobs_conversation_history;
+            DROP TABLE shared_project_stop_receipts;
+            DROP TABLE shared_conversation_stop_fences;
+            DROP TABLE shared_origin_turns;
+            DROP TABLE shared_origin_scopes;
+            ALTER TABLE shared_jobs DROP COLUMN origin_turn_revision;
+            ALTER TABLE shared_jobs DROP COLUMN origin_turn_epoch;
+            ALTER TABLE shared_jobs DROP COLUMN origin_turn_ref;
+            DROP TABLE shared_service_leases;
+            DROP TABLE shared_environment_capabilities;
+            DROP INDEX shared_jobs_conversation;
+            DROP INDEX shared_jobs_origin_device;
+            ALTER TABLE shared_jobs DROP COLUMN required_capability;
+            ALTER TABLE shared_jobs DROP COLUMN origin_device_id;
+            ALTER TABLE shared_jobs DROP COLUMN origin_session_ref;
+            ALTER TABLE shared_jobs DROP COLUMN conversation_id;
             DROP VIEW identity_effective_project_memberships;
             DROP VIEW identity_explicit_project_memberships;
             DROP TRIGGER identity_controller_insert;
@@ -177,7 +207,14 @@ fn status_explains_shared_capacity_without_disclosing_other_project_work() {
             &SubmitJob {
                 request_id: "beta-secret".into(),
                 project_id: "beta".into(),
+                project_participation: None,
+                conversation_id: None,
+                revises_job_id: None,
+                expected_revised_revision: None,
                 environment_id: "solver".into(),
+                origin_session_ref: None,
+                origin_turn_ref: None,
+                origin_turn_epoch: None,
                 title: "秘密の計算依頼".into(),
                 input: json!({"secret":"not-visible"}),
                 descendant_budget: 0,
@@ -701,7 +738,14 @@ fn acceptance_replay_is_durable_and_changed_content_conflicts() {
     let bad = SubmitJob {
         request_id: "request1".into(),
         project_id: "alpha".into(),
+        project_participation: None,
+        conversation_id: None,
+        revises_job_id: None,
+        expected_revised_revision: None,
         environment_id: "solver".into(),
+        origin_session_ref: None,
+        origin_turn_ref: None,
+        origin_turn_epoch: None,
         title: "changed".into(),
         input: json!({}),
         descendant_budget: 2,
@@ -735,7 +779,14 @@ fn projects_share_one_capacity_and_restart_does_not_release_unknown_execution() 
             &SubmitJob {
                 request_id: "b".into(),
                 project_id: "beta".into(),
+                project_participation: None,
+                conversation_id: None,
+                revises_job_id: None,
+                expected_revised_revision: None,
                 environment_id: "solver".into(),
+                origin_session_ref: None,
+                origin_turn_ref: None,
+                origin_turn_epoch: None,
                 title: "b".into(),
                 input: json!({}),
                 descendant_budget: 0,
@@ -1002,7 +1053,14 @@ fn admission_reserves_the_new_roots_uncreated_descendants_at_storage_limit() {
     let request = SubmitJob {
         request_id: "last-slot".into(),
         project_id: "alpha".into(),
+        project_participation: None,
+        conversation_id: None,
+        revises_job_id: None,
+        expected_revised_revision: None,
         environment_id: "solver".into(),
+        origin_session_ref: None,
+        origin_turn_ref: None,
+        origin_turn_epoch: None,
         title: "budget".into(),
         input: json!({}),
         descendant_budget: 1,
@@ -1073,6 +1131,304 @@ mod completion;
 mod controller_projection;
 mod data_tests;
 mod deadlines;
+mod origin;
 mod participation;
 mod project_setup;
+mod runner_capability;
 mod runner_contact;
+mod services;
+mod stop_scope;
+
+#[test]
+fn conversation_id_survives_confirmed_continuations_and_v15_forward_migration() {
+    let mut f = Fixture::new();
+    let root = f.submit("solver", "original", 2);
+    let unrelated = f.submit("solver", "same-title", 0);
+    f.work
+        .db
+        .execute(
+            "INSERT INTO shared_jobs(id,root_id,parent_id,project_id,environment_id,requestor_id,assignee_id,request_id,request_json,title,input_json,state,descendant_budget,revision,created_at_ms,updated_at_ms) SELECT 'child',id,id,project_id,environment_id,requestor_id,assignee_id,'child-request','{}',title,input_json,'succeeded',0,1,11,11 FROM shared_jobs WHERE id=?1",
+            [&root.id],
+        )
+        .unwrap();
+    f.work
+        .db
+        .execute(
+            "INSERT INTO shared_jobs(id,root_id,project_id,environment_id,requestor_id,assignee_id,request_id,request_json,title,input_json,state,descendant_budget,revision,created_at_ms,updated_at_ms) SELECT 'continued','continued',project_id,environment_id,requestor_id,assignee_id,'continue-request','{}',title,input_json,'queued',0,1,12,12 FROM shared_jobs WHERE id=?1",
+            [&root.id],
+        )
+        .unwrap();
+    f.work
+        .db
+        .execute(
+            "INSERT INTO shared_continuations(job_id,previous_job_id) VALUES('continued','child')",
+            [],
+        )
+        .unwrap();
+    f.work
+        .db
+        .execute_batch(
+            "DROP TABLE shared_conversation_details; DROP INDEX shared_jobs_controller_participation; ALTER TABLE shared_jobs DROP COLUMN controller_device_id; ALTER TABLE shared_jobs DROP COLUMN controller_participation_generation; ALTER TABLE shared_jobs DROP COLUMN revises_job_id; ALTER TABLE shared_projects DROP COLUMN deleted_at_ms; ALTER TABLE shared_project_devices DROP COLUMN participation_generation; DROP INDEX shared_jobs_origin_turn; DROP INDEX shared_jobs_conversation_history; DROP TABLE shared_project_stop_receipts; DROP TABLE shared_conversation_stop_fences; DROP TABLE shared_origin_turns; DROP TABLE shared_origin_scopes; ALTER TABLE shared_jobs DROP COLUMN origin_turn_revision; ALTER TABLE shared_jobs DROP COLUMN origin_turn_epoch; ALTER TABLE shared_jobs DROP COLUMN origin_turn_ref; DROP INDEX shared_jobs_origin_device; ALTER TABLE shared_jobs DROP COLUMN required_capability; ALTER TABLE shared_jobs DROP COLUMN origin_device_id; ALTER TABLE shared_jobs DROP COLUMN origin_session_ref; DROP TABLE shared_service_leases; DROP INDEX shared_jobs_conversation; DROP TABLE shared_environment_capabilities; ALTER TABLE shared_jobs DROP COLUMN conversation_id; PRAGMA user_version=15;",
+        )
+        .unwrap();
+    f.reopen();
+    for id in [&root.id, "child", "continued"] {
+        assert_eq!(f.work.job(&f.alice, id).unwrap().conversation_id, root.id);
+    }
+    assert_eq!(
+        f.work.job(&f.alice, &unrelated.id).unwrap().conversation_id,
+        unrelated.id
+    );
+    let status = f.work.status(&f.alice, "alpha", None, 20, None).unwrap();
+    assert_eq!(
+        status
+            .jobs
+            .iter()
+            .find(|job| job.id == "continued")
+            .unwrap()
+            .conversation_id,
+        root.id
+    );
+}
+
+#[test]
+fn omitted_environment_uses_authorized_stable_initial_placement() {
+    let mut f = Fixture::new();
+    let raw = json!({"request_id":"automatic","project_id":"alpha","title":"Build","input":{},"descendant_budget":0});
+    let request: SubmitJob = serde_json::from_value(raw).unwrap();
+    assert_eq!(request.environment_id, "");
+    let on_solver = f
+        .work
+        .submit_for_device(&f.alice, &request, 10, Some("WinE"))
+        .unwrap();
+    assert_eq!(on_solver.environment_id, "solver");
+    assert_eq!(on_solver.conversation_id, on_solver.id);
+    assert_eq!(
+        f.work
+            .submit_for_device(&f.alice, &request, 11, Some("WinC"))
+            .unwrap()
+            .id,
+        on_solver.id,
+        "a retry must keep the original placement"
+    );
+    let another = SubmitJob {
+        request_id: "next-automatic".into(),
+        ..request
+    };
+    assert_eq!(
+        f.work
+            .submit_for_device(&f.alice, &another, 12, Some("unknown"))
+            .unwrap()
+            .environment_id,
+        "parent"
+    );
+}
+
+#[test]
+fn local_conversation_origin_is_stable_metadata_for_child_work() {
+    let mut f = Fixture::new();
+    let root = f
+        .work
+        .submit(
+            &f.alice,
+            &SubmitJob {
+                request_id: "from-local".into(),
+                project_id: "alpha".into(),
+                project_participation: None,
+                conversation_id: None,
+                revises_job_id: None,
+                expected_revised_revision: None,
+                environment_id: "solver".into(),
+                origin_session_ref: Some("local-session-1".into()),
+                origin_turn_ref: None,
+                origin_turn_epoch: None,
+                title: "Build".into(),
+                input: json!({"version":1,"prompt":"Build"}),
+                descendant_budget: 1,
+                start_before_ms: None,
+            },
+            10,
+        )
+        .unwrap();
+    assert_eq!(root.origin_session_ref.as_deref(), Some("local-session-1"));
+    assert_eq!(root.conversation_id, root.id);
+    let assigned = f.work.claim("WinE", 11).unwrap().unwrap();
+    f.report(&assigned, "started", ReportOutcome::Started);
+    f.report(
+        &assigned,
+        "yield",
+        ReportOutcome::YieldToChild {
+            checkpoint: json!({"version":1}),
+            child_environment_id: "parent".into(),
+            child_title: "Check".into(),
+            child_input: json!({"version":1,"prompt":"Check"}),
+            resources_released: true,
+        },
+    );
+    let child = f.work.claim("WinC", 21).unwrap().unwrap().job;
+    assert_eq!(child.conversation_id, root.id);
+    assert_eq!(child.origin_session_ref, root.origin_session_ref);
+    let projected = f.work.status(&f.alice, "alpha", None, 20, None).unwrap();
+    assert_eq!(
+        projected
+            .jobs
+            .iter()
+            .find(|job| job.id == child.id)
+            .unwrap()
+            .origin_session_ref,
+        root.origin_session_ref
+    );
+}
+
+#[test]
+fn locally_originated_completion_stays_in_its_local_conversation_instead_of_shared_inbox() {
+    let mut f = Fixture::new();
+    let local = f
+        .work
+        .submit(
+            &f.alice,
+            &SubmitJob {
+                request_id: "local-completion".into(),
+                project_id: "alpha".into(),
+                project_participation: None,
+                conversation_id: None,
+                revises_job_id: None,
+                expected_revised_revision: None,
+                environment_id: "solver".into(),
+                origin_session_ref: Some("local-session-2".into()),
+                origin_turn_ref: None,
+                origin_turn_epoch: None,
+                title: "Local work".into(),
+                input: json!({"version":1,"prompt":"Do work"}),
+                descendant_budget: 0,
+                start_before_ms: None,
+            },
+            10,
+        )
+        .unwrap();
+    let assigned = f.work.claim("WinE", 11).unwrap().unwrap();
+    assert_eq!(assigned.job.id, local.id);
+    f.report(&assigned, "local-started", ReportOutcome::Started);
+    f.report(&assigned, "local-finished", finished());
+    assert_eq!(
+        f.work.inbox(&f.alice, None, 10, 30).unwrap()["unread_count"],
+        0
+    );
+    identity::set_project_role(
+        &f.work.db,
+        &f.admin,
+        "alpha",
+        &f.bob.user_id,
+        Some(ProjectRole::Contributor),
+        30,
+    )
+    .unwrap();
+    let handed = f
+        .work
+        .submit(
+            &f.alice,
+            &SubmitJob {
+                request_id: "local-handover".into(),
+                project_id: "alpha".into(),
+                project_participation: None,
+                conversation_id: None,
+                revises_job_id: None,
+                expected_revised_revision: None,
+                environment_id: "solver".into(),
+                origin_session_ref: Some("local-session-2".into()),
+                origin_turn_ref: None,
+                origin_turn_epoch: None,
+                title: "Local handover".into(),
+                input: json!({"version":1,"prompt":"Do work"}),
+                descendant_budget: 0,
+                start_before_ms: None,
+            },
+            30,
+        )
+        .unwrap();
+    f.work
+        .handover(
+            &f.alice,
+            &handed.id,
+            &HandoverRequest {
+                expected_revision: handed.revision,
+                new_assignee_id: f.bob.user_id.clone(),
+            },
+            31,
+        )
+        .unwrap();
+    let assigned = f.work.claim("WinE", 32).unwrap().unwrap();
+    assert_eq!(assigned.job.id, handed.id);
+    f.report(&assigned, "handed-started", ReportOutcome::Started);
+    f.report(&assigned, "handed-finished", finished());
+    assert!(
+        !f.work.inbox(&f.alice, None, 10, 35).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["job_id"] == handed.id && item["kind"] == "finished")
+    );
+    assert!(
+        f.work.inbox(&f.bob, None, 10, 35).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["job_id"] == handed.id && item["kind"] == "finished")
+    );
+    let ordinary = f.submit("solver", "shared-completion", 0);
+    let assigned = f.work.claim("WinE", 31).unwrap().unwrap();
+    assert_eq!(assigned.job.id, ordinary.id);
+    f.report(&assigned, "shared-started", ReportOutcome::Started);
+    f.report(&assigned, "shared-finished", finished());
+    let inbox = f.work.inbox(&f.alice, None, 10, 40).unwrap();
+    assert!(
+        inbox["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["job_id"] == ordinary.id && item["kind"] == "finished")
+    );
+}
+
+#[test]
+fn capability_declarations_are_bounded_admin_data_and_not_execution_proof() {
+    let mut f = Fixture::new();
+    let revision = f.work.management_snapshot(&f.admin).unwrap()["revision"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let command = ManagementCommand {
+        request_id: "capabilities-1".into(),
+        expected_revision: revision.clone(),
+        request: ManagementRequest::SetEnvironmentCapabilities {
+            environment_id: "solver".into(),
+            names: vec!["Gurobi".into(), "Python".into()],
+        },
+    };
+    assert!(matches!(
+        f.work.manage(&f.alice, &command, 12),
+        Err(WorkError::Identity(_) | WorkError::Forbidden)
+    ));
+    let updated = f.work.manage(&f.admin, &command, 12).unwrap();
+    let solver = updated["environments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "solver")
+        .unwrap();
+    assert_eq!(solver["capabilities"][0]["name"], "Gurobi");
+    assert_eq!(solver["capabilities"][0]["source"], "declared");
+    assert_eq!(solver["capabilities"][0]["observed_at_ms"], Value::Null);
+    let duplicate = ManagementCommand {
+        request_id: "capabilities-2".into(),
+        expected_revision: updated["revision"].as_str().unwrap().into(),
+        request: ManagementRequest::SetEnvironmentCapabilities {
+            environment_id: "solver".into(),
+            names: vec!["Python".into(), "Python".into()],
+        },
+    };
+    assert!(matches!(
+        f.work.manage(&f.admin, &duplicate, 13),
+        Err(WorkError::Invalid)
+    ));
+}

@@ -29,6 +29,7 @@ export interface Deployment {
     provider_model: string;
     provider_profile: string;
     enabled: boolean;
+    upstream_credential_id?: string | null;
 }
 export interface DeploymentRow {
     deployment: Deployment;

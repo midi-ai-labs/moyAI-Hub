@@ -318,35 +318,53 @@ async fn actual_host_web_and_device_network_stop_independently() {
     let profile = Profile::new();
     let (mut process, client) = profile.start().await;
     let host_instance = client.instance_id().to_owned();
-    // Reserve both simultaneously so the OS cannot select the same free port.
-    let network_probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let gateway_probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let network_address = network_probe.local_addr().unwrap();
-    let gateway_address = gateway_probe.local_addr().unwrap();
-    let settings = client
-        .dispatch("hub_network_snapshot", json!({}))
-        .await
-        .unwrap();
-    client
-        .dispatch(
-            "hub_network_settings",
-            json!({
-                "expectedRevision":settings["revision"], "gatewayPort":gateway_address.port()
-            }),
-        )
-        .await
-        .unwrap();
-    drop(network_probe);
-    drop(gateway_probe);
-    client
-        .dispatch(
-            "hub_network_start",
-            json!({
-                "bind":network_address.to_string(), "advertiseIp":"127.0.0.1"
-            }),
-        )
-        .await
-        .unwrap();
+    // A probe's ephemeral port can be taken after it closes, especially while
+    // the full integration suite starts other listeners in parallel.
+    let mut started = false;
+    let mut bound_address = None;
+    for _ in 0..5 {
+        let network_probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway_probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let network_address = network_probe.local_addr().unwrap();
+        let gateway_address = gateway_probe.local_addr().unwrap();
+        let settings = client
+            .dispatch("hub_network_snapshot", json!({}))
+            .await
+            .unwrap();
+        client
+            .dispatch(
+                "hub_network_settings",
+                json!({
+                    "expectedRevision":settings["revision"],"gatewayPort":gateway_address.port()
+                }),
+            )
+            .await
+            .unwrap();
+        drop(network_probe);
+        drop(gateway_probe);
+        match client
+            .dispatch(
+                "hub_network_start",
+                json!({
+                    "bind":network_address.to_string(),"advertiseIp":"127.0.0.1"
+                }),
+            )
+            .await
+        {
+            Ok(_) => {
+                started = true;
+                bound_address = Some(network_address);
+                break;
+            }
+            Err(error) if error.contains("TLS の待受を開始できません") => continue,
+            Err(error) => panic!("unexpected network start failure: {error}"),
+        }
+    }
+    assert!(
+        started,
+        "another process repeatedly claimed the probed TLS port"
+    );
+    let network_address = bound_address.unwrap();
     let network_before = client
         .dispatch("hub_network_snapshot", json!({}))
         .await

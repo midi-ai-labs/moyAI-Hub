@@ -32,6 +32,8 @@ use tokio::sync::{Notify, mpsc};
 
 const BOOTSTRAP: &str = "bootstrap-test-secret-000000000000000000000";
 const CONTROL: &str = "companion-test-secret-000000000000000000000";
+#[path = "gateway_execution/authentication.rs"]
+mod authentication;
 #[path = "gateway_execution/delegated.rs"]
 mod delegated;
 #[path = "gateway_execution/orphaned.rs"]
@@ -210,6 +212,7 @@ impl Fixture {
                 endpoint: provider_url.clone(),
                 provider_model: "actual-provider-model".into(),
                 provider_profile: "openai_compatible_chat".into(),
+                upstream_credential_id: None,
                 enabled: true,
             }],
             capacity_pools: vec![CapacityPool {

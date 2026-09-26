@@ -1,5 +1,8 @@
 # Embedded by the Hub. No caller-supplied script, file or cmdlet name is accepted.
 $ErrorActionPreference = 'Stop'
+# A Hub launched from PowerShell 7 can inherit that runtime's PSModulePath.
+# Load the matching built-in module explicitly; its manifest differs in 5.1.
+Import-Module (Join-Path $PSHOME 'Modules/Microsoft.PowerShell.Utility/Microsoft.PowerShell.Utility.psd1')
 function Test-MoyaiPrivate([string]$Address) {
     $ip = $null
     if (-not [Net.IPAddress]::TryParse($Address, [ref]$ip) -or $ip.AddressFamily -ne 'InterNetwork' -or $ip.ToString() -cne $Address) { return $false }
@@ -50,7 +53,7 @@ function Test-MoyaiSame($a,$b) {
     if ($null -eq $a -or $null -eq $b) { return ($null -eq $a -and $null -eq $b) }
     return ($a.name -ceq $b.name -and $a.program -ieq $b.program -and (Get-MoyaiDescription $a) -ceq (Get-MoyaiDescription $b))
 }
-function Invoke-MoyaiFirewall($request) {
+function Assert-MoyaiFirewallRequest($request) {
     Assert-MoyaiSpec $request.spec
     $now=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     if ($request.action -notin @('apply','remove') -or $request.binary_sha256 -cnotmatch '^[0-9a-f]{64}$' -or $now -ge $request.expires_at_ms -or $request.expires_at_ms -gt $now+60000) { throw 'Expired or invalid request' }
@@ -59,6 +62,10 @@ function Invoke-MoyaiFirewall($request) {
     $actual=Get-MoyaiRule $request.spec.name
     if (($null -ne $actual -and -not $actual.owned) -or -not (Test-MoyaiSame $actual.spec $request.previous)) { throw 'Rule changed' }
     if ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -ge $request.expires_at_ms) { throw 'Expired request' }
+    return $actual
+}
+function Invoke-MoyaiFirewall($request) {
+    $actual=Assert-MoyaiFirewallRequest $request
     if ($request.action -eq 'remove') {
         if ($null -ne $actual) { Remove-NetFirewallRule -PolicyStore PersistentStore -Name $request.spec.name -Confirm:$false }
     } elseif (-not (Test-MoyaiSame $actual.spec $request.spec)) {

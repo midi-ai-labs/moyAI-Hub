@@ -58,13 +58,20 @@ impl SharedWork {
         let submit = SubmitJob {
             request_id: format!("local:{}", request.request_id),
             project_id: request.project_id.clone(),
+            project_participation: None,
+            conversation_id: None,
+            revises_job_id: None,
+            expected_revised_revision: None,
             environment_id: request.environment_id.clone(),
+            origin_session_ref: None,
+            origin_turn_ref: None,
+            origin_turn_epoch: None,
             title: request.title.clone(),
             input: serde_json::json!({"version":1,"prompt":request.title,"source":request.source,"actor_device_id":request.actor_device_id}),
             descendant_budget: 0,
             start_before_ms: None,
         };
-        let job = store::submit_in_transaction(&tx, &actor, &submit, now)?;
+        let job = store::submit_in_transaction(&tx, &actor, &submit, now, None)?;
         let existing: Option<String> = tx.query_row("SELECT a.id FROM shared_external_attempts x JOIN shared_attempts a ON a.id=x.attempt_id WHERE a.job_id=?1 AND a.runner_id=?2",params![job.id,runner],|row|row.get(0)).optional()?;
         if let Some(attempt) = existing {
             return store::assignment(&tx, &attempt);

@@ -65,6 +65,19 @@ async fn project_status_uses_current_device_names_for_assignments_environments_a
         };
         work.manage(&fixture.actor, &command, crate::service::now_ms())
             .unwrap();
+        let capabilities = ManagementCommand {
+            request_id: "project-pc-capabilities".into(),
+            expected_revision: work.management_snapshot(&fixture.actor).unwrap()["revision"]
+                .as_str()
+                .unwrap()
+                .into(),
+            request: ManagementRequest::SetEnvironmentCapabilities {
+                environment_id: "environment".into(),
+                names: vec!["Gurobi".into()],
+            },
+        };
+        work.manage(&fixture.actor, &capabilities, crate::service::now_ms())
+            .unwrap();
     }
     for label in ["実行PC B", "名称変更後のPC B"] {
         {
@@ -95,8 +108,14 @@ async fn project_status_uses_current_device_names_for_assignments_environments_a
         .unwrap()
         .0;
         let json = serde_json::to_value(result).unwrap();
-        assert_eq!(json["environments"][0]["device_label"], label);
-        assert_eq!(json["environments"][0]["label"], "Environment");
+        let environment = json["environments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == "environment")
+            .unwrap();
+        assert_eq!(environment["device_label"], label);
+        assert_eq!(environment["label"], "Environment");
         assert_eq!(json["jobs"][0]["device_label"], label);
         let devices = json["execution_devices"].as_array().unwrap();
         let pending = devices
@@ -104,9 +123,27 @@ async fn project_status_uses_current_device_names_for_assignments_environments_a
             .find(|row| row["device_id"] == pending.id)
             .unwrap();
         assert_eq!(pending["device_label"], "未設定の実行PC");
-        assert_eq!(pending["preparation_state"], "waiting_setup");
-        assert_eq!(pending["environment_id"], Value::Null);
+        assert_eq!(pending["preparation_state"], "waiting_local_folder");
+        assert!(pending["environment_id"].is_string());
         assert_eq!(devices.len(), 2);
+        let catalog = environments(
+            State(fixture.state.clone()),
+            headers.clone(),
+            Extension(fixture.device.clone()),
+            Query(ProjectQuery {
+                project_id: "project".into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(catalog[0]["device_id"], fixture.device.device_id);
+        assert_eq!(catalog[0]["device_label"], label);
+        assert_eq!(catalog[0]["capabilities"][0]["name"], "Gurobi");
+        assert_eq!(catalog[0]["capabilities"][0]["source"], "declared");
+        assert_eq!(catalog[0]["capabilities"][0]["observed_at_ms"], Value::Null);
+        assert_eq!(catalog[0]["can_submit"], true);
+        assert!(catalog[0]["runner_contact"].is_object());
     }
 }
 
@@ -284,6 +321,7 @@ async fn project_device_gates_cover_human_routes_but_keep_executor_control_and_l
     assert!(
         attempt(
             State(fixture.state.clone()),
+            HeaderMap::new(),
             Extension(fixture.device.clone()),
             Path(fixture.assignment.attempt_id.clone())
         )

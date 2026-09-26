@@ -21,7 +21,7 @@ class Element {
 }
 const rule = { name: "moyai-hub-inbound-v1-" + "a".repeat(24), program: "C:\\Hub\\moyai-hub.exe", local_address: "192.168.1.2", local_ports: [9471,9472], remote_addresses: ["192.168.1.0/24"], profile_mask: 2 };
 const preview = () => ({spec:rule,binary_sha256:"a".repeat(64),previous:null as typeof rule|null,conflict:false,matching:false,fingerprint:"exact-preview"});
-async function fixture(remote: boolean, operation: (command:string,args:Record<string,unknown>)=>unknown|Promise<unknown>, run: (host:Element,calls:string[],owner:ReturnType<typeof attachFirewall>)=>Promise<void>, onStatus: Parameters<typeof attachFirewall>[1] = undefined) {
+async function fixture(remote: boolean, operation: (command:string,args:Record<string,unknown>)=>unknown|Promise<unknown>, run: (host:Element,calls:string[],owner:ReturnType<typeof attachFirewall>)=>Promise<void>, onStatus: Parameters<typeof attachFirewall>[1] = undefined, onConfigured: () => void = () => {}) {
   const oldFetch=globalThis.fetch, oldWindow=Object.getOwnPropertyDescriptor(globalThis,"window"); const calls:string[]=[];
   globalThis.fetch=async(url,options)=>{
     if(String(url)==="/admin/session") return Response.json({csrf:"csrf",epoch:"epoch",authentication:{configured:true,bootstrap_allowed:false,login_allowed:true,session_id:"session",user:{user_id:"admin",display_name:"Admin",administrator:true}}});
@@ -31,7 +31,7 @@ async function fixture(remote: boolean, operation: (command:string,args:Record<s
   };
   Object.defineProperty(globalThis,"window",{configurable:true,value:{location:{origin:remote ? "https://hub.example:9081" : "http://127.0.0.1:9080"}}});
   const host=new Element();
-  try { const owner = attachFirewall(host as unknown as HTMLElement, onStatus); await run(host,calls,owner); }
+  try { const owner = attachFirewall(host as unknown as HTMLElement, onStatus, onConfigured); await run(host,calls,owner); }
   finally { globalThis.fetch=oldFetch; if(oldWindow) Object.defineProperty(globalThis,"window",oldWindow);else delete (globalThis as Record<string,unknown>).window; }
 }
 test("scope has no automatic profile and request summary contains the exact restrictions",()=>{
@@ -80,17 +80,70 @@ test("unconfirmed OS outcome remains uncertain, resets confirmation and never re
 });
 
 const health = () => ({state:"missing" as const,program:rule.program,local_address:rule.local_address,local_ports:rule.local_ports,current:null,other_programs:["C:\\Old\\moyai-hub.exe"],suggestion:{remote_addresses:rule.remote_addresses,profiles:["Private"]},suggestion_source:"lan" as const});
-test("startup status reports relocated rules and suggestions require a separate explicit review",async()=>{
-  await fixture(false,(command)=>{ assert.equal(command,"hub_firewall_status"); return health(); },async(host,calls,owner)=>{
+test("startup prepares the current LAN review but never confirms or applies it",async()=>{
+  await fixture(false,(command)=>{ if(command==="hub_firewall_preview") return preview(); assert.equal(command,"hub_firewall_status"); return health(); },async(host,calls,owner)=>{
     const n=(id:string)=>host.nodes.get(`hub-firewall-${id}`)!;
     owner.refresh("active-target",true); await new Promise(done=>setImmediate(done));
     assert.match(n("health").textContent,/別の設置先/);
-    assert.equal(n("addresses").value,""); assert.equal(n("private").checked,false);
-    await n("suggestion").fire("click");
     assert.equal(n("addresses").value,"192.168.1.0/24"); assert.equal(n("private").checked,true);
+    assert.equal(n("preview").hidden,false);
+    assert.equal(n("export").disabled,true);
     assert.equal(n("apply").disabled,true); assert.equal(n("confirm").checked,false);
     owner.refresh("active-target",true); await new Promise(done=>setImmediate(done));
     assert.equal(calls.filter(name=>name==="hub_firewall_status").length,1);
+    assert.equal(calls.some(name=>name==="hub_firewall_apply"),false);
+    assert.equal(calls.filter(name=>name==="hub_firewall_preview").length,1);
+  });
+});
+
+test("a matching rule needs no review or elevation and startup preserves edited scope",async()=>{
+  await fixture(false,()=>({...health(),state:"matching"}),async(host,calls,owner)=>{
+    owner.refresh("matching",true); await new Promise(done=>setImmediate(done));
+    assert.equal(host.nodes.get("hub-firewall-preview")!.hidden,true);
+    assert.deepEqual(calls,["hub_web_status","hub_firewall_status"]);
+  });
+  await fixture(false,()=>health(),async(host,calls,owner)=>{
+    host.nodes.get("hub-firewall-addresses")!.value="10.2.3.4";
+    owner.refresh("active",true); await new Promise(done=>setImmediate(done));
+    assert.equal(host.nodes.get("hub-firewall-addresses")!.value,"10.2.3.4");
+    assert.equal(calls.includes("hub_firewall_preview"),false);
+  });
+});
+
+test("continue reaches distribution only after explicit apply and a matching OS recheck",async()=>{
+  for(const confirmedState of ["matching","mismatch"] as const) {
+    let applied=false, continued=0;
+    await fixture(false,(command)=>{
+      if(command==="hub_firewall_status") return {...health(),state:applied?confirmedState:"missing"};
+      if(command==="hub_firewall_preview")return preview();
+      assert.equal(command,"hub_firewall_apply");applied=true;return {status:"verified",preview:{...preview(),matching:true}};
+    },async(host,calls,owner)=>{
+      owner.refresh("active",true);await new Promise(done=>setImmediate(done));
+      assert.equal(continued,0);
+      host.nodes.get("hub-firewall-confirm")!.checked=true;await host.nodes.get("hub-firewall-confirm")!.fire("change");
+      await host.nodes.get("hub-firewall-apply")!.fire("click");await new Promise(done=>setImmediate(done));
+      assert.equal(continued,confirmedState==="matching"?1:0);
+      assert.equal(calls.filter(name=>name==="hub_firewall_apply").length,1);
+    },undefined,()=>{++continued;});
+  }
+});
+
+test("export uses the reviewed fingerprint and discards a late response after target change",async()=>{
+  let resolve!: (value:unknown)=>void;
+  await fixture(false,(command,args)=>{
+    if(command==="hub_firewall_preview") return preview();
+    assert.equal(command,"hub_firewall_export"); assert.equal(args.expectedFingerprint,"exact-preview");
+    assert.deepEqual(args.scope,{remote_addresses:["192.168.1.0/24"],profiles:["Private"]});
+    return new Promise(done=>{resolve=done;});
+  },async(host,calls,owner)=>{
+    const n=(id:string)=>host.nodes.get(`hub-firewall-${id}`)!;
+    n("addresses").value="192.168.1.0/24";n("private").checked=true;
+    await n("export").fire("click"); assert.equal(calls.length,0);
+    await n("review").fire("click"); n("confirm").checked=true; await n("confirm").fire("change");
+    const pending=n("export").fire("click"); await new Promise(done=>setImmediate(done));
+    owner.refresh("stopped",false); resolve({filename:"Allow-moyAI-Hub.ps1",content:"should not download"}); await pending;
+    assert.equal(n("preview").hidden,true);assert.equal(n("export").disabled,true);
+    assert.equal(calls.filter(name=>name==="hub_firewall_export").length,1);
     assert.equal(calls.some(name=>name==="hub_firewall_apply"),false);
   });
 });
@@ -103,6 +156,21 @@ test("a late status cannot restore a stopped target or discard manually entered 
     owner.refresh("stopped",false); resolve(health()); await new Promise(done=>setImmediate(done));
     assert.match(n("health").textContent,/Hubを開始すると/);
     assert.equal(n("suggestion").hidden,true); assert.equal(n("addresses").value,"10.2.3.4");
+    assert.equal(calls.some(name=>name==="hub_firewall_apply"),false);
+  });
+});
+
+test("changing the active target during startup preview resumes checking the current target",async()=>{
+  let resolve!: (value:unknown)=>void; let checks=0;
+  await fixture(false,(command)=>{
+    if(command==="hub_firewall_status") return ++checks === 1 ? health() : {...health(),state:"matching"};
+    assert.equal(command,"hub_firewall_preview");return new Promise(done=>{resolve=done;});
+  },async(host,calls,owner)=>{
+    owner.refresh("old",true); await new Promise(done=>setImmediate(done));
+    owner.refresh("new",true); resolve(preview()); await new Promise(done=>setImmediate(done));
+    assert.equal(checks,2);
+    assert.match(host.nodes.get("hub-firewall-health")!.textContent,/受信許可を確認しました/);
+    assert.equal(host.nodes.get("hub-firewall-preview")!.hidden,true);
     assert.equal(calls.some(name=>name==="hub_firewall_apply"),false);
   });
 });

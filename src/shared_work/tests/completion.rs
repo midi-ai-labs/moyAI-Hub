@@ -117,6 +117,89 @@ fn completion_scope_regression_reader_requestor_notification_is_not_actionable()
         .find(|v| v["kind"] == "approval")
         .unwrap();
     assert_eq!(approval["can_act"], false);
+    assert_eq!(approval["approval_status"], "pending");
+    assert_eq!(approval["approval_decision"], Value::Null);
+}
+
+#[test]
+fn inbox_approval_status_tracks_each_exact_request_without_marking_it_read() {
+    let mut f = Fixture::new();
+    let job = f.submit("solver", "notification-status", 0);
+    let attempt = f.work.claim("WinE", 11).unwrap().unwrap();
+    f.report(&attempt, "start", ReportOutcome::Started);
+    request_approval(&mut f, &attempt, "approval-first");
+    let notification = |f: &Fixture, id: &str, now| {
+        f.work.inbox(&f.alice, None, 20, now).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["approval_id"] == id)
+            .unwrap()
+            .clone()
+    };
+    let pending = notification(&f, "approval-first", 21);
+    assert_eq!(pending["approval_status"], "pending");
+    assert_eq!(pending["can_act"], true);
+    f.work
+        .decide_approval(
+            &f.alice,
+            &job.id,
+            "approval-first",
+            ApprovalDecision::Approve,
+            22,
+        )
+        .unwrap();
+    let decided = notification(&f, "approval-first", 23);
+    assert_eq!(decided["approval_status"], "decided");
+    assert_eq!(decided["approval_decision"], "approve");
+    assert_eq!(decided["can_act"], false);
+    assert_eq!(decided["read_at_ms"], Value::Null);
+    f.work
+        .consume_approval(
+            "WinE",
+            "approval-first",
+            &attempt.attempt_id,
+            attempt.generation,
+            24,
+        )
+        .unwrap();
+    request_approval(&mut f, &attempt, "approval-second");
+    assert_eq!(
+        notification(&f, "approval-first", 25)["approval_status"],
+        "consumed"
+    );
+    assert_eq!(
+        notification(&f, "approval-second", 25)["approval_status"],
+        "pending"
+    );
+    assert_eq!(
+        f.work.inbox(&f.alice, None, 20, 25).unwrap()["unread_count"],
+        2
+    );
+    let expired = notification(&f, "approval-second", 1000);
+    assert_eq!(expired["approval_status"], "expired");
+    assert_eq!(expired["can_act"], false);
+    assert_eq!(expired["approval_decision"], Value::Null);
+}
+
+#[test]
+fn cancelled_job_removes_notification_action_even_while_attempt_is_running() {
+    let mut f = Fixture::new();
+    let job = f.submit("solver", "notification-cancel", 0);
+    let attempt = f.work.claim("WinE", 11).unwrap().unwrap();
+    f.report(&attempt, "start", ReportOutcome::Started);
+    request_approval(&mut f, &attempt, "cancelled-approval");
+    f.work.cancel(&f.alice, &job.id, 21).unwrap();
+    let inbox = f.work.inbox(&f.alice, None, 20, 22).unwrap();
+    let approval = inbox["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["approval_id"] == "cancelled-approval")
+        .unwrap();
+    assert_eq!(approval["approval_status"], "cancelled");
+    assert_eq!(approval["can_act"], false);
+    assert_eq!(approval["read_at_ms"], Value::Null);
 }
 
 #[test]
@@ -214,7 +297,6 @@ fn management_cas_and_exact_replay_preserve_metadata_and_referenced_entities() {
         ManagementRequest::DeleteUser {
             user_id: f.alice.user_id.clone(),
         },
-        ManagementRequest::DeleteProject { id: "alpha".into() },
         ManagementRequest::DeleteEnvironment {
             id: "solver".into(),
         },

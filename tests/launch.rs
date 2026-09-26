@@ -57,6 +57,8 @@ struct LaunchReply {
     network_running: bool,
     needs_setup: bool,
     network_error: Option<String>,
+    firewall_status: String,
+    firewall_error: Option<String>,
 }
 
 struct Profile {
@@ -284,6 +286,8 @@ async fn launch_first_profile_reports_setup_and_keeps_web_running() {
     assert!(reply.needs_setup);
     assert!(!reply.network_running);
     assert!(reply.network_error.is_none());
+    assert_eq!(reply.firewall_status, "not_checked");
+    assert!(reply.firewall_error.is_none());
     assert!(!profile.hosting_path().exists());
     let client = profile.connect().await;
     let web = assert_web(&client, &reply).await;
@@ -325,6 +329,8 @@ async fn launch_saved_network_restores_gateway_and_serializes_duplicate_callers(
         assert!(reply.network_running);
         assert!(!reply.needs_setup);
         assert!(reply.network_error.is_none());
+        assert_eq!(reply.firewall_status, "not_required");
+        assert!(reply.firewall_error.is_none());
     }
     let restored = profile.connect().await;
     assert_ne!(restored.instance_id(), old_instance);
@@ -343,6 +349,8 @@ async fn launch_saved_network_restores_gateway_and_serializes_duplicate_callers(
     assert_eq!(duplicate.web_url, left.web_url);
     assert!(duplicate.network_running && !duplicate.needs_setup);
     assert!(duplicate.network_error.is_none());
+    assert_eq!(duplicate.firewall_status, "not_required");
+    assert!(duplicate.firewall_error.is_none());
     let repeated = assert_network(&same, network, gateway).await;
     assert_eq!(repeated["revision"], after["revision"]);
     assert_eq!(repeated["server"]["bind"], after["server"]["bind"]);
@@ -389,6 +397,8 @@ async fn launch_network_port_conflict_keeps_web_and_saved_settings_for_retry() {
     let failed = profile.launch(false, false).await;
     assert!(!failed.network_running);
     assert!(!failed.needs_setup);
+    assert_eq!(failed.firewall_status, "not_checked");
+    assert!(failed.firewall_error.is_none());
     assert!(
         failed
             .network_error
@@ -417,6 +427,8 @@ async fn launch_network_port_conflict_keeps_web_and_saved_settings_for_retry() {
     assert_eq!(recovered.web_url, failed.web_url);
     assert!(recovered.network_running && !recovered.needs_setup);
     assert!(recovered.network_error.is_none());
+    assert_eq!(recovered.firewall_status, "not_required");
+    assert!(recovered.firewall_error.is_none());
     let same = profile.connect().await;
     assert_eq!(same.instance_id(), retained.instance_id());
     assert_network(&same, network, gateway).await;
@@ -450,6 +462,8 @@ async fn launch_stale_saved_ip_reports_failure_without_rewriting_the_address() {
 
     let failed = profile.launch(false, false).await;
     assert!(!failed.network_running && !failed.needs_setup);
+    assert_eq!(failed.firewall_status, "not_checked");
+    assert!(failed.firewall_error.is_none());
     assert!(
         failed
             .network_error

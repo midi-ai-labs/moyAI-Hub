@@ -116,6 +116,7 @@ async fn authenticated_heartbeat_renews_only_its_exact_live_turn_and_accepts_leg
             endpoint: "http://127.0.0.1:1234/v1".into(),
             provider_model: "model-a".into(),
             provider_profile: "openai_compatible_chat".into(),
+            upstream_credential_id: None,
             enabled: true,
         });
         catalog.capacity_pools.push(CapacityPool {

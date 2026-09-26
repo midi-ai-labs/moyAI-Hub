@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { NetworkEdits, networkAdmissionStatus, networkCertificateStatus, networkClientAction, networkClients, networkDeviceDeletion, networkDevices, networkDeviceStatus, networkDiagnosticMatches, networkDiagnosticStages, networkDiagnosticTarget, networkGatewayPort, networkHostingAddress, networkServerAddress, networkSetupStep, networkSubject, type NetworkSnapshot, type NetworkDiagnostics } from "../src/network_state.ts";
+import { NetworkEdits, networkAdmissionStatus, networkCanDistribute, networkIsLocalOnly, networkCertificateStatus, networkClientAction, networkClients, networkDeviceDeletion, networkDevices, networkDeviceStatus, networkDiagnosticMatches, networkDiagnosticStages, networkDiagnosticTarget, networkGatewayPort, networkHostingAddress, networkServerAddress, networkSetupStep, networkSubject, type NetworkSnapshot, type NetworkDiagnostics } from "../src/network_state.ts";
 
 function snapshot(revision = "9007199254740993"): NetworkSnapshot {
     return { revision, hub_id: "hub-a", ca_certificate_pem: "public-ca", ca_sha256: "digest", gateway_port: 0, hosting: { configured: false, bind: null, advertise_ip: null, error: null }, server: { running: false, bind: null, gateway_bind: null, certificate: null },
@@ -13,26 +13,41 @@ function snapshot(revision = "9007199254740993"): NetworkSnapshot {
 test("connection steps start with hosting and never infer firewall or AI completion from an online PC", () => {
     const current = snapshot();
     assert.equal(networkSetupStep(current).anchor, "network-step-start");
-    current.server.running = true;
-    assert.equal(networkSetupStep(current).anchor, "network-step-confirm");
-    assert.match(networkSetupStep(current).detail, /Desktopで接続を診断/);
-    assert.doesNotMatch(networkSetupStep(current).detail, /完了|成功/);
+    current.server = {...current.server,running:true,bind:"https://192.168.1.2:9471",gateway_bind:"https://192.168.1.2:9472"};
+    assert.equal(networkSetupStep(current).anchor, "network-step-firewall");
+    assert.equal(networkSetupStep(current,"matching").anchor, "network-step-confirm");
+    assert.match(networkSetupStep(current,"matching").detail, /Desktopで接続を診断/);
+    assert.doesNotMatch(networkSetupStep(current,"matching").detail, /完了|成功/);
     current.devices[0].admission = "stopped";
     assert.equal(networkSetupStep(current).anchor, "network-step-firewall");
 });
 test("pending joins take the user to approval and expired requests never count as pending", () => {
-    const current=snapshot(); current.server.running=true; current.devices=[];
+    const current=snapshot(); current.server={...current.server,running:true,bind:"https://192.168.1.2:9471",gateway_bind:"https://192.168.1.2:9472"}; current.devices=[];
     current.join_requests=[{request_id:"request",label:"WinB",observed_ip:"192.168.1.20",key_sha256:"key",created_at_ms:1,expires_at_ms:9,status:"pending"}];
-    assert.equal(networkSetupStep(current).anchor,"clients");
+    assert.equal(networkSetupStep(current,"matching").anchor,"clients");
     current.join_requests[0].status="expired";
     assert.equal(networkSetupStep(current).anchor,"network-step-firewall");
 });
 test("observed missing or outdated inbound rules remain actionable even when a local PC is online", () => {
-    const current = snapshot(); current.server.running = true;
+    const current = snapshot(); current.server = {...current.server,running:true,bind:"https://192.168.1.2:9471",gateway_bind:"https://192.168.1.2:9472"};
     for (const state of ["missing", "mismatch", "conflict"] as const) assert.equal(networkSetupStep(current, state).anchor, "network-step-firewall");
     assert.equal(networkSetupStep(current, "matching").anchor, "network-step-confirm");
     current.devices = [];
     assert.equal(networkSetupStep(current, "matching").title, "3. 接続ファイルの配布");
+});
+
+test("distribution waits for both listeners and firewall confirmation with an explicit external-policy exception", () => {
+    const current=snapshot();
+    assert.equal(networkCanDistribute(current,"matching"),false);
+    current.server={...current.server,running:true,bind:"https://192.168.1.2:9471",gateway_bind:"https://192.168.1.2:9472"};
+    for(const state of [null,"missing","mismatch","conflict"] as const) assert.equal(networkCanDistribute(current,state),false);
+    assert.equal(networkCanDistribute(current,"matching"),true);
+    assert.equal(networkCanDistribute(current,"missing",true),true);
+    assert.equal(networkCanDistribute({...current,server:{...current.server,gateway_bind:null}},"matching",true),false);
+    current.server.bind="https://127.0.0.1:9471"; current.server.gateway_bind="https://127.0.0.1:9472";
+    assert.equal(networkIsLocalOnly(current),true); assert.equal(networkCanDistribute(current,null),true);
+    current.server.gateway_bind="https://192.168.1.2:9472";
+    assert.equal(networkIsLocalOnly(current),false); assert.equal(networkCanDistribute(current,null),false);
 });
 
 test("Windows username finds distinct registered PCs without merging their identities", () => {

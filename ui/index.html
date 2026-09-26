@@ -206,7 +206,7 @@
                 ホストからモデルを追加
               </h3>
               <p class="subtle">
-                IP:port を入力すると、モデル候補を自動で取得します。
+                IP:port を入力すると、モデル候補を自動で取得します。キーが必要な場合は、入力後に「モデルを取得」を押してください。
               </p>
             </div>
             <form id="register-form">
@@ -236,6 +236,11 @@
                   モデルを取得
                 </button>
               </div>
+              <label>
+                APIキー（必要な場合）
+                <input id="api-key" type="password" spellcheck="false" autocomplete="off" placeholder="接続先で設定したAPIキー" aria-describedby="api-key-help"/>
+              </label>
+              <p id="api-key-help" class="footnote">モデルの登録時にHubへ保存します。各Desktopへの入力は不要です。</p>
               <p id="discovery-status" class="field-status" role="status" aria-live="polite">
                 ホストを指定してください。
               </p>
@@ -472,6 +477,15 @@
         <label>
           表示名
           <input id="edit-label" required maxlength="160"/>
+        </label>
+        <label>
+          APIキー
+          <input id="edit-api-key" type="password" spellcheck="false" autocomplete="off" aria-describedby="edit-api-key-status"/>
+        </label>
+        <p id="edit-api-key-status" class="footnote"></p>
+        <label id="edit-api-key-clear-label" class="checkbox">
+          <input id="edit-api-key-clear" type="checkbox"/>
+          保存時にAPIキーを削除する
         </label>
         <label>
           グループの同時接続上限

@@ -373,6 +373,17 @@ impl SharedWork {
             .query_map([job_id], row)?
             .collect::<std::result::Result<_, _>>()?)
     }
+    /// The caller first selects a device- and grant-authorized job. Return
+    /// only small artifact metadata for its chat card, never file content.
+    pub(super) fn job_artifact_preview(&self, job_id: &str) -> Result<(Vec<Asset>, bool)> {
+        let mut stmt = self.db.prepare(&format!("SELECT {COLUMNS} FROM shared_assets WHERE job_id=?1 AND kind='artifact' AND purged_at_ms IS NULL ORDER BY created_at_ms,id LIMIT 21"))?;
+        let mut artifacts = stmt
+            .query_map([job_id], row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let more = artifacts.len() > 20;
+        artifacts.truncate(20);
+        Ok((artifacts, more))
+    }
     pub fn asset(&self, actor: &Principal, id: &str) -> Result<AssetDownload> {
         let asset = get(&self.db, id)?;
         identity::require_project_role(
@@ -394,7 +405,10 @@ impl SharedWork {
         input: &RunnerAssetUpload,
         now: u64,
     ) -> Result<Asset> {
-        if !matches!(input.kind.as_str(), "artifact" | "archive") {
+        if !matches!(input.kind.as_str(), "artifact" | "archive" | "input") {
+            return Err(WorkError::Invalid);
+        }
+        if input.kind == "input" && input.base_sha256.is_some() {
             return Err(WorkError::Invalid);
         }
         let bytes = bytes(
@@ -409,12 +423,18 @@ impl SharedWork {
         if status.assignment.generation != input.generation {
             return Err(WorkError::Conflict);
         }
-        let job = status.assignment.job;
+        let job = &status.assignment.job;
         let received: bool = self.db.query_row(
             "SELECT EXISTS(SELECT 1 FROM shared_assets WHERE created_by=?1 AND request_id=?2)",
             params![format!("runner:{runner}"), input.upload.request_id],
             |r| r.get(0),
         )?;
+        if input.kind == "input" && !received {
+            if status.state != "running" {
+                return Err(WorkError::Conflict);
+            }
+            runner_may_read(&self.db, &status)?;
+        }
         if !received && !matches!(status.state.as_str(), "running" | "stop_requested") {
             return Err(WorkError::Conflict);
         }
@@ -463,6 +483,71 @@ impl SharedWork {
         if asset.project_id != job.project_id
             || !(referenced
                 || (asset.kind == "archive" && asset.job_id.as_deref() == Some(&job.id)))
+        {
+            return Err(WorkError::Forbidden);
+        }
+        download(&self.db, asset)
+    }
+    fn child_artifact_scope(
+        &self,
+        runner: &str,
+        attempt: &str,
+        generation: u64,
+        child_id: &str,
+    ) -> Result<Job> {
+        let status = self.attempt(runner, attempt)?;
+        if status.assignment.generation != generation
+            || !matches!(status.state.as_str(), "assigned" | "running")
+        {
+            return Err(WorkError::Conflict);
+        }
+        runner_may_read(&self.db, &status)?;
+        let parent = &status.assignment.job;
+        let child = store::load(&self.db, child_id)?;
+        if child.parent_id.as_deref() != Some(parent.id.as_str())
+            || child.root_id != parent.root_id
+            || child.project_id != parent.project_id
+            || child.conversation_id != parent.conversation_id
+        {
+            return Err(WorkError::Forbidden);
+        }
+        if !child.state.terminal() {
+            return Err(WorkError::Conflict);
+        }
+        Ok(child)
+    }
+    pub fn runner_child_artifacts(
+        &self,
+        runner: &str,
+        attempt: &str,
+        generation: u64,
+        child_id: &str,
+    ) -> Result<Vec<Asset>> {
+        let child = self.child_artifact_scope(runner, attempt, generation, child_id)?;
+        let mut statement = self.db.prepare(&format!(
+            "SELECT {COLUMNS} FROM shared_assets WHERE project_id=?1 AND job_id=?2 AND kind='artifact' AND purged_at_ms IS NULL ORDER BY created_at_ms,id LIMIT 1001"
+        ))?;
+        let artifacts = statement
+            .query_map(params![child.project_id, child.id], row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if artifacts.len() > 1000 {
+            return Err(WorkError::Capacity);
+        }
+        Ok(artifacts)
+    }
+    pub fn runner_child_artifact(
+        &self,
+        runner: &str,
+        attempt: &str,
+        generation: u64,
+        child_id: &str,
+        asset_id: &str,
+    ) -> Result<AssetDownload> {
+        let child = self.child_artifact_scope(runner, attempt, generation, child_id)?;
+        let asset = get(&self.db, asset_id)?;
+        if asset.project_id != child.project_id
+            || asset.job_id.as_deref() != Some(child.id.as_str())
+            || asset.kind != "artifact"
         {
             return Err(WorkError::Forbidden);
         }
@@ -555,6 +640,14 @@ fn runner_may_read(db: &Connection, status: &AttemptStatus) -> Result<()> {
         || root.state.terminal()
         || root.state == JobState::Cancelling
     {
+        return Err(WorkError::Forbidden);
+    }
+    let current_runner: String = db.query_row(
+        "SELECT runner_id FROM shared_environments WHERE id=?1",
+        [&job.environment_id],
+        |row| row.get(0),
+    )?;
+    if current_runner != status.assignment.runner_id {
         return Err(WorkError::Forbidden);
     }
     super::handover::may_continue(db, job, &job.environment_id)

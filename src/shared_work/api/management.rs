@@ -131,6 +131,7 @@ async fn continue_job(
     Path(id): Path<String>,
     Json(input): Json<ContinueJob>,
 ) -> ApiResult<Job> {
+    let controller_device = device.device_id.clone();
     authenticated(
         state,
         headers,
@@ -139,7 +140,15 @@ async fn continue_job(
             target: ControllerTarget::Job(id.clone()),
             new_usage: true,
         },
-        move |store, actor| store.continue_job(&actor, &id, &input, crate::service::now_ms()),
+        move |store, actor| {
+            store.continue_job_for_device(
+                &actor,
+                Some(&controller_device),
+                &id,
+                &input,
+                crate::service::now_ms(),
+            )
+        },
     )
     .await
 }

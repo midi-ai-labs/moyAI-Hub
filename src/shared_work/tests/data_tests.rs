@@ -34,7 +34,14 @@ fn with_input(f: &mut Fixture, key: &str, asset: &str) -> Job {
             &SubmitJob {
                 request_id: key.into(),
                 project_id: "alpha".into(),
+                project_participation: None,
+                conversation_id: None,
+                revises_job_id: None,
+                expected_revised_revision: None,
                 environment_id: "parent".into(),
+                origin_session_ref: None,
+                origin_turn_ref: None,
+                origin_turn_epoch: None,
                 title: key.into(),
                 input: json!({"version":2,"prompt":"Use shared input","input_refs":[asset]}),
                 descendant_budget: 2,
@@ -60,6 +67,591 @@ fn prune(f: &mut Fixture, before: u64, now: u64) {
             now,
         )
         .unwrap();
+}
+
+#[test]
+fn revising_latest_stopped_turn_keeps_audit_and_resumes_before_the_edited_turn() {
+    let mut f = Fixture::new();
+    let first = f.submit("parent", "first-for-revise", 0);
+    let attempt = f.work.claim("WinC", 11).unwrap().unwrap();
+    f.report(&attempt, "start-for-revise", ReportOutcome::Started);
+    let saved = f
+        .work
+        .runner_upload_asset(
+            "WinC",
+            &attempt.attempt_id,
+            &archive(&attempt, "archive-for-revise", None),
+            12,
+        )
+        .unwrap();
+    f.report(&attempt, "finish-for-revise", finished());
+    let first = f.work.job(&f.alice, &first.id).unwrap();
+    let second = f
+        .work
+        .continue_job(
+            &f.alice,
+            &first.id,
+            &ContinueJob {
+                request_id: "turn-to-edit".into(),
+                expected_revision: first.revision,
+                project_participation: None,
+                conversation_epoch: None,
+                prompt: "before edit".into(),
+                input_refs: vec![],
+                start_before_ms: None,
+            },
+            22,
+        )
+        .unwrap();
+    let stopped = f.work.cancel(&f.alice, &second.id, 23).unwrap();
+    assert_eq!(stopped.state, JobState::Cancelled);
+    let catalog = f
+        .work
+        .list_project_conversations(&f.alice, "alpha")
+        .unwrap();
+    let row = catalog["conversations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == first.id)
+        .unwrap();
+    assert_eq!(row["can_revise"], true);
+    assert_eq!(row["revision"], 2);
+    let replacement = SubmitJob {
+        request_id: "turn-edited".into(),
+        project_id: "alpha".into(),
+        project_participation: None,
+        conversation_id: Some(first.conversation_id.clone()),
+        revises_job_id: Some(stopped.id.clone()),
+        expected_revised_revision: Some(stopped.revision),
+        environment_id: String::new(),
+        origin_session_ref: None,
+        origin_turn_ref: None,
+        origin_turn_epoch: None,
+        title: "Edited turn".into(),
+        input: json!({"prompt":"after edit"}),
+        descendant_budget: 0,
+        start_before_ms: None,
+    };
+    let edited = f.work.submit(&f.alice, &replacement, 24).unwrap();
+    assert_eq!(edited.conversation_id, first.id);
+    assert_eq!(edited.revises_job_id.as_deref(), Some(stopped.id.as_str()));
+    assert_eq!(edited.continued_from.as_deref(), Some(first.id.as_str()));
+    let after_append = f
+        .work
+        .list_project_conversations(&f.alice, "alpha")
+        .unwrap();
+    let current = after_append["conversations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == first.id)
+        .unwrap();
+    assert_eq!(current["revision"], 3);
+    assert!(matches!(
+        f.work
+            .rename_project_conversation(&f.alice, "alpha", &first.id, "stale", 2, 25),
+        Err(WorkError::Conflict)
+    ));
+    assert_eq!(
+        f.work.submit(&f.alice, &replacement, 25).unwrap().id,
+        edited.id
+    );
+    assert!(matches!(
+        f.work.submit(
+            &f.alice,
+            &SubmitJob {
+                request_id: "stale-revise".into(),
+                ..replacement.clone()
+            },
+            26
+        ),
+        Err(WorkError::Conflict)
+    ));
+    let history = f
+        .work
+        .conversation_history(&f.alice, "alpha", &first.id, None, None, 10, 27)
+        .unwrap();
+    assert_eq!(history.jobs.len(), 3);
+    assert_eq!(
+        history.jobs[0].job.revises_job_id.as_deref(),
+        Some(stopped.id.as_str())
+    );
+    let running = f.work.claim("WinC", 28).unwrap().unwrap();
+    assert_eq!(running.job.id, edited.id);
+    assert_eq!(
+        f.work
+            .runner_archive("WinC", &running.attempt_id)
+            .unwrap()
+            .unwrap()
+            .asset
+            .id,
+        saved.id
+    );
+}
+
+#[test]
+fn first_turn_revision_has_no_predecessor_and_needs_settled_stop() {
+    let mut f = Fixture::new();
+    let first = f.submit("parent", "first-stop-revise", 0);
+    let attempt = f.work.claim("WinC", 11).unwrap().unwrap();
+    let cancelling = f.work.cancel(&f.alice, &first.id, 12).unwrap();
+    assert_eq!(cancelling.state, JobState::Cancelling);
+    let request = SubmitJob {
+        request_id: "first-edited".into(),
+        project_id: "alpha".into(),
+        project_participation: None,
+        conversation_id: Some(first.id.clone()),
+        revises_job_id: Some(first.id.clone()),
+        expected_revised_revision: Some(cancelling.revision),
+        environment_id: "parent".into(),
+        origin_session_ref: None,
+        origin_turn_ref: None,
+        origin_turn_epoch: None,
+        title: "edited".into(),
+        input: json!({"prompt":"after edit"}),
+        descendant_budget: 0,
+        start_before_ms: None,
+    };
+    assert!(matches!(
+        f.work.submit(&f.alice, &request, 13),
+        Err(WorkError::Conflict)
+    ));
+    f.report(
+        &attempt,
+        "stopped-for-revise",
+        ReportOutcome::Finished {
+            success: false,
+            result: json!({"stopped":true}),
+            resources_released: true,
+        },
+    );
+    let cancelled = f.work.job(&f.alice, &first.id).unwrap();
+    identity::set_project_role(
+        &f.work.db,
+        &f.admin,
+        "alpha",
+        &f.bob.user_id,
+        Some(ProjectRole::Contributor),
+        21,
+    )
+    .unwrap();
+    assert_eq!(
+        f.work.job_detail_at(&f.bob, &first.id, 21).unwrap()["can_revise"],
+        true
+    );
+    let edited = f
+        .work
+        .submit(
+            &f.bob,
+            &SubmitJob {
+                expected_revised_revision: Some(cancelled.revision),
+                ..request
+            },
+            22,
+        )
+        .unwrap();
+    assert_eq!(edited.continued_from, None);
+}
+
+#[test]
+fn conversation_delete_waits_for_runner_stop_then_hides_canonical_history() {
+    let mut f = Fixture::new();
+    let root = f.submit("parent", "conversation-to-delete", 0);
+    let listed = f
+        .work
+        .list_project_conversations(&f.alice, "alpha")
+        .unwrap();
+    assert_eq!(listed["conversations"][0]["id"], root.id);
+    assert_eq!(listed["conversations"][0]["can_rename"], true);
+    assert!(
+        f.work
+            .rename_project_conversation(&f.bob, "alpha", &root.id, "denied", 1, 11)
+            .is_err()
+    );
+    let renamed = f
+        .work
+        .rename_project_conversation(&f.alice, "alpha", &root.id, "新しい題名", 1, 11)
+        .unwrap();
+    assert_eq!(renamed["title"], "新しい題名");
+    assert_eq!(renamed["revision"], 2);
+    assert!(matches!(
+        f.work
+            .rename_project_conversation(&f.alice, "alpha", &root.id, "stale", 1, 12),
+        Err(WorkError::Conflict)
+    ));
+    assert!(matches!(
+        f.work
+            .delete_project_conversation(&f.alice, "alpha", &root.id, 1, 12),
+        Err(WorkError::Conflict)
+    ));
+    let running = f.work.claim("WinC", 12).unwrap().unwrap();
+    f.report(&running, "start-to-delete", ReportOutcome::Started);
+    let deleting = f
+        .work
+        .delete_project_conversation(&f.alice, "alpha", &root.id, 2, 21)
+        .unwrap();
+    assert_eq!(deleting["delete_pending"], true);
+    let pending = f
+        .work
+        .list_project_conversations(&f.alice, "alpha")
+        .unwrap();
+    assert_eq!(pending["conversations"][0]["delete_pending"], true);
+    assert_eq!(pending["conversations"][0]["can_rename"], false);
+    assert!(
+        f.work
+            .rename_project_conversation(&f.alice, "alpha", &root.id, "late rename", 3, 22)
+            .is_err()
+    );
+    f.report(
+        &running,
+        "stopped-after-delete",
+        ReportOutcome::Finished {
+            success: false,
+            result: json!({"stopped":true}),
+            resources_released: true,
+        },
+    );
+    let deleted = f
+        .work
+        .delete_project_conversation(&f.alice, "alpha", &root.id, 2, 23)
+        .unwrap();
+    assert_eq!(deleted["deleted"], true);
+    assert!(
+        f.work
+            .list_project_conversations(&f.alice, "alpha")
+            .unwrap()["conversations"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(matches!(
+        f.work.job(&f.alice, &root.id),
+        Err(WorkError::NotFound)
+    ));
+    assert!(matches!(
+        f.work
+            .conversation_history(&f.alice, "alpha", &root.id, None, None, 10, 24),
+        Err(WorkError::NotFound)
+    ));
+    let state: String = f
+        .work
+        .db
+        .query_row(
+            "SELECT state FROM shared_jobs WHERE id=?1",
+            [&root.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "cancelled");
+}
+
+#[test]
+fn conversation_catalog_latest_job_uses_save_order_when_timestamps_tie() {
+    let mut f = Fixture::new();
+    let first = f.submit("parent", "same-timestamp-first", 0);
+    let attempt = f.work.claim("WinC", 11).unwrap().unwrap();
+    f.report(&attempt, "same-timestamp-start", ReportOutcome::Started);
+    f.report(&attempt, "same-timestamp-done", finished());
+    let latest = "000-same-timestamp-latest";
+    f.work.db.execute(
+        "INSERT INTO shared_jobs(id,root_id,conversation_id,project_id,environment_id,requestor_id,assignee_id,request_id,request_json,title,input_json,state,descendant_budget,revision,created_at_ms,updated_at_ms)
+         SELECT ?2,?2,?1,project_id,environment_id,requestor_id,assignee_id,'same-timestamp-receipt','{}','Latest','{}','succeeded',0,1,created_at_ms,updated_at_ms FROM shared_jobs WHERE id=?1",
+        rusqlite::params![first.id,latest],
+    ).unwrap();
+    let row = &f
+        .work
+        .list_project_conversations(&f.alice, "alpha")
+        .unwrap()["conversations"][0];
+    assert_eq!(row["latest_job_id"], latest);
+    assert_eq!(row["can_revise"], true);
+    assert_eq!(
+        f.work.job_detail_at(&f.alice, &first.id, 30).unwrap()["can_revise"],
+        false
+    );
+}
+
+#[test]
+fn continuation_uses_only_the_latest_settled_root_and_never_overlaps_a_turn() {
+    let mut f = Fixture::new();
+    let first = f.submit("parent", "first-continuation-root", 0);
+    let first_attempt = f.work.claim("WinC", 11).unwrap().unwrap();
+    f.report(
+        &first_attempt,
+        "first-continuation-start",
+        ReportOutcome::Started,
+    );
+    f.work
+        .runner_upload_asset(
+            "WinC",
+            &first_attempt.attempt_id,
+            &archive(&first_attempt, "first-continuation-archive", None),
+            12,
+        )
+        .unwrap();
+    f.report(&first_attempt, "first-continuation-done", finished());
+    let first = f.work.job(&f.alice, &first.id).unwrap();
+    assert_eq!(
+        f.work.job_detail_at(&f.alice, &first.id, 20).unwrap()["can_continue"],
+        true
+    );
+    let request = ContinueJob {
+        request_id: "second-continuation-root".into(),
+        expected_revision: first.revision,
+        project_participation: None,
+        conversation_epoch: None,
+        prompt: "Second turn".into(),
+        input_refs: vec![],
+        start_before_ms: None,
+    };
+    let second = f
+        .work
+        .continue_job(&f.alice, &first.id, &request, 21)
+        .unwrap();
+    assert_eq!(
+        f.work
+            .continue_job(&f.alice, &first.id, &request, 22)
+            .unwrap()
+            .id,
+        second.id
+    );
+    assert_eq!(
+        f.work.job_detail_at(&f.alice, &first.id, 22).unwrap()["can_continue"],
+        false
+    );
+    let late = ContinueJob {
+        request_id: "parallel-third-root".into(),
+        ..request
+    };
+    assert!(matches!(
+        f.work.continue_job(&f.alice, &first.id, &late, 22),
+        Err(WorkError::Conflict)
+    ));
+    let second_attempt = f.work.claim("WinC", 23).unwrap().unwrap();
+    assert_eq!(second_attempt.job.id, second.id);
+    f.report(
+        &second_attempt,
+        "second-continuation-start",
+        ReportOutcome::Started,
+    );
+    assert!(matches!(
+        f.work.continue_job(&f.alice, &first.id, &late, 24),
+        Err(WorkError::Conflict)
+    ));
+    f.work
+        .runner_upload_asset(
+            "WinC",
+            &second_attempt.attempt_id,
+            &archive(&second_attempt, "second-continuation-archive", None),
+            25,
+        )
+        .unwrap();
+    f.report(&second_attempt, "second-continuation-done", finished());
+    let second = f.work.job(&f.alice, &second.id).unwrap();
+    assert_eq!(
+        f.work.job_detail_at(&f.alice, &first.id, 26).unwrap()["can_continue"],
+        false
+    );
+    assert_eq!(
+        f.work.job_detail_at(&f.alice, &second.id, 26).unwrap()["can_continue"],
+        true
+    );
+    assert!(matches!(
+        f.work.continue_job(&f.alice, &first.id, &late, 27),
+        Err(WorkError::Conflict)
+    ));
+    let third = f
+        .work
+        .continue_job(
+            &f.alice,
+            &second.id,
+            &ContinueJob {
+                request_id: "third-continuation-root".into(),
+                expected_revision: second.revision,
+                project_participation: None,
+                conversation_epoch: None,
+                prompt: "Third turn".into(),
+                input_refs: vec![],
+                start_before_ms: None,
+            },
+            27,
+        )
+        .unwrap();
+    assert_eq!(third.conversation_id, first.id);
+}
+
+#[test]
+fn delete_pending_conversation_cannot_accept_continuation_while_old_work_stops() {
+    let mut f = Fixture::new();
+    let first = f.submit("parent", "delete-pending-root", 0);
+    let first_attempt = f.work.claim("WinC", 11).unwrap().unwrap();
+    f.report(
+        &first_attempt,
+        "delete-pending-start",
+        ReportOutcome::Started,
+    );
+    f.work
+        .runner_upload_asset(
+            "WinC",
+            &first_attempt.attempt_id,
+            &archive(&first_attempt, "delete-pending-archive", None),
+            12,
+        )
+        .unwrap();
+    f.report(
+        &first_attempt,
+        "delete-pending-retain",
+        ReportOutcome::RetainService {
+            service_id: "delete-pending-service".into(),
+            expires_at_ms: 1000,
+        },
+    );
+    f.report(&first_attempt, "delete-pending-finish", finished());
+    let first = f.work.job(&f.alice, &first.id).unwrap();
+    assert_eq!(
+        f.work.job_detail_at(&f.alice, &first.id, 21).unwrap()["can_continue"],
+        true
+    );
+    let continuation = ContinueJob {
+        request_id: "delete-pending-second".into(),
+        expected_revision: first.revision,
+        project_participation: None,
+        conversation_epoch: None,
+        prompt: "Second turn".into(),
+        input_refs: vec![],
+        start_before_ms: None,
+    };
+    let second = f
+        .work
+        .continue_job(&f.alice, &first.id, &continuation, 22)
+        .unwrap();
+    let second_attempt = f.work.claim("WinC", 23).unwrap().unwrap();
+    assert_eq!(second_attempt.job.id, second.id);
+    f.report(
+        &second_attempt,
+        "delete-pending-second-start",
+        ReportOutcome::Started,
+    );
+    let deleted = f
+        .work
+        .delete_project_conversation(&f.alice, "alpha", &first.id, 2, 24)
+        .unwrap();
+    assert_eq!(deleted["delete_pending"], true);
+    assert_eq!(
+        f.work.job_detail_at(&f.alice, &first.id, 25).unwrap()["can_continue"],
+        false
+    );
+    assert!(
+        f.work
+            .attempt("WinC", &second_attempt.attempt_id)
+            .unwrap()
+            .assignment
+            .stop_requested
+    );
+    assert_eq!(
+        f.work
+            .continue_job(&f.alice, &first.id, &continuation, 25)
+            .unwrap()
+            .id,
+        second.id
+    );
+    let late = ContinueJob {
+        request_id: "late-after-delete".into(),
+        ..continuation
+    };
+    assert!(matches!(
+        f.work.continue_job(&f.alice, &first.id, &late, 25),
+        Err(WorkError::Conflict)
+    ));
+    f.report(
+        &second_attempt,
+        "delete-pending-second-stopped",
+        ReportOutcome::Finished {
+            success: false,
+            result: json!({"stopped":true}),
+            resources_released: true,
+        },
+    );
+    assert_eq!(
+        f.work
+            .list_project_conversations(&f.alice, "alpha")
+            .unwrap()["conversations"][0]["delete_pending"],
+        true
+    );
+    f.work
+        .report(
+            "WinC",
+            &Report {
+                event_id: "delete-pending-service-stopped".into(),
+                attempt_id: first_attempt.attempt_id,
+                generation: first_attempt.generation,
+                outcome: ReportOutcome::ServiceStopped {
+                    service_id: "delete-pending-service".into(),
+                },
+            },
+            26,
+        )
+        .unwrap();
+    assert!(
+        f.work
+            .list_project_conversations(&f.alice, "alpha")
+            .unwrap()["conversations"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn revising_attached_root_is_rejected_until_client_can_preserve_inputs() {
+    let mut f = Fixture::new();
+    let asset = f
+        .work
+        .upload_input(
+            &f.alice,
+            "alpha",
+            &upload("attached-revise-input", "source.txt", b"data"),
+            5,
+        )
+        .unwrap();
+    let root = with_input(&mut f, "attached-root", &asset.id);
+    let attempt = f.work.claim("WinC", 11).unwrap().unwrap();
+    f.report(&attempt, "attached-revise-start", ReportOutcome::Started);
+    f.report(&attempt, "attached-revise-finish", finished());
+    let terminal = f.work.job(&f.alice, &root.id).unwrap();
+    assert_eq!(terminal.state, JobState::Succeeded);
+    assert_eq!(
+        f.work.job_detail_at(&f.alice, &root.id, 21).unwrap()["can_revise"],
+        false
+    );
+    let revise = SubmitJob {
+        request_id: "drop-attachment".into(),
+        project_id: "alpha".into(),
+        project_participation: None,
+        conversation_id: Some(root.id.clone()),
+        revises_job_id: Some(root.id.clone()),
+        expected_revised_revision: Some(terminal.revision),
+        environment_id: "parent".into(),
+        origin_session_ref: None,
+        origin_turn_ref: None,
+        origin_turn_epoch: None,
+        title: "edited".into(),
+        input: json!({"prompt":"without file"}),
+        descendant_budget: 0,
+        start_before_ms: None,
+    };
+    assert!(matches!(
+        f.work.submit(&f.alice, &revise, 22),
+        Err(WorkError::Conflict)
+    ));
+    assert_eq!(
+        f.work
+            .conversation_history(&f.alice, "alpha", &root.id, None, None, 10, 23)
+            .unwrap()
+            .jobs
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -146,7 +738,14 @@ fn data_upload_retry_and_current_project_download_authorization_are_exact() {
                 &SubmitJob {
                     request_id: "foreign-ref".into(),
                     project_id: "alpha".into(),
+                    project_participation: None,
+                    conversation_id: None,
+                    revises_job_id: None,
+                    expected_revised_revision: None,
                     environment_id: "solver".into(),
+                    origin_session_ref: None,
+                    origin_turn_ref: None,
+                    origin_turn_epoch: None,
                     title: "no".into(),
                     input: json!({"version":2,"prompt":"no","input_refs":[beta.id]}),
                     descendant_budget: 0,
@@ -231,6 +830,107 @@ fn data_input_references_bind_parent_and_child_without_broad_runner_access() {
 }
 
 #[test]
+fn runner_can_stage_exact_child_input_from_its_running_attempt() {
+    let mut f = Fixture::new();
+    let root = f.submit("parent", "runner-staged-input", 1);
+    let parent = f.work.claim("WinC", 11).unwrap().unwrap();
+    let staged = RunnerAssetUpload {
+        generation: parent.generation,
+        kind: "input".into(),
+        base_sha256: None,
+        upload: upload("staged-source", "src/app.py", b"print('ok')\n"),
+    };
+    assert!(matches!(
+        f.work
+            .runner_upload_asset("WinC", &parent.attempt_id, &staged, 12),
+        Err(WorkError::Conflict)
+    ));
+    f.report(&parent, "staged-start", ReportOutcome::Started);
+    let saved = f
+        .work
+        .runner_upload_asset("WinC", &parent.attempt_id, &staged, 13)
+        .unwrap();
+    assert_eq!(saved.kind, "input");
+    assert_eq!(saved.job_id.as_deref(), Some(root.id.as_str()));
+    assert_eq!(
+        f.work
+            .runner_upload_asset("WinC", &parent.attempt_id, &staged, 14)
+            .unwrap(),
+        saved
+    );
+    assert!(
+        f.work
+            .runner_upload_asset("WinE", &parent.attempt_id, &staged, 14)
+            .is_err()
+    );
+    assert!(matches!(
+        f.work.runner_upload_asset(
+            "WinC",
+            &parent.attempt_id,
+            &RunnerAssetUpload {
+                generation: parent.generation + 1,
+                ..staged.clone()
+            },
+            14
+        ),
+        Err(WorkError::Conflict)
+    ));
+    assert!(matches!(
+        f.work.runner_upload_asset(
+            "WinC",
+            &parent.attempt_id,
+            &RunnerAssetUpload {
+                base_sha256: Some("0".repeat(64)),
+                ..staged.clone()
+            },
+            14
+        ),
+        Err(WorkError::Invalid)
+    ));
+    f.report(
+        &parent,
+        "staged-yield",
+        ReportOutcome::YieldToChild {
+            checkpoint: json!({"version":1}),
+            child_environment_id: "solver".into(),
+            child_title: "Use staged file".into(),
+            child_input: json!({"version":2,"prompt":"Use file","input_refs":[saved.id]}),
+            resources_released: true,
+        },
+    );
+    assert_eq!(
+        f.work
+            .runner_upload_asset("WinC", &parent.attempt_id, &staged, 20)
+            .unwrap(),
+        saved
+    );
+    assert!(matches!(
+        f.work.runner_upload_asset(
+            "WinC",
+            &parent.attempt_id,
+            &RunnerAssetUpload {
+                upload: upload("late-staged", "late.txt", b"late"),
+                ..staged.clone()
+            },
+            20
+        ),
+        Err(WorkError::Conflict)
+    ));
+    let child = f.work.claim("WinE", 21).unwrap().unwrap();
+    assert_eq!(child.job.parent_id.as_deref(), Some(root.id.as_str()));
+    assert_eq!(
+        f.work
+            .runner_asset("WinE", &child.attempt_id, &saved.id)
+            .unwrap()
+            .asset
+            .id,
+        saved.id
+    );
+    prune(&mut f, 30, 31);
+    assert!(f.work.asset(&f.alice, &saved.id).is_ok());
+}
+
+#[test]
 fn data_runner_new_downloads_recheck_current_person_and_cancellation() {
     for revoke in [false, true] {
         let mut f = Fixture::new();
@@ -278,6 +978,143 @@ fn data_runner_new_downloads_recheck_current_person_and_cancellation() {
         );
         assert!(f.work.runner_archive("WinC", &attempt.attempt_id).is_err());
     }
+}
+
+#[test]
+fn resumed_parent_runner_reads_only_its_immediate_child_artifacts() {
+    let mut f = Fixture::new();
+    let root = f.submit("parent", "child-artifact-scope", 1);
+    let parent = f.work.claim("WinC", 11).unwrap().unwrap();
+    f.report(
+        &parent,
+        "child-artifact-parent-start",
+        ReportOutcome::Started,
+    );
+    let parent_artifact = f
+        .work
+        .runner_upload_asset(
+            "WinC",
+            &parent.attempt_id,
+            &RunnerAssetUpload {
+                generation: parent.generation,
+                kind: "artifact".into(),
+                base_sha256: None,
+                upload: upload("parent-artifact", "parent.txt", b"parent"),
+            },
+            12,
+        )
+        .unwrap();
+    f.report(&parent, "child-artifact-yield", child());
+    let child = f.work.claim("WinE", 21).unwrap().unwrap();
+    f.report(&child, "child-artifact-child-start", ReportOutcome::Started);
+    let artifact = f
+        .work
+        .runner_upload_asset(
+            "WinE",
+            &child.attempt_id,
+            &RunnerAssetUpload {
+                generation: child.generation,
+                kind: "artifact".into(),
+                base_sha256: None,
+                upload: upload("child-artifact", "result.txt", b"answer 42"),
+            },
+            22,
+        )
+        .unwrap();
+    let child_archive = f
+        .work
+        .runner_upload_asset(
+            "WinE",
+            &child.attempt_id,
+            &archive(&child, "child-artifact-archive", None),
+            23,
+        )
+        .unwrap();
+    f.report(&child, "child-artifact-child-done", finished());
+    let resumed = f.work.claim("WinC", 24).unwrap().unwrap();
+    assert_eq!(resumed.job.id, root.id);
+    assert_eq!(resumed.generation, 2);
+    let items = f
+        .work
+        .runner_child_artifacts(
+            "WinC",
+            &resumed.attempt_id,
+            resumed.generation,
+            &child.job.id,
+        )
+        .unwrap();
+    assert_eq!(items, vec![artifact.clone()]);
+    let downloaded = f
+        .work
+        .runner_child_artifact(
+            "WinC",
+            &resumed.attempt_id,
+            resumed.generation,
+            &child.job.id,
+            &artifact.id,
+        )
+        .unwrap();
+    assert_eq!(
+        STANDARD.decode(downloaded.content_base64).unwrap(),
+        b"answer 42"
+    );
+    assert!(matches!(
+        f.work.runner_child_artifacts(
+            "WinC",
+            &resumed.attempt_id,
+            resumed.generation + 1,
+            &child.job.id
+        ),
+        Err(WorkError::Conflict)
+    ));
+    assert!(
+        f.work
+            .runner_child_artifacts(
+                "WinE",
+                &resumed.attempt_id,
+                resumed.generation,
+                &child.job.id
+            )
+            .is_err()
+    );
+    assert!(
+        f.work
+            .runner_child_artifacts("WinC", &resumed.attempt_id, resumed.generation, &root.id)
+            .is_err()
+    );
+    assert!(
+        f.work
+            .runner_child_artifact(
+                "WinC",
+                &resumed.attempt_id,
+                resumed.generation,
+                &child.job.id,
+                &parent_artifact.id
+            )
+            .is_err()
+    );
+    assert!(
+        f.work
+            .runner_child_artifact(
+                "WinC",
+                &resumed.attempt_id,
+                resumed.generation,
+                &child.job.id,
+                &child_archive.id
+            )
+            .is_err()
+    );
+    identity::set_project_role(&f.work.db, &f.admin, "alpha", &f.alice.user_id, None, 25).unwrap();
+    assert!(
+        f.work
+            .runner_child_artifacts(
+                "WinC",
+                &resumed.attempt_id,
+                resumed.generation,
+                &child.job.id
+            )
+            .is_err()
+    );
 }
 
 #[test]
@@ -400,6 +1237,7 @@ fn data_retention_preserves_active_inputs_and_continuation_archive_then_rejects_
         )
         .unwrap();
     let root = with_input(&mut f, "continue-data", &input.id);
+    f.work.db.execute("UPDATE shared_jobs SET origin_session_ref='data-session',origin_device_id='WinA' WHERE id=?1", [&root.id]).unwrap();
     let attempt = f.work.claim("WinC", 11).unwrap().unwrap();
     f.report(&attempt, "start", ReportOutcome::Started);
     let saved = f
@@ -423,16 +1261,39 @@ fn data_retention_preserves_active_inputs_and_continuation_archive_then_rejects_
     let request = ContinueJob {
         request_id: "next-root".into(),
         expected_revision: terminal.revision,
+        project_participation: None,
+        conversation_epoch: None,
         prompt: "Continue from this conversation".into(),
         input_refs: vec![input.id.clone()],
         start_before_ms: None,
     };
+    let invalid_deadline = ContinueJob {
+        request_id: "expired-continuation".into(),
+        start_before_ms: Some(41),
+        ..request.clone()
+    };
+    assert!(matches!(
+        f.work
+            .continue_job(&f.alice, &root.id, &invalid_deadline, 41),
+        Err(WorkError::StartDeadline)
+    ));
     let next = f
         .work
         .continue_job(&f.alice, &root.id, &request, 41)
         .unwrap();
     assert_ne!(next.id, root.id);
     assert_eq!(next.continued_from.as_deref(), Some(root.id.as_str()));
+    assert_eq!(next.origin_session_ref.as_deref(), Some("data-session"));
+    let continuation_device: String = f
+        .work
+        .db
+        .query_row(
+            "SELECT origin_device_id FROM shared_jobs WHERE id=?1",
+            [&next.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(continuation_device, "WinA");
     assert_eq!(next.quota_owner_id, root.quota_owner_id);
     assert_eq!(next.start_before_ms, 41 + DEFAULT_START_WINDOW_MS);
     assert!(next.start_before_ms > terminal.start_before_ms);
@@ -450,16 +1311,6 @@ fn data_retention_preserves_active_inputs_and_continuation_archive_then_rejects_
             .start_before_ms,
         next.start_before_ms
     );
-    let invalid_deadline = ContinueJob {
-        request_id: "expired-continuation".into(),
-        start_before_ms: Some(42),
-        ..request.clone()
-    };
-    assert!(matches!(
-        f.work
-            .continue_job(&f.alice, &root.id, &invalid_deadline, 42),
-        Err(WorkError::StartDeadline)
-    ));
     assert_eq!(
         f.work.job(&f.alice, &root.id).unwrap().revision,
         terminal.revision
@@ -504,7 +1355,14 @@ fn data_retention_preserves_active_inputs_and_continuation_archive_then_rejects_
                 &SubmitJob {
                     request_id: "purged-input-new-job".into(),
                     project_id: "alpha".into(),
+                    project_participation: None,
+                    conversation_id: None,
+                    revises_job_id: None,
+                    expected_revised_revision: None,
                     environment_id: "parent".into(),
+                    origin_session_ref: None,
+                    origin_turn_ref: None,
+                    origin_turn_epoch: None,
                     title: "must refuse".into(),
                     input: json!({"version":2,"prompt":"no","input_refs":[input.id]}),
                     descendant_budget: 0,
@@ -638,7 +1496,7 @@ fn data_v8_blob_migrates_only_after_verified_file_persistence_and_failed_migrati
                     .db
                     .pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
                     .unwrap(),
-                15
+                22
             );
             assert_eq!(
                 f.work

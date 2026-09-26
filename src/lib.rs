@@ -13,4 +13,5 @@ pub mod protocol;
 mod provider;
 pub mod service;
 pub mod shared_work;
+pub mod upstream_auth;
 mod web_admin;

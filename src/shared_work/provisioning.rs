@@ -17,6 +17,8 @@ pub struct ProvisionRequest {
     pub template_id: String,
     #[serde(default)]
     pub generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -134,13 +136,14 @@ impl SharedWork {
         Ok(())
     }
     pub fn pending_provision(&self, runner: &str) -> Result<Vec<ProvisionRequest>> {
-        let mut statement=self.db.prepare("SELECT p.environment_id,p.template_id,p.generation FROM shared_provisioning p JOIN shared_environments e ON e.id=p.environment_id WHERE p.runner_id=?1 AND e.runner_id=?1 AND p.state='pending' ORDER BY p.created_at_ms,p.environment_id LIMIT 128")?;
+        let mut statement=self.db.prepare("SELECT p.environment_id,p.template_id,p.generation,p.state FROM shared_provisioning p JOIN shared_environments e ON e.id=p.environment_id WHERE p.runner_id=?1 AND e.runner_id=?1 AND (p.state='pending' OR (p.template_id='local-folder' AND p.state='failed')) ORDER BY p.created_at_ms,p.environment_id LIMIT 128")?;
         Ok(statement
             .query_map([runner], |r| {
                 Ok(ProvisionRequest {
                     environment_id: r.get(0)?,
                     template_id: r.get(1)?,
                     generation: r.get(2)?,
+                    state: Some(r.get(3)?),
                 })
             })?
             .collect::<std::result::Result<_, _>>()?)
@@ -162,19 +165,61 @@ impl SharedWork {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let previous: Option<(String,String,Option<String>)>=tx.query_row("SELECT p.template_id,p.state,p.error FROM shared_provisioning p JOIN shared_environments e ON e.id=p.environment_id WHERE p.environment_id=?1 AND p.runner_id=?2 AND e.runner_id=?2 AND p.generation=?3",params![receipt.environment_id,runner,receipt.generation],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
-        let Some((template, state, error)) = previous else {
+        let previous: Option<(String,String,Option<String>,u64)>=tx.query_row("SELECT p.template_id,p.state,p.error,p.generation FROM shared_provisioning p JOIN shared_environments e ON e.id=p.environment_id WHERE p.environment_id=?1 AND p.runner_id=?2 AND e.runner_id=?2",params![receipt.environment_id,runner],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+        let Some((template, state, error, generation)) = previous else {
             return Err(WorkError::NotFound);
         };
-        let next = if receipt.success { "ready" } else { "failed" };
-        if template != receipt.template_id
-            || state != "pending" && (state != next || error != receipt.error)
-        {
+        if template != receipt.template_id {
             return Err(WorkError::Conflict);
         }
+        let folder = template == super::project_setup::LOCAL_FOLDER_TEMPLATE;
+        if generation != receipt.generation {
+            // A repeated lost-folder report is harmless, but a delayed success
+            // from before that report must never re-enable the workspace.
+            if folder
+                && !receipt.success
+                && generation == receipt.generation.saturating_add(1)
+                && state == "failed"
+                && error == receipt.error
+            {
+                tx.commit()?;
+                return Ok(());
+            }
+            return Err(WorkError::Conflict);
+        }
+        if receipt.success && state == "ready" && error.is_none() {
+            tx.commit()?;
+            return Ok(());
+        }
+        if !receipt.success && state == "failed" && error == receipt.error {
+            tx.commit()?;
+            return Ok(());
+        }
+        if folder {
+            let current:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM shared_project_devices d JOIN shared_projects p ON p.id=d.project_id JOIN shared_environment_projects ep ON ep.project_id=d.project_id AND ep.environment_id=d.environment_id WHERE d.environment_id=?1 AND d.device_id=?2 AND d.can_execute=1 AND p.archived=0 AND p.deleted_at_ms IS NULL)",params![receipt.environment_id,runner],|r|r.get(0))?;
+            if !current {
+                return Err(WorkError::Forbidden);
+            }
+        }
+        if folder && !receipt.success && state == "ready" {
+            if generation >= 1000 {
+                return Err(WorkError::Capacity);
+            }
+            tx.execute("UPDATE shared_provisioning SET state='failed',error=?2,generation=generation+1,updated_at_ms=?3 WHERE environment_id=?1",params![receipt.environment_id,receipt.error,now])?;
+            tx.execute(
+                "UPDATE shared_environments SET enabled=0 WHERE id=?1",
+                [&receipt.environment_id],
+            )?;
+            tx.commit()?;
+            return Ok(());
+        }
+        if state != "pending" && !(folder && state == "failed" && receipt.success) {
+            return Err(WorkError::Conflict);
+        }
+        let next = if receipt.success { "ready" } else { "failed" };
         tx.execute("UPDATE shared_provisioning SET state=?2,error=?3,updated_at_ms=?4 WHERE environment_id=?1",params![receipt.environment_id,next,receipt.error,now])?;
         if receipt.success {
-            tx.execute("UPDATE shared_environments SET enabled=1 WHERE id=?1 AND EXISTS(SELECT 1 FROM shared_project_devices d JOIN shared_projects p ON p.id=d.project_id WHERE d.environment_id=?1 AND d.can_execute=1 AND p.archived=0)",[&receipt.environment_id])?;
+            tx.execute("UPDATE shared_environments SET enabled=1 WHERE id=?1 AND EXISTS(SELECT 1 FROM shared_project_devices d JOIN shared_projects p ON p.id=d.project_id WHERE d.environment_id=?1 AND d.can_execute=1 AND p.archived=0 AND p.deleted_at_ms IS NULL)",[&receipt.environment_id])?;
         }
         tx.commit()?;
         Ok(())
@@ -193,7 +238,11 @@ pub(super) fn enqueue(db: &Connection, request: &ProvisionRequest, now: u64) -> 
     store::id(&request.environment_id)?;
     store::id(&request.template_id)?;
     store::timestamp(now)?;
-    let runner:String=db.query_row("SELECT e.runner_id FROM shared_environments e JOIN shared_runner_templates t ON t.runner_id=e.runner_id AND t.template_id=?2 WHERE e.id=?1",params![request.environment_id,request.template_id],|r|r.get(0)).optional()?.ok_or(WorkError::NotFound)?;
+    let runner: String = if request.template_id == super::project_setup::LOCAL_FOLDER_TEMPLATE {
+        db.query_row("SELECT e.runner_id FROM shared_environments e JOIN shared_project_devices d ON d.environment_id=e.id JOIN shared_projects p ON p.id=d.project_id WHERE e.id=?1 AND d.can_execute=1 AND p.archived=0 AND p.deleted_at_ms IS NULL",[&request.environment_id],|r|r.get(0)).optional()?.ok_or(WorkError::NotFound)?
+    } else {
+        db.query_row("SELECT e.runner_id FROM shared_environments e JOIN shared_runner_templates t ON t.runner_id=e.runner_id AND t.template_id=?2 WHERE e.id=?1",params![request.environment_id,request.template_id],|r|r.get(0)).optional()?.ok_or(WorkError::NotFound)?
+    };
     let previous: Option<(String, u64, String)> = db
         .query_row(
             "SELECT template_id,generation,state FROM shared_provisioning WHERE environment_id=?1",

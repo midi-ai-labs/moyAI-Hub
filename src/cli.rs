@@ -8,11 +8,11 @@ Usage: moyai-hub [--data-dir PATH] [--web-port PORT | --web-settings FILE]\n\
        moyai-hub --status [--data-dir PATH]\n\
        moyai-hub --stop [--data-dir PATH]\n\n\
 Starts Web management automatically. First start: http://127.0.0.1:9080/admin/\n\
-Web management requires administrator login. Device mTLS is separate.\n\
+Use --launch to open authenticated management on this PC, or open it from an approved administrator device. No Hub ID/password is required.\n\
 --web-port PORT       Local HTTP port (0 selects a free port); saves on success.\n\
 --web-settings FILE   JSON Web settings; see docs/web-management.md for LAN/TLS.\n\
 --data-dir PATH       Hub data directory; MOYAI_HUB_DATA_DIR also supported.\n\
---launch              Start in the background, resume saved hosting, open browser.\n\
+--launch              Resume saved hosting, check inbound rules, open browser.\n\
 --no-browser          With --launch, print the result without opening a browser.\n\
 --status             Print current Web URLs and running state; never starts Hub.\n\
 --stop               Stop this data directory's Hub and its Gateway.\n\
@@ -296,6 +296,7 @@ pub async fn run(action: Action) -> Result<(), String> {
                         .as_str()
                         .ok_or("管理画面の認証を準備できません。")?,
                     report.already_running,
+                    report.firewall_status,
                 )?;
             }
             if let Some(error) = report.network_error {
@@ -307,6 +308,14 @@ pub async fn run(action: Action) -> Result<(), String> {
                 eprintln!(
                     "Web管理が利用できます。初回だけ端末ネットワークのIP・ポートを設定して開始してください。次回から同じ設定で再開します。"
                 );
+            }
+            if report.firewall_status.requires_setup() {
+                eprintln!(
+                    "Hub・Gatewayは起動しています。別のPCへ接続ファイルを渡す前に、管理画面の「Windowsで受信を許可」で設定を確認してください。Windowsの設定は自動変更していません。"
+                );
+                if let Some(error) = report.firewall_error {
+                    eprintln!("受信許可の確認: {error}");
+                }
             }
             Ok(())
         }

@@ -18,6 +18,14 @@ pub(super) fn routes() -> Router<ApiState> {
             get(runner_asset),
         )
         .route(
+            "/v1/shared/runner/attempts/{attempt}/children/{child}/artifacts",
+            get(runner_child_artifacts),
+        )
+        .route(
+            "/v1/shared/runner/attempts/{attempt}/children/{child}/artifacts/{id}",
+            get(runner_child_artifact),
+        )
+        .route(
             "/v1/shared/runner/attempts/{id}/archive",
             get(runner_archive),
         )
@@ -131,21 +139,17 @@ async fn runner_upload(
     Path(id): Path<String>,
     Json(upload): Json<RunnerAssetUpload>,
 ) -> ApiResult<Asset> {
-    operation(
-        state,
-        device.clone(),
-        DeviceAccess::Settlement,
-        move |store| {
-            let result = store.runner_upload_asset(
-                &device.device_id,
-                &id,
-                &upload,
-                crate::service::now_ms(),
-            )?;
-            store.observe_attempt(&device.device_id, &id, crate::service::now_ms())?;
-            Ok(result)
-        },
-    )
+    let access = if upload.kind == "input" {
+        DeviceAccess::NewUsage
+    } else {
+        DeviceAccess::Settlement
+    };
+    operation(state, device.clone(), access, move |store| {
+        let result =
+            store.runner_upload_asset(&device.device_id, &id, &upload, crate::service::now_ms())?;
+        store.observe_attempt(&device.device_id, &id, crate::service::now_ms())?;
+        Ok(result)
+    })
     .await
 }
 async fn runner_asset(
@@ -159,6 +163,58 @@ async fn runner_asset(
         DeviceAccess::NewUsage,
         move |store| {
             let result = store.runner_asset(&device.device_id, &attempt, &id)?;
+            store.observe_attempt(&device.device_id, &attempt, crate::service::now_ms())?;
+            Ok(result)
+        },
+    )
+    .await
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChildArtifactsQuery {
+    generation: u64,
+}
+async fn runner_child_artifacts(
+    State(state): State<ApiState>,
+    Extension(device): Extension<DeviceIdentity>,
+    Path((attempt, child)): Path<(String, String)>,
+    Query(input): Query<ChildArtifactsQuery>,
+) -> ApiResult<Value> {
+    operation(
+        state,
+        device.clone(),
+        DeviceAccess::NewUsage,
+        move |store| {
+            let items = store.runner_child_artifacts(
+                &device.device_id,
+                &attempt,
+                input.generation,
+                &child,
+            )?;
+            store.observe_attempt(&device.device_id, &attempt, crate::service::now_ms())?;
+            Ok(json!({"items":items}))
+        },
+    )
+    .await
+}
+async fn runner_child_artifact(
+    State(state): State<ApiState>,
+    Extension(device): Extension<DeviceIdentity>,
+    Path((attempt, child, id)): Path<(String, String, String)>,
+    Query(input): Query<ChildArtifactsQuery>,
+) -> ApiResult<AssetDownload> {
+    operation(
+        state,
+        device.clone(),
+        DeviceAccess::NewUsage,
+        move |store| {
+            let result = store.runner_child_artifact(
+                &device.device_id,
+                &attempt,
+                input.generation,
+                &child,
+                &id,
+            )?;
             store.observe_attempt(&device.device_id, &attempt, crate::service::now_ms())?;
             Ok(result)
         },

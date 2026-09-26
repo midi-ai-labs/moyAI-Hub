@@ -161,13 +161,18 @@ async fn refresh_presence(
         let deployments = core
             .routing_deployments(&request.id, &context, now_ms())
             .map_err(|error| core_failure(error, core.catalog_store().revision))?;
-        let mut groups: BTreeMap<(String, String), Vec<Deployment>> = BTreeMap::new();
+        let mut groups: BTreeMap<(String, String, Option<String>), Vec<Deployment>> =
+            BTreeMap::new();
         for row in deployments
             .into_iter()
             .filter(|row| row.enabled && core.needs_presence_refresh(&row.id, now_ms()))
         {
             groups
-                .entry((row.endpoint.clone(), row.provider_profile.clone()))
+                .entry((
+                    row.endpoint.clone(),
+                    row.provider_profile.clone(),
+                    row.upstream_credential_id.clone(),
+                ))
                 .or_default()
                 .push(row);
         }
@@ -176,8 +181,16 @@ async fn refresh_presence(
     let mut tasks = tokio::task::JoinSet::new();
     // One prepare does at most four bounded metadata reads. Later prepares continue with
     // remaining stale hosts; no generation payload enters this process.
-    for ((endpoint, profile), rows) in groups.into_iter().take(4) {
-        tasks.spawn(async move { (rows, crate::discovery::discover(&endpoint, &profile).await) });
+    for (_, rows) in groups.into_iter().take(4) {
+        let directory = state
+            .gateway
+            .as_ref()
+            .and_then(|gateway| gateway.credential_directory.clone());
+        tasks.spawn(async move {
+            let result =
+                crate::discovery::discover_deployment(&rows[0], directory.as_deref()).await;
+            (rows, result)
+        });
     }
     while let Some(result) = tasks.join_next().await {
         let (rows, discovered) = result.map_err(|_| failed())?;

@@ -50,6 +50,7 @@ enum StartupError {
 
 #[derive(Clone)]
 pub struct GatewayControl {
+    pub(crate) credential_directory: Option<PathBuf>,
     base_url: String,
     token: String,
     client: reqwest::Client,
@@ -77,6 +78,7 @@ impl GatewayControl {
             return Err("Gateway の待受先または認証が無効です。".into());
         }
         Ok(Self {
+            credential_directory: None,
             base_url: base_url.trim_end_matches('/').into(),
             network_base_url: None,
             token,
@@ -279,6 +281,7 @@ impl GatewayProcess {
             .and_then(Value::as_str)
             .ok_or("Gateway の待受先がありません。")?;
         let mut control = GatewayControl::for_loopback(base.into(), secret)?;
+        control.credential_directory = Some(directory.to_path_buf());
         if let Some(base) = value.get("network_base_url").and_then(Value::as_str) {
             control = control.with_network_base_url(base.into())?;
         }
@@ -354,8 +357,9 @@ pub async fn run_companion() -> Result<(), io::Error> {
     fs2::FileExt::try_lock_exclusive(&_lock)?;
     // Legacy gateway-uncertain.json is retained as historical data, but is not
     // evidence about provider activity and must not gate this process's startup.
-    let gateway = Gateway::new(init.hub_url, init.control_token)
-        .map_err(|_| io::Error::other("gateway client unavailable"))?;
+    let gateway =
+        Gateway::new_with_credentials(init.hub_url, init.control_token, Some(init.data_directory))
+            .map_err(|_| io::Error::other("gateway client unavailable"))?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let base_url = format!("http://{}/", listener.local_addr()?);
     // Bind and validate every listener before starting either admission loop.

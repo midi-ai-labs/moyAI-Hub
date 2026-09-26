@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { test, expect } from "./fixture.mjs";
+import { freePort } from "./hub_server.mjs";
 
 test("Authenticated browser manages the real Hub without a native app", { tag: "@smoke" }, async ({ page, hub }, testInfo) => {
     const pageErrors = [];
@@ -62,7 +63,9 @@ test("Authenticated browser manages the real Hub without a native app", { tag: "
     await page.getByRole("button", { name: "Hub本体へ再接続", exact: true }).click();
     await expect(page.locator("#shared-admin-content")).toContainText(project);
     await page.locator("#manual-server-connection > summary").click();
-    await page.locator("#bind").fill(`127.0.0.1:${hub.networkPort}`);
+    let manualPort = await freePort();
+    while (manualPort === hub.networkPort) manualPort = await freePort();
+    await page.locator("#bind").fill(`127.0.0.1:${manualPort}`);
     await page.locator("#generate-token").click();
     await page.locator("#start-server").click();
     await expect(page.locator("#stop-server")).toBeVisible();

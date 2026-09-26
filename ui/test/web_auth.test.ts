@@ -19,6 +19,16 @@ test("expired access directs the user to reopen management without displaying a 
   assert.doesNotMatch(authenticationError(new Error("access=confidential-value")), /confidential-value/);
 });
 
+test("startup retains only the allowlisted firewall section after removing the ticket", () => {
+  const urls: string[] = [];
+  const history = { replaceState: (_state: unknown, _unused: string, url: string | URL | null | undefined) => urls.push(String(url)) };
+  const location = {hash:"#access=secret&notice=hub-started&section=network-step-firewall",pathname:"/admin/",search:""};
+  assert.equal(consumeAccessTicket(location,history),"secret");
+  assert.equal(urls[0],"/admin/#network-step-firewall");
+  consumeAccessTicket({...location,hash:"#access=other&section=https://outside.example"},history);
+  assert.equal(urls[1],"/admin/");
+});
+
 test("a new fragment ticket opens the existing tab and supersedes an older pending exchange", async () => {
   class NodeFixture {
     hidden = false; inert = false; className = ""; disabled = false; textContent = "";

@@ -165,7 +165,7 @@ fn joining_pc_adds_only_reviewed_purposes_without_granting_people_or_replacing_o
     );
     assert_eq!(
         f.work.device_projects("WinB").unwrap()["projects"][0]["preparation_state"],
-        "waiting_setup"
+        "waiting_local_folder"
     );
     f.work.manage(&f.admin, &command, 51).unwrap();
     let mut changed = command.clone();
@@ -213,6 +213,283 @@ fn save(
 }
 
 #[test]
+fn leaving_and_rejoining_changes_participation_and_execution_workspace() {
+    let mut f = Fixture::new();
+    save(&mut f, "new-a", &["WinA"], &["WinB"]);
+    let first = f.work.pending_provision("WinB").unwrap().remove(0);
+    f.work
+        .provision_receipt(
+            "WinB",
+            &ProvisionReceipt {
+                environment_id: first.environment_id.clone(),
+                template_id: first.template_id.clone(),
+                generation: first.generation,
+                success: true,
+                error: None,
+            },
+            41,
+        )
+        .unwrap();
+    let submit = SubmitJob {
+        request_id: "before-leave".into(),
+        project_id: "new-a".into(),
+        project_participation: Some(1),
+        conversation_id: None,
+        revises_job_id: None,
+        expected_revised_revision: None,
+        environment_id: String::new(),
+        origin_session_ref: None,
+        origin_turn_ref: None,
+        origin_turn_epoch: None,
+        title: "before leave".into(),
+        input: json!({"prompt":"work"}),
+        descendant_budget: 0,
+        start_before_ms: None,
+    };
+    let initial = f
+        .work
+        .submit_for_device(&f.alice, &submit, 42, Some("WinA"))
+        .unwrap();
+    assert_eq!(initial.environment_id, first.environment_id);
+    f.work.leave_project("new-a", "WinA", 1, 43).unwrap();
+    assert_eq!(
+        f.work.job(&f.alice, &initial.id).unwrap().state,
+        JobState::Cancelled
+    );
+    assert!(matches!(
+        f.work
+            .submit_for_device(&f.alice, &submit, 44, Some("WinA")),
+        Err(WorkError::Forbidden)
+    ));
+    save(&mut f, "new-a", &["WinA"], &["WinB"]);
+    let win_a = f.work.device_projects("WinA").unwrap();
+    assert_eq!(win_a["projects"][0]["participation_generation"], 2);
+    assert!(matches!(
+        f.work.submit_for_device(
+            &f.alice,
+            &SubmitJob {
+                request_id: "stale-participation".into(),
+                ..submit.clone()
+            },
+            45,
+            Some("WinA")
+        ),
+        Err(WorkError::Conflict)
+    ));
+    assert!(matches!(
+        f.work.leave_project("new-a", "WinA", 1, 46),
+        Err(WorkError::Conflict)
+    ));
+    let current = f
+        .work
+        .submit_for_device(
+            &f.alice,
+            &SubmitJob {
+                request_id: "after-rejoin".into(),
+                project_participation: Some(2),
+                ..submit
+            },
+            47,
+            Some("WinA"),
+        )
+        .unwrap();
+    assert_eq!(current.environment_id, first.environment_id);
+
+    f.work.leave_project("new-a", "WinB", 1, 48).unwrap();
+    assert_eq!(
+        f.work.job(&f.alice, &current.id).unwrap().state,
+        JobState::Cancelled
+    );
+    save(&mut f, "new-a", &["WinA"], &["WinB"]);
+    let new = f.work.pending_provision("WinB").unwrap().remove(0);
+    assert_ne!(new.environment_id, first.environment_id);
+    assert_eq!(
+        f.work.device_projects("WinB").unwrap()["projects"][0]["participation_generation"],
+        2
+    );
+    f.work
+        .provision_receipt(
+            "WinB",
+            &ProvisionReceipt {
+                environment_id: first.environment_id,
+                template_id: first.template_id,
+                generation: first.generation,
+                success: true,
+                error: None,
+            },
+            49,
+        )
+        .unwrap();
+    let retired = f
+        .work
+        .runner_environments("WinB")
+        .unwrap()
+        .into_iter()
+        .find(|row| row.environment.id == initial.environment_id)
+        .unwrap();
+    assert!(!retired.enabled);
+    assert!(retired.environment.project_ids.is_empty());
+}
+
+#[test]
+fn missing_local_folder_disables_execution_until_explicit_rebind() {
+    let mut f = Fixture::new();
+    save(&mut f, "new-a", &["WinA"], &["WinB"]);
+    let initial = f.work.pending_provision("WinB").unwrap().remove(0);
+    let ready = ProvisionReceipt {
+        environment_id: initial.environment_id.clone(),
+        template_id: initial.template_id.clone(),
+        generation: initial.generation,
+        success: true,
+        error: None,
+    };
+    f.work.provision_receipt("WinB", &ready, 41).unwrap();
+    f.work
+        .provision_receipt(
+            "WinB",
+            &ProvisionReceipt {
+                success: false,
+                error: Some("folder missing".into()),
+                ..ready.clone()
+            },
+            42,
+        )
+        .unwrap();
+    let pending = f.work.pending_provision("WinB").unwrap().remove(0);
+    assert_eq!(pending.state.as_deref(), Some("failed"));
+    assert_eq!(pending.generation, initial.generation + 1);
+    assert!(!f.work.runner_environments("WinB").unwrap()[0].enabled);
+    assert!(matches!(
+        f.work.provision_receipt("WinB", &ready, 43),
+        Err(WorkError::Conflict)
+    ));
+    let rebound = ProvisionReceipt {
+        generation: pending.generation,
+        ..ready
+    };
+    f.work.provision_receipt("WinB", &rebound, 44).unwrap();
+    assert!(f.work.runner_environments("WinB").unwrap()[0].enabled);
+    f.work
+        .db
+        .execute(
+            "UPDATE shared_environments SET enabled=0 WHERE id=?1",
+            [&initial.environment_id],
+        )
+        .unwrap();
+    f.work.provision_receipt("WinB", &rebound, 45).unwrap();
+    assert!(!f.work.runner_environments("WinB").unwrap()[0].enabled);
+    save(&mut f, "new-a", &["WinA"], &["WinB"]);
+    assert!(!f.work.runner_environments("WinB").unwrap()[0].enabled);
+}
+
+#[test]
+fn deleting_used_project_revokes_roles_and_stops_work_without_dropping_audit() {
+    let mut f = Fixture::new();
+    save(&mut f, "new-a", &["WinA"], &["WinB"]);
+    let request = f.work.pending_provision("WinB").unwrap().remove(0);
+    f.work
+        .provision_receipt(
+            "WinB",
+            &ProvisionReceipt {
+                environment_id: request.environment_id.clone(),
+                template_id: request.template_id,
+                generation: request.generation,
+                success: true,
+                error: None,
+            },
+            41,
+        )
+        .unwrap();
+    let job = f
+        .work
+        .submit_for_device(
+            &f.alice,
+            &SubmitJob {
+                request_id: "used-project".into(),
+                project_id: "new-a".into(),
+                project_participation: Some(1),
+                conversation_id: None,
+                revises_job_id: None,
+                expected_revised_revision: None,
+                environment_id: String::new(),
+                origin_session_ref: None,
+                origin_turn_ref: None,
+                origin_turn_epoch: None,
+                title: "ongoing".into(),
+                input: json!({"prompt":"work"}),
+                descendant_budget: 0,
+                start_before_ms: None,
+            },
+            42,
+            Some("WinA"),
+        )
+        .unwrap();
+    let attempt = f.work.claim("WinB", 43).unwrap().unwrap();
+    let revision = f.work.management_snapshot(&f.admin).unwrap()["revision"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    f.work
+        .manage(
+            &f.admin,
+            &ManagementCommand {
+                request_id: "delete-used-project".into(),
+                expected_revision: revision,
+                request: ManagementRequest::DeleteProject { id: "new-a".into() },
+            },
+            44,
+        )
+        .unwrap();
+    assert_eq!(
+        f.work
+            .attempt("WinB", &attempt.attempt_id)
+            .unwrap()
+            .assignment
+            .stop_requested,
+        true
+    );
+    assert!(
+        f.work.device_projects("WinA").unwrap()["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["id"] != "new-a")
+    );
+    assert!(
+        f.work.management_snapshot(&f.admin).unwrap()["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["id"] != "new-a")
+    );
+    f.report(
+        &attempt,
+        "stopped-after-project-delete",
+        ReportOutcome::Finished {
+            success: false,
+            result: json!({"stopped":true}),
+            resources_released: true,
+        },
+    );
+    let stored: String = f
+        .work
+        .db
+        .query_row(
+            "SELECT state FROM shared_jobs WHERE id=?1",
+            [&job.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, "cancelled");
+    assert!(f.work.job(&f.alice, &job.id).is_err());
+    assert!(
+        f.work
+            .create_project(&f.admin, "new-a", "recreated")
+            .is_err()
+    );
+}
+
+#[test]
 fn project_setup_waits_for_pc_and_reuses_one_physical_resource_across_projects() {
     let mut f = Fixture::new();
     let command = save(&mut f, "new-a", &["WinA", "WinZ"], &["WinZ"]);
@@ -223,8 +500,8 @@ fn project_setup_waits_for_pc_and_reuses_one_physical_resource_across_projects()
         .iter()
         .find(|r| r["id"] == "new-a")
         .unwrap();
-    assert_eq!(row["preparation_state"], "waiting_setup");
-    assert_eq!(row["environment_id"], Value::Null);
+    assert_eq!(row["preparation_state"], "waiting_local_folder");
+    assert!(row["environment_id"].is_string());
     f.work
         .publish_templates(
             "WinZ",
@@ -236,13 +513,15 @@ fn project_setup_waits_for_pc_and_reuses_one_physical_resource_across_projects()
         )
         .unwrap();
     let request = f.work.pending_provision("WinZ").unwrap().remove(0);
+    assert_eq!(request.template_id, "local-folder");
+    assert_eq!(request.state.as_deref(), Some("pending"));
     assert_eq!(
         f.work
             .status_for_device(&f.alice, "new-a", None, 10, None, Some("WinA"))
             .unwrap()
             .execution_devices[0]
             .preparation_state,
-        "pending"
+        "waiting_local_folder"
     );
     assert!(!f.work.runner_environments("WinZ").unwrap()[0].enabled);
     f.work
@@ -307,13 +586,13 @@ fn project_status_shows_assigned_executor_before_initial_setup() {
         .work
         .status_for_device(&f.alice, "new-a", None, 10, None, Some("WinA"))
         .unwrap();
-    assert!(status.environments.is_empty());
+    assert_eq!(status.environments.len(), 1);
     let json = serde_json::to_value(status).unwrap();
     assert_eq!(json["execution_devices"][0]["device_id"], "WinZ");
-    assert_eq!(json["execution_devices"][0]["environment_id"], Value::Null);
+    assert!(json["execution_devices"][0]["environment_id"].is_string());
     assert_eq!(
         json["execution_devices"][0]["preparation_state"],
-        "waiting_setup"
+        "waiting_local_folder"
     );
     assert!(
         f.work
@@ -343,8 +622,8 @@ fn project_setup_revoke_keeps_history_binding_and_stale_ready_does_not_reenable_
     save(&mut f, "new-a", &["WinA"], &["WinZ"]);
     let request = f.work.pending_provision("WinZ").unwrap().remove(0);
     save(&mut f, "new-a", &["WinB"], &[]);
-    f.work
-        .provision_receipt(
+    assert!(matches!(
+        f.work.provision_receipt(
             "WinZ",
             &ProvisionReceipt {
                 environment_id: request.environment_id,
@@ -354,8 +633,9 @@ fn project_setup_revoke_keeps_history_binding_and_stale_ready_does_not_reenable_
                 error: None,
             },
             60,
-        )
-        .unwrap();
+        ),
+        Err(WorkError::Forbidden)
+    ));
     let environments = f.work.runner_environments("WinZ").unwrap();
     assert_eq!(environments.len(), 1);
     assert!(!environments[0].enabled);
@@ -542,7 +822,14 @@ fn project_setup_archive_preserves_selected_pc_history_and_cancellation_but_bloc
                 &SubmitJob {
                     request_id: "after-archive".into(),
                     project_id: "alpha".into(),
+                    project_participation: None,
+                    conversation_id: None,
+                    revises_job_id: None,
+                    expected_revised_revision: None,
                     environment_id: "solver".into(),
+                    origin_session_ref: None,
+                    origin_turn_ref: None,
+                    origin_turn_epoch: None,
                     title: "new".into(),
                     input: json!({}),
                     descendant_budget: 0,
@@ -654,7 +941,7 @@ fn project_setup_legacy_environment_edits_cannot_override_managed_pc_purposes() 
 }
 
 #[test]
-fn project_setup_resolving_a_legacy_ambiguity_clears_only_its_setup_error() {
+fn project_setup_uses_a_fresh_folder_binding_without_adopting_ambiguous_legacy_environments() {
     let mut f = Fixture::new();
     f.work
         .register_environment(
@@ -679,7 +966,10 @@ fn project_setup_resolving_a_legacy_ambiguity_clears_only_its_setup_error() {
             .unwrap()
             .clone()
     };
-    assert_eq!(row(&f)["preparation_state"], "failed");
+    let new_environment = row(&f)["environment_id"].as_str().unwrap().to_owned();
+    assert_ne!(new_environment, "solver");
+    assert_ne!(new_environment, "extra");
+    assert_eq!(row(&f)["preparation_state"], "waiting_local_folder");
     let command = ManagementCommand {
         request_id: "remove-ambiguity".into(),
         expected_revision: f.work.management_snapshot(&f.admin).unwrap()["revision"]
@@ -690,8 +980,8 @@ fn project_setup_resolving_a_legacy_ambiguity_clears_only_its_setup_error() {
     };
     f.work.manage(&f.admin, &command, 41).unwrap();
     save(&mut f, "alpha", &["WinA"], &["WinE"]);
-    assert_eq!(row(&f)["environment_id"], "solver");
-    assert_eq!(row(&f)["preparation_state"], "ready");
+    assert_eq!(row(&f)["environment_id"], new_environment);
+    assert_eq!(row(&f)["preparation_state"], "waiting_local_folder");
     assert_eq!(row(&f)["error"], Value::Null);
 }
 

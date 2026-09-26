@@ -2,7 +2,7 @@ use crate::protocol::{Availability, HubError};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 pub const MAX_CATALOG_ENTRIES: usize = 1024;
 pub const MAX_LOGICAL_MODELS: usize = 128;
 const MAX_CHANGES: usize = 64;
@@ -26,6 +26,9 @@ pub struct Deployment {
     pub endpoint: String,
     pub provider_model: String,
     pub provider_profile: String,
+    /// Opaque reference to a Hub-local, protected credential. Never the API key itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_credential_id: Option<String>,
     pub enabled: bool,
 }
 
@@ -118,7 +121,14 @@ impl CatalogStore {
     }
 
     pub fn validate(&self) -> Result<(), HubError> {
-        let legacy = self.schema_version == 1 && self.catalog.team_default_model_id.is_none();
+        let no_credentials = self
+            .catalog
+            .deployments
+            .iter()
+            .all(|deployment| deployment.upstream_credential_id.is_none());
+        let legacy = no_credentials
+            && (self.schema_version == 2
+                || (self.schema_version == 1 && self.catalog.team_default_model_id.is_none()));
         if (!legacy && self.schema_version != SCHEMA_VERSION) || self.revision == 0 {
             return Err(invalid("unsupported schema or invalid revision"));
         }
@@ -168,8 +178,10 @@ impl CatalogStore {
     }
 
     pub fn replace_catalog(&mut self, catalog: Catalog, now_ms: u64) -> Result<u64, HubError> {
+        self.validate()?;
         catalog.validate()?;
-        if self.catalog == catalog {
+        let schema_changed = self.schema_version != SCHEMA_VERSION;
+        if self.catalog == catalog && !schema_changed {
             return Ok(self.revision);
         }
         let revision = self.next_revision()?;
@@ -204,7 +216,7 @@ impl CatalogStore {
             policy_changed: before.policy != catalog.policy
                 || before.capacity_pools != catalog.capacity_pools
                 || before.team_default_model_id != catalog.team_default_model_id,
-            software_changed: false,
+            software_changed: schema_changed,
         };
         self.catalog = catalog;
         self.schema_version = SCHEMA_VERSION;
@@ -272,6 +284,13 @@ impl Catalog {
             valid_text(&deployment.label, 256)?;
             valid_text(&deployment.provider_model, 256)?;
             valid_text(&deployment.endpoint, 2048)?;
+            if deployment
+                .upstream_credential_id
+                .as_ref()
+                .is_some_and(|id| ulid::Ulid::from_string(id).is_err())
+            {
+                return Err(invalid("invalid upstream credential reference"));
+            }
             let endpoint = reqwest::Url::parse(&deployment.endpoint)
                 .map_err(|_| invalid("invalid endpoint URL"))?;
             if !matches!(endpoint.scheme(), "http" | "https")

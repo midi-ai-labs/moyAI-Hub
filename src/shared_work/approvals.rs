@@ -151,6 +151,15 @@ fn view(db: &Connection, actor: &Principal, record: Record, now: u64) -> Result<
     })
 }
 
+pub(super) fn view_by_id(
+    db: &Connection,
+    actor: &Principal,
+    id: &str,
+    now: u64,
+) -> Result<ApprovalView> {
+    view(db, actor, load(db, id)?, now)
+}
+
 pub(super) fn record_request(
     db: &Connection,
     attempt: &str,
@@ -227,7 +236,7 @@ impl SharedWork {
     ) -> Result<Option<ApprovalView>> {
         self.job(actor, job_id)?;
         let id:Option<String>=self.db.query_row("SELECT p.id FROM shared_approvals p JOIN shared_attempts a ON a.id=p.attempt_id WHERE a.job_id=?1 ORDER BY p.created_at_ms DESC,p.id DESC LIMIT 1",[job_id],|r|r.get(0)).optional()?;
-        id.map(|id| view(&self.db, actor, load(&self.db, &id)?, now))
+        id.map(|id| view_by_id(&self.db, actor, &id, now))
             .transpose()
     }
 

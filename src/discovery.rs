@@ -78,6 +78,36 @@ pub fn normalize_endpoint(raw: &str) -> Result<String, String> {
 }
 
 pub async fn discover(raw: &str, profile: &str) -> Result<Discovery, DiscoveryError> {
+    discover_authenticated(raw, profile, None).await
+}
+
+pub async fn discover_deployment(
+    deployment: &crate::catalog::Deployment,
+    directory: Option<&std::path::Path>,
+) -> Result<Discovery, DiscoveryError> {
+    let authorization = if deployment.upstream_credential_id.is_some() {
+        crate::upstream_auth::resolve(
+            directory.ok_or("HubのAPIキー保存先を確認できません。")?,
+            deployment.upstream_credential_id.as_deref(),
+            &deployment.endpoint,
+            &deployment.provider_profile,
+        )?
+    } else {
+        None
+    };
+    discover_authenticated(
+        &deployment.endpoint,
+        &deployment.provider_profile,
+        authorization,
+    )
+    .await
+}
+
+pub async fn discover_authenticated(
+    raw: &str,
+    profile: &str,
+    authorization: Option<reqwest::header::HeaderValue>,
+) -> Result<Discovery, DiscoveryError> {
     let endpoint = normalize_endpoint(raw)?;
     let path = crate::provider::ProviderProfile::parse(profile)
         .ok_or("この接続方式は利用できません。")?
@@ -89,19 +119,19 @@ pub async fn discover(raw: &str, profile: &str) -> Result<Discovery, DiscoveryEr
         .timeout(Duration::from_secs(8))
         .build()
         .map_err(|_| "モデル確認を開始できません。")?;
-    let mut response = client
-        .get(format!("{endpoint}/{path}"))
-        .send()
-        .await
-        .map_err(|error| DiscoveryError {
-            availability: if error.is_connect() {
-                Availability::Offline
-            } else {
-                Availability::Unknown
-            },
-            message: "接続・受信を完了できません。ホストの起動状態・アドレスを確認してください。"
-                .into(),
-        })?;
+    let mut request = client.get(format!("{endpoint}/{path}"));
+    if let Some(authorization) = authorization {
+        request = request.header(reqwest::header::AUTHORIZATION, authorization);
+    }
+    let mut response = request.send().await.map_err(|error| DiscoveryError {
+        availability: if error.is_connect() {
+            Availability::Offline
+        } else {
+            Availability::Unknown
+        },
+        message: "接続・受信を完了できません。ホストの起動状態・アドレスを確認してください。"
+            .into(),
+    })?;
     if !response.status().is_success() {
         return Err(format!(
             "モデル一覧を取得できません（HTTP {}）。接続方式と認証要否を確認してください。",

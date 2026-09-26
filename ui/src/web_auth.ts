@@ -10,7 +10,8 @@ export function consumeAccessTicket(
     if (!fragment.has("access")) return null;
     const ticket = fragment.get("access") ?? "";
     const notice = fragment.get("notice");
-    const retained = notice === "hub-started" || notice === "hub-already-running" ? `#${notice}` : "";
+    const retained = fragment.get("section") === "network-step-firewall" ? "#network-step-firewall"
+        : notice === "hub-started" || notice === "hub-already-running" ? `#${notice}` : "";
     history.replaceState(null, "", `${location.pathname}${location.search}${retained}`);
     return ticket;
 }

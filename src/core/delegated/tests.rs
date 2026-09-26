@@ -20,6 +20,7 @@ fn fixture() -> (HubCore, Selection) {
                     endpoint: "http://127.0.0.1:1234".into(),
                     provider_model: "model".into(),
                     provider_profile: "openai_compatible_chat".into(),
+                    upstream_credential_id: None,
                     enabled: true,
                 }],
                 capacity_pools: vec![CapacityPool {

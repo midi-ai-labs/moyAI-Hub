@@ -23,6 +23,7 @@ fn fixture() -> HubCore {
                 endpoint: "http://127.0.0.1:1234/v1".into(),
                 provider_model: id.into(),
                 provider_profile: "openai_compatible_chat".into(),
+                upstream_credential_id: None,
                 enabled: true,
             })
             .collect(),

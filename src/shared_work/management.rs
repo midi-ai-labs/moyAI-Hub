@@ -135,6 +135,10 @@ pub enum ManagementRequest {
         enabled: bool,
         project_ids: Vec<String>,
     },
+    SetEnvironmentCapabilities {
+        environment_id: String,
+        names: Vec<String>,
+    },
     DeleteEnvironment {
         id: String,
     },
@@ -167,6 +171,16 @@ fn rows(
         .prepare(sql)?
         .query_map([], read)?
         .collect::<std::result::Result<_, _>>()?)
+}
+pub(super) fn declared_capabilities(db: &Connection, environment: &str) -> Result<Vec<Value>> {
+    let mut stmt = db.prepare(
+        "SELECT name FROM shared_environment_capabilities WHERE environment_id=?1 ORDER BY name LIMIT 32",
+    )?;
+    Ok(stmt
+        .query_map([environment], |r| {
+            Ok(json!({"name":r.get::<_,String>(0)?,"source":"declared","observed_at_ms":null}))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?)
 }
 fn maintenance(db: &Connection, before: Option<&str>, limit: u32) -> Result<Value> {
     if !(1..=128).contains(&limit) {
@@ -210,7 +224,7 @@ fn snapshot(db: &Connection, actor: &Principal) -> Result<Value> {
     )?;
     let projects = rows(
         db,
-        "SELECT id,label,archived,legacy_devices_unrestricted FROM shared_projects ORDER BY id",
+        "SELECT id,label,archived,legacy_devices_unrestricted FROM shared_projects WHERE deleted_at_ms IS NULL ORDER BY id",
         |r| {
             Ok(
                 json!({"id":r.get::<_,String>(0)?,"label":r.get::<_,String>(1)?,"archived":r.get::<_,bool>(2)?,"legacy_devices_unrestricted":r.get::<_,bool>(3)?}),
@@ -240,7 +254,7 @@ fn snapshot(db: &Connection, actor: &Principal) -> Result<Value> {
         "SELECT id,capacity FROM shared_resources ORDER BY id",
         |r| Ok(json!({"id":r.get::<_,String>(0)?,"capacity":r.get::<_,u32>(1)?})),
     )?;
-    let environments = rows(
+    let mut environments = rows(
         db,
         "SELECT e.id,e.label,e.resource_id,e.runner_id,e.enabled,(SELECT json_group_array(project_id) FROM (SELECT project_id FROM shared_environment_projects WHERE environment_id=e.id ORDER BY project_id)) FROM shared_environments e ORDER BY e.id",
         |r| {
@@ -249,6 +263,11 @@ fn snapshot(db: &Connection, actor: &Principal) -> Result<Value> {
             )
         },
     )?;
+    for environment in &mut environments {
+        if let Some(id) = environment["id"].as_str() {
+            environment["capabilities"] = json!(declared_capabilities(db, id)?);
+        }
+    }
     let maintenance = maintenance(db, None, 128)?;
     let templates = rows(
         db,
@@ -339,7 +358,7 @@ fn exists(db: &Connection, table: &str, id: &str) -> Result<()> {
     }
     Ok(())
 }
-fn capacity(db: &Connection, table: &str, limit: u32) -> Result<()> {
+pub(super) fn capacity(db: &Connection, table: &str, limit: u32) -> Result<()> {
     let count: u32 = db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
     if count >= limit {
         Err(WorkError::Capacity)
@@ -551,6 +570,7 @@ impl SharedWork {
                                 environment_id,
                                 template_id,
                                 generation,
+                                state: None,
                             },
                             now,
                         )?;
@@ -676,25 +696,26 @@ impl SharedWork {
             } => {
                 super::store::label(label)?;
                 changed(tx.execute(
-                    "UPDATE shared_projects SET label=?2,archived=?3 WHERE id=?1",
+                    "UPDATE shared_projects SET label=?2,archived=?3 WHERE id=?1 AND deleted_at_ms IS NULL",
                     params![id, label, archived],
                 )?)?;
             }
             DeleteProject { id } => {
-                no_reference(
-                    &tx,
-                    "SELECT EXISTS(SELECT 1 FROM shared_jobs WHERE project_id=?1)",
-                    id,
-                )?;
+                super::store::id(id)?;
+                let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM shared_projects WHERE id=?1 AND deleted_at_ms IS NULL)",[id],|row|row.get(0))?;
+                if !exists {
+                    return Err(WorkError::NotFound);
+                }
+                super::project_setup::revoke_project_usage(&tx, id, now)?;
                 tx.execute(
                     "DELETE FROM identity_project_memberships WHERE project_id=?1",
                     [id],
                 )?;
                 tx.execute(
-                    "DELETE FROM shared_environment_projects WHERE project_id=?1",
+                    "DELETE FROM identity_group_project_roles WHERE project_id=?1",
                     [id],
                 )?;
-                changed(tx.execute("DELETE FROM shared_projects WHERE id=?1", [id])?)?;
+                changed(tx.execute("UPDATE shared_projects SET archived=1,deleted_at_ms=?2 WHERE id=?1 AND deleted_at_ms IS NULL",params![id,now])?)?;
             }
             ProjectMember {
                 project_id,
@@ -757,6 +778,7 @@ impl SharedWork {
                             environment_id: id.clone(),
                             template_id: template_id.clone(),
                             generation: 0,
+                            state: None,
                         },
                         now,
                     )?;
@@ -793,6 +815,37 @@ impl SharedWork {
                 changed(tx.execute("UPDATE shared_environments SET label=?2,resource_id=?3,runner_id=?4,enabled=?5 WHERE id=?1",params![id,label,resource_id,runner_id,enabled])?)?;
                 environment_projects(&tx, id, project_ids)?;
             }
+            SetEnvironmentCapabilities {
+                environment_id,
+                names,
+            } => {
+                super::store::id(environment_id)?;
+                exists(&tx, "shared_environments", environment_id)?;
+                if names.len() > 32 {
+                    return Err(WorkError::Invalid);
+                }
+                let mut unique = std::collections::BTreeSet::new();
+                for name in names {
+                    if name.trim() != name
+                        || name.is_empty()
+                        || name.len() > 128
+                        || name.chars().any(char::is_control)
+                        || !unique.insert(name)
+                    {
+                        return Err(WorkError::Invalid);
+                    }
+                }
+                tx.execute(
+                    "DELETE FROM shared_environment_capabilities WHERE environment_id=?1",
+                    [environment_id],
+                )?;
+                for name in unique {
+                    tx.execute(
+                        "INSERT INTO shared_environment_capabilities(environment_id,name) VALUES(?1,?2)",
+                        params![environment_id, name],
+                    )?;
+                }
+            }
             DeleteEnvironment { id } => {
                 no_reference(
                     &tx,
@@ -820,6 +873,7 @@ impl SharedWork {
                         environment_id: environment_id.clone(),
                         template_id: template_id.clone(),
                         generation: *generation,
+                        state: None,
                     },
                     now,
                 )?;
@@ -832,7 +886,7 @@ impl SharedWork {
                 if !(1..=128).contains(slots) {
                     return Err(WorkError::Invalid);
                 }
-                let occupied:u32=tx.query_row("SELECT COUNT(*) FROM shared_attempts WHERE resource_id=?1 AND state IN ('assigned','running','stop_requested')",[id],|r|r.get(0))?;
+                let occupied = super::store::resource_occupancy(&tx, id)?;
                 if occupied > *slots {
                     return Err(WorkError::Conflict);
                 }

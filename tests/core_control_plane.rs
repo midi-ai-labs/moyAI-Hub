@@ -26,6 +26,71 @@ fn legacy_catalog_upgrades_without_assuming_a_standard_and_explicit_choice_is_va
     assert!(selected.validate().is_err());
 }
 
+#[test]
+fn schema_two_catalog_upgrades_once_preserving_defaults_models_and_history() {
+    let mut previous = fixture().catalog_store().clone();
+    previous.schema_version = 2;
+    previous.catalog.team_default_model_id = Some("model-b".into());
+    let saved = serde_json::to_string(&previous).unwrap();
+    assert!(!saved.contains("upstream_credential_id"));
+    let mut migrated: CatalogStore = serde_json::from_str(&saved).unwrap();
+    migrated.validate().unwrap();
+    assert!(migrated.reconcile_software("0.1.0", 20).unwrap());
+    assert_eq!(migrated.schema_version, 3);
+    assert_eq!(migrated.hub_id, previous.hub_id);
+    assert_eq!(migrated.catalog, previous.catalog);
+    assert_eq!(migrated.revision, previous.revision + 1);
+    assert_eq!(
+        &migrated.changes[..previous.changes.len()],
+        previous.changes
+    );
+    assert!(migrated.changes.last().unwrap().software_changed);
+    assert!(!migrated.reconcile_software("0.1.0", 21).unwrap());
+    let roundtrip: CatalogStore =
+        serde_json::from_str(&serde_json::to_string(&migrated).unwrap()).unwrap();
+    assert_eq!(roundtrip, migrated);
+    roundtrip.validate().unwrap();
+}
+
+#[test]
+fn catalog_replacement_also_upgrades_legacy_schema_even_when_data_is_unchanged() {
+    for version in [1, 2] {
+        let mut previous = fixture().catalog_store().clone();
+        previous.schema_version = version;
+        let mut migrated = previous.clone();
+        migrated
+            .replace_catalog(previous.catalog.clone(), 20)
+            .unwrap();
+        assert_eq!(migrated.schema_version, SCHEMA_VERSION);
+        assert_eq!(migrated.catalog, previous.catalog);
+        assert_eq!(migrated.revision, previous.revision + 1);
+        assert!(migrated.changes.last().unwrap().software_changed);
+        assert!(!migrated.reconcile_software("0.1.0", 21).unwrap());
+    }
+}
+
+#[test]
+fn legacy_schema_cannot_claim_credentials_and_unknown_schema_is_not_rewritten() {
+    let mut authenticated = fixture().catalog_store().clone();
+    authenticated.catalog.deployments[0].upstream_credential_id =
+        Some(ulid::Ulid::new().to_string());
+    authenticated.validate().unwrap();
+    for version in [1, 2, 0, SCHEMA_VERSION + 1, u32::MAX] {
+        let mut invalid = authenticated.clone();
+        invalid.schema_version = version;
+        assert!(invalid.validate().is_err());
+        let before = invalid.clone();
+        assert!(invalid.reconcile_software("0.1.0", 20).is_err());
+        assert_eq!(invalid, before);
+        assert!(invalid.replace_catalog(before.catalog.clone(), 21).is_err());
+        assert_eq!(invalid, before);
+    }
+    let mut future = fixture().catalog_store().clone();
+    future.schema_version = SCHEMA_VERSION + 1;
+    assert!(future.validate().is_err());
+    assert!(HubCore::new(future).is_err());
+}
+
 fn fixture() -> HubCore {
     let mut store = CatalogStore::empty("0.1.0");
     store
@@ -92,6 +157,7 @@ fn deployment(id: &str, model: &str, pool: &str) -> Deployment {
         endpoint: "http://127.0.0.1:1234/v1".into(),
         provider_model: model.into(),
         provider_profile: "openai_compatible_chat".into(),
+        upstream_credential_id: None,
         enabled: true,
     }
 }

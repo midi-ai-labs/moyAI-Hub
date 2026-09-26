@@ -618,6 +618,7 @@ mod tests {
             endpoint: "http://localhost:1234/v1".into(),
             provider_model: "model".into(),
             provider_profile: "openai_compatible_chat".into(),
+            upstream_credential_id: None,
             enabled: true,
         }];
         assert_eq!(

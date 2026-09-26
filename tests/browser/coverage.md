@@ -7,6 +7,7 @@
 | 画面／操作・状態 | 現在のブラウザーシナリオで確認する内容 | 残るGUI確認 |
 | --- | --- | --- |
 | チームの初期設定 | `onboarding.spec.mjs`で利用者作成・password入力なしのproject作成、保存済みproject・PC用途から準備状態を再表示 | 実Desktopから最初の仕事までの結合はDesktop側のシナリオ |
+| 実行PCで使えるソフト・機器の登録 | `shared-management.spec.mjs`でプロジェクトカードから編集し、別の読取要求で保存値と画面への反映を確認 | 宣言した機能の動作・ライセンス可用性は実行PCとDesktop側で確認 |
 | 競合したプロジェクトの編集 | `shared-management.spec.mjs`で入力保持→最新値と比較→明示継続→通常保存、再競合、削除対象、遅延比較後の利用終了と新ticketで再開 | 実行結果はtask-local reportを参照。破壊的・世代依存の操作は対象を開き直す |
 | 最初のPCへの接続手順 | `onboarding.spec.mjs`で設定・開始→受信許可案内→ファイル取得→実TLS申請・承認→Desktop診断案内、停止時の戻り、Gateway変更が任意で開始前に見えること | このケースはloopbackのprotocol fixture。実UAC・Firewall書込み・物理LAN到達・実AI応答を確認した意味ではない |
 | PC参加と用途の一括判断 | `onboarding.spec.mjs`でWindowsユーザー名の参考表示、同じPCの操作／実行用途、非管理者の専用actor発行とPWなしのproject閲覧、並行更新後の部分保存と同一PC再開 | 複数の物理PC、申請元と現物の照合 |

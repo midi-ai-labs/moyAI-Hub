@@ -1,6 +1,6 @@
 # HubからMCP履歴を確認する
 
-Hubの「MCP履歴」では、参加端末に保存された記録を読み取り専用で確認できます。「接続PC」の「履歴を見る」からも、その端末を選んで開けます。タスク受付がOFFでも、Hubへ接続しているDesktopの履歴を取得できます。
+Hubの「MCP履歴」では、旧端末間MCP方式で参加端末に保存された記録を読み取り専用で確認できます。現行Hubプロジェクトの会話・成果は[共有仕事](shared-work.md)が保存し、Desktopのプロジェクトから確認します。「接続PC」の「履歴を見る」からも、その端末を選んで開けます。タスク受付がOFFでも、Hubへ接続しているDesktopの履歴を取得できます。
 
 1. 端末と「MCP指示」または「MCP実行」を選び、「履歴を取得」を押します。
 2. 一覧で依頼の概要、相手端末、対象、状態、記録日時を確認します。古い履歴はページを切り替えて取得します。
@@ -19,6 +19,6 @@ Hubに取得した結果はメモリ上で最大64件・30分間保持します�
 
 `GET /v1/network/history/requests` と `POST /v1/network/history/results` は証明書で認証した自端末に限定します。要求は端末・方向・ページまたは履歴IDに束縛し、1端末につき同時に1件までです。返却内容は型、対象、件数、本文サイズを検証します。この返却APIだけ要求body上限を512 KiBとし、他の端末ネットワークAPIの64 KiB上限は維持します。
 
-通常の端末間タスク実行・結果返却はDesktop同士で行います。Hubが記録本文を受け取るのは、管理者が履歴閲覧を明示した場合だけです。Hubのカタログ・端末台帳へ履歴本文を永続保存せず、モデル割当や新しい作業の実行にも流用しません。
+この旧MCP履歴についてHubが記録本文を受け取るのは、管理者が履歴閲覧を明示した場合だけです。Hubのカタログ・端末台帳へ履歴本文を永続保存せず、モデル割当や新しい作業の実行にも流用しません。
 
-実装の正本は`src/network/history.rs`、`src/network/api.rs`、`src/admin/network_admin.rs`、`src/web_admin.rs`、`ui/src/history.ts`、`ui/src/management.ts`と近傍testsです。Tauri管理アプリ廃止後の経路は実装・検証中です。ブラウザーと別端末での受入結果は実施したtaskの検証記録を参照してください。
+実装の正本は`src/network/history.rs`、`src/network/api.rs`、`src/admin/network_admin.rs`、`src/web_admin.rs`、`ui/src/history.ts`、`ui/src/management.ts`と近傍testsです。現在の管理画面はブラウザーです。ブラウザーと別端末での受入結果は実施したtaskの検証記録を参照してください。

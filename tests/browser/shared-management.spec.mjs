@@ -69,6 +69,12 @@ test("one project form assigns both PC purposes without creating a user and auto
   await page.locator("#shared-admin-refresh").click(); await expect(page.locator("#shared-admin-content")).toContainText("作業フォルダーを準備中");
   await second.participant.sharedProvisionReceipt({...request,success:true,error:null});
   await page.locator("#shared-admin-refresh").click(); await expect(page.locator("#shared-admin-content")).toContainText("作業フォルダー作成済み");
+  await operation(page,"set_environment_capabilities",request.environment_id);
+  await expect(page.locator("#shared-admin-editor")).toContainText("実際に動くことの確認にはなりません");
+  await page.locator("#shared-admin-names").fill("Flask\nGurobi"); await save(page);
+  const configured=await sharedSnapshot(page,hub);
+  expect(configured.environments.find(row=>row.id===request.environment_id).capabilities.map(item=>item.name)).toEqual(["Flask","Gurobi"]);
+  await expect(page.locator("#shared-admin-content")).toContainText("このPCで使えるもの: Flask、Gurobi");
   await info.attach("project-pc-preparation-ready",{body:await page.locator("#shared-administration").screenshot(),contentType:"image/png"});
   await operation(page,"save_project"); await page.locator("#shared-admin-label").fill("設計プロジェクト B");
   await page.getByLabel("操作用 PCを操作に使う",{exact:true}).check(); await page.getByLabel("解析用 PCで仕事を実行する",{exact:true}).check(); await save(page);

@@ -10,7 +10,7 @@ export interface SharedAdminSnapshot {
   project_devices?: { project_id: string; device_id: string; can_control: boolean; can_execute: boolean; environment_id: string | null; preparation_state: string; error: string | null }[];
   project_memberships: { project_id: string; user_id: string; role: ProjectRole }[];
   group_project_roles: { project_id: string; group_id: string; role: ProjectRole }[];
-  environments: { id: string; label: string; resource_id: string; runner_id: string; enabled: boolean; project_ids: string[] }[];
+  environments: { id: string; label: string; resource_id: string; runner_id: string; enabled: boolean; project_ids: string[]; capabilities?: { name: string; source: "declared"; observed_at_ms: null }[] }[];
   resources: { id: string; capacity: number }[];
   templates: { runner_id: string; id: string; label: string }[];
   provisioning: { environment_id: string; runner_id: string; template_id: string; generation: number; state: string; error: string | null }[];
@@ -27,7 +27,7 @@ export type AdminOperation = "update_user" | "delete_user" | "bind_device_princi
   | "save_project" | "retry_project_device"
   | "create_group" | "update_group" | "delete_group" | "group_member"
   | "create_project" | "update_project" | "delete_project" | "project_member" | "group_project_role"
-  | "create_environment" | "update_environment" | "delete_environment" | "set_resource" | "delete_resource" | "settle_attempt" | "request_provision" | "prune_shared_data";
+  | "create_environment" | "update_environment" | "set_environment_capabilities" | "delete_environment" | "set_resource" | "delete_resource" | "settle_attempt" | "request_provision" | "prune_shared_data";
 export type AdminDraft = Record<string, string | boolean | string[] | number>;
 export function projectPCSelection(data: Pick<FormData, "getAll">): Pick<AdminDraft, "controller_device_ids" | "runner_device_ids"> {
   return { controller_device_ids: data.getAll("controller_device_ids").map(String), runner_device_ids: data.getAll("runner_device_ids").map(String) };
@@ -45,7 +45,7 @@ export const operationLabels: Record<AdminOperation, string> = {
   create_group: "グループを追加", update_group: "グループを編集", delete_group: "グループを削除", group_member: "グループの所属を設定",
   create_project: "プロジェクトを追加", update_project: "プロジェクトを編集", delete_project: "プロジェクトを削除",
   project_member: "利用者の役割を設定", group_project_role: "グループの役割を設定",
-  create_environment: "実行先を追加", update_environment: "実行先を編集", delete_environment: "実行先を削除",
+  create_environment: "実行先を追加", update_environment: "実行先を編集", set_environment_capabilities: "このPCで使えるものを設定", delete_environment: "実行先を削除",
   set_resource: "共有枠を設定", delete_resource: "同時利用の枠を削除", settle_attempt: "停止を確認して枠を解放",
   request_provision: "作業フォルダーの作成を依頼", prune_shared_data: "保存データを整理",
 };
@@ -92,6 +92,11 @@ export function adminRequest(kind: AdminOperation, draft: AdminDraft): Record<st
       if (!project_ids.length) throw "この実行先を使えるプロジェクトを一つ以上選択してください。";
       return { kind, id: id(), label: required(draft, "label"), resource_id: required(draft, "resource_id"), runner_id: required(draft, "runner_id"), project_ids,
         ...(kind === "create_environment" ? { capacity: capacity(draft), ...(text(draft, "template_id") ? { template_id: text(draft, "template_id") } : {}) } : { enabled: flag(draft, "enabled") }) };
+    }
+    case "set_environment_capabilities": {
+      const names = [...new Set(String(draft.names ?? "").split(/\r?\n/).map(name => name.trim()).filter(Boolean))];
+      if (names.length > 32 || names.some(name => new TextEncoder().encode(name).length > 128)) throw "使えるものは32件まで、各行128バイト以内で入力してください。";
+      return { kind, environment_id: required(draft, "environment_id"), names };
     }
     case "request_provision": {
       const generation = Number(draft.generation);

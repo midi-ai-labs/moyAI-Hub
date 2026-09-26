@@ -4,13 +4,18 @@ import { createServer } from "node:http";
 export async function createMetadataProvider() {
     let models = ["fixture-alpha", "fixture-beta"];
     let nativeModels = ["fixture-native"];
+    let apiKey = null;
     let nextHold = null;
     const held = new Set();
     const requests = [];
     const server = createServer(async (request, response) => {
-        requests.push({ method: request.method, path: request.url });
+        const authorized = apiKey === null || request.headers.authorization === `Bearer ${apiKey}`;
+        requests.push({ method: request.method, path: request.url, authorized });
         if (request.method !== "GET" || !["/v1/models", "/api/v1/models"].includes(request.url)) {
             response.writeHead(404).end(); return;
+        }
+        if (!authorized) {
+            response.writeHead(401, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "API key required" })); return;
         }
         const body = request.url === "/v1/models"
             ? { data: models.map(id => ({ id, object: "model", owned_by: "browser-test-fixture" })) }
@@ -27,6 +32,7 @@ export async function createMetadataProvider() {
         requests,
         setModels(value) { models = [...value]; },
         setNativeModels(value) { nativeModels = [...value]; },
+        setApiKey(value) { apiKey = value; },
         holdNext() {
             if (nextHold) throw new Error("Only one scheduled metadata hold is supported");
             let release, received;

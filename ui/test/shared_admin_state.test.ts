@@ -58,6 +58,15 @@ test("environment registration contains shared identity and only selected projec
   for (const value of ["0", "1.5", "129", "1e2", "2suffix"]) assert.throws(() => adminRequest("set_resource", { id: "resource", capacity: value }));
 });
 
+test("execution PC capabilities use one exact environment and a bounded line list", () => {
+  assert.deepEqual(adminRequest("set_environment_capabilities", { environment_id: "winb-work", names: "Flask\n  Gurobi  \nFlask\n" }),
+    { kind: "set_environment_capabilities", environment_id: "winb-work", names: ["Flask", "Gurobi"] });
+  assert.deepEqual(adminRequest("set_environment_capabilities", { environment_id: "winb-work", names: "" }),
+    { kind: "set_environment_capabilities", environment_id: "winb-work", names: [] });
+  assert.throws(() => adminRequest("set_environment_capabilities", { environment_id: "winb-work", names: "x".repeat(129) }));
+  assert.throws(() => adminRequest("set_environment_capabilities", { environment_id: "", names: "Flask" }));
+});
+
 test("device principal assignment uses exact device and user identities with no credentials", () => {
   assert.deepEqual(adminRequest("bind_device_principal", { device_id: "pc-a", user_id: "alice", password: "ignored" }),
     { kind: "bind_device_principal", device_id: "pc-a", user_id: "alice" });

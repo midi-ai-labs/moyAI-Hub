@@ -155,7 +155,7 @@ async function browserInvoke<T>(command: string, args: Record<string, unknown>, 
 export function invokeSharedAdmin<T>(command: "hub_shared_snapshot" | "hub_shared_command" | "hub_shared_retention_preview" | "hub_shared_maintenance" | "hub_join_project", args: Record<string, unknown> = {}): Promise<T> {
     return browserInvoke<T>(command, args, true);
 }
-function download(text: string, name: string, mime: string): string {
+export function download(text: string, name: string, mime: string): string {
     const url = URL.createObjectURL(new Blob([text], { type: mime }));
     const link = document.createElement("a");
     link.href = url; link.download = name; document.body.append(link); link.click(); link.remove();

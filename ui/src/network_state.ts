@@ -52,16 +52,30 @@ export interface NetworkSnapshot {
     rules: NetworkRule[];
 }
 
+type FirewallState = "missing" | "matching" | "mismatch" | "conflict" | null;
+export function networkIsLocalOnly(snapshot: NetworkSnapshot): boolean {
+    const loopback = (endpoint: string | null) => {
+        try { const host = new URL(endpoint ?? "").hostname; return host === "[::1]" || /^127\./.test(host); }
+        catch { return false; }
+    };
+    return loopback(snapshot.server.bind) && loopback(snapshot.server.gateway_bind);
+}
+/** A distribution acknowledgment is UI-only; it is never evidence of OS or LAN success. */
+export function networkCanDistribute(snapshot: NetworkSnapshot | null, firewall: FirewallState, externallyManaged = false): boolean {
+    return Boolean(snapshot?.server.running && snapshot.server.bind && snapshot.server.gateway_bind
+        && (firewall === "matching" || externallyManaged || networkIsLocalOnly(snapshot)));
+}
+
 /** Suggestions use observed Hub facts; an online PC is not proof of a usable LAN or AI. */
-export function networkSetupStep(snapshot: NetworkSnapshot, firewall: "missing" | "matching" | "mismatch" | "conflict" | null = null): { title: string; detail: string; anchor: string; action: string } {
+export function networkSetupStep(snapshot: NetworkSnapshot, firewall: FirewallState = null, externallyManaged = false): { title: string; detail: string; anchor: string; action: string } {
     if (!snapshot.server.running) return { title: "1. Hubの接続先を設定して開始", detail: "参加するPCと通信できるLANとHubポートを選びます。モデル通信用ポートは必要な場合だけ変更してください。", anchor: "network-step-start", action: "接続先を設定する" };
-    if (firewall && firewall !== "matching") return { title: "2. Windowsの受信許可を確認", detail: firewall === "missing" ? "この設置先でmoyAIが管理する受信許可が未登録です。会社で設定済みの場合も含め、下の確認結果を確認してください。" : "現在のHubと受信許可の内容が一致しません。下の確認結果に沿って見直してください。", anchor: "network-step-firewall", action: "受信許可を確認する" };
+    if (!networkCanDistribute(snapshot, firewall, externallyManaged)) return { title: "2. Windowsの受信許可を確認", detail: firewall === "missing" ? "現在のHubへの受信許可が未登録です。下の設定内容を確認して「接続を許可して続ける」を押してください。" : firewall === null ? "起動中のHubへの受信許可を確認しています。確認できない場合は下の案内に従ってください。" : "現在のHubと受信許可の内容が一致しません。下の確認結果に沿って見直してください。", anchor: "network-step-firewall", action: "受信許可を確認する" };
     const pending = snapshot.join_requests.filter(request => request.status === "pending").length;
     if (pending) return { title: `4. 参加申請が${pending}台届いています`, detail: "申請元のPCを確かめて許可し、そのDesktopで接続を診断してください。", anchor: "clients", action: "参加申請を開く" };
     const allowed = snapshot.devices.filter(device => !device.revoked && device.admission === "allowed");
     if (allowed.length) return { title: "4. 参加したPCで接続を診断", detail: `参加を許可したPCは${allowed.length}台、現在接続中は${allowed.filter(device => device.online).length}台です。Desktopで接続を診断し、使えることを確かめたら残りのPCへ同じ接続ファイルを渡します。`, anchor: "network-step-confirm", action: "Desktopでの確認手順を見る" };
     if (firewall === "matching") return { title: "3. 接続ファイルの配布", detail: "現在のHubへの受信許可を確認しました。参加するPCへ接続ファイルを渡し、そのDesktopで接続を確認してください。", anchor: "network-step-file", action: "接続ファイルを保存する" };
-    return { title: "2. 受信許可を設定してPCを接続", detail: "Hubは起動しています。Windowsの受信許可を設定し、参加するPCへ接続ファイルを渡してください。", anchor: "network-step-firewall", action: "受信許可の手順へ" };
+    return { title: "3. 接続ファイルの配布", detail: networkIsLocalOnly(snapshot) ? "この接続先はHubと同じPCでの試用専用です。別PCへ配布する場合はLAN側のIPでHubを開始してください。" : "管理者による設定済みの確認に基づいて配布できます。moyAIによる受信許可の確認は未完了です。参加Desktopで接続を確かめてください。", anchor: "network-step-file", action: "接続ファイルを保存する" };
 }
 
 export interface NetworkDiagnostics {

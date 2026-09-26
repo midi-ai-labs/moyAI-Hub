@@ -133,16 +133,31 @@ impl SharedWork {
         );
         Ok(())
     }
+    #[cfg(test)]
     pub(super) fn claim_observed(
         &mut self,
         runner: &str,
         scope: Option<&[String]>,
         now: u64,
     ) -> Result<Option<Assignment>> {
+        self.claim_observed_for_capability(
+            runner,
+            scope,
+            Some(store::MULTI_DEVICE_SESSION_CAPABILITY),
+            now,
+        )
+    }
+    pub(super) fn claim_observed_for_capability(
+        &mut self,
+        runner: &str,
+        scope: Option<&[String]>,
+        capability: Option<&str>,
+        now: u64,
+    ) -> Result<Option<Assignment>> {
         let owned = scope
             .map(|scope| self.owned_contact_scope(runner, scope))
             .transpose()?;
-        let assignment = self.claim_for(runner, scope, now)?;
+        let assignment = self.claim_for_capability(runner, scope, capability, now)?;
         if let Some(scope) = &owned {
             self.record_environment_scope(runner, scope, now);
         }
@@ -151,17 +166,32 @@ impl SharedWork {
         }
         Ok(assignment)
     }
+    #[cfg(test)]
     pub(super) fn assignments_observed(
         &mut self,
         runner: &str,
         scope: Option<&[String]>,
         now: u64,
     ) -> Result<Vec<Assignment>> {
+        self.assignments_observed_for_capability(
+            runner,
+            scope,
+            Some(store::MULTI_DEVICE_SESSION_CAPABILITY),
+            now,
+        )
+    }
+    pub(super) fn assignments_observed_for_capability(
+        &mut self,
+        runner: &str,
+        scope: Option<&[String]>,
+        capability: Option<&str>,
+        now: u64,
+    ) -> Result<Vec<Assignment>> {
         store::timestamp(now)?;
         let owned = scope
             .map(|scope| self.owned_contact_scope(runner, scope))
             .transpose()?;
-        let mut assignments = self.assignments(runner)?;
+        let mut assignments = self.assignments_for_capability(runner, capability)?;
         if let Some(scope) = &owned {
             assignments.retain(|assignment| scope.contains(&assignment.job.environment_id));
             self.record_environment_scope(runner, scope, now);

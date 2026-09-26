@@ -47,7 +47,7 @@ test("connection setup guides the first PC through start permission file and app
   // Loopback is an isolated protocol fixture: no Windows rule, UAC, or LAN reachability is exercised.
   await page.locator("#network-ip").fill("127.0.0.1"); await page.locator("#network-port").fill(String(hub.networkPort));
   await page.locator("#network-start").click(); await expect(page.locator("#network-stop")).toBeVisible();
-  await expect(page.locator("#network-next-title")).toContainText("2.");
+  await expect(page.locator("#network-next-title")).toHaveText("3. 接続ファイルの配布");
   await expect(page.locator("#network-firewall-prerequisite")).toContainText("現在のHubとGatewayのポート");
   await expect(page.locator("#network-save-config")).toBeEnabled();
   const downloadEvent=page.waitForEvent("download"); await page.locator("#network-save-config").click();

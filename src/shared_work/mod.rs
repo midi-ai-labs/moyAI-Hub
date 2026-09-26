@@ -2,6 +2,7 @@
 pub mod api;
 mod approvals;
 pub(crate) mod blob_store;
+mod conversation_catalog;
 mod data;
 mod deadlines;
 mod handover;
@@ -15,17 +16,21 @@ pub(crate) mod project_setup;
 pub use project_setup::ProjectMember;
 mod projection;
 mod runner_contact;
+mod services;
+mod stop_scope;
 pub use data::{Asset, AssetDownload, AssetUpload, RunnerAssetUpload, TranscriptPage};
 pub use deadlines::DEFAULT_START_WINDOW_MS;
 pub use handover::{ContinueJob, HandoverRequest, HandoverView};
 pub use management::{ManagementCommand, ManagementRequest};
 pub use runner_contact::{RUNNER_CONTACT_STALE_MS, RunnerContact, RunnerContactState};
+pub use services::ServiceLeaseView;
 
 pub use approvals::{ApprovalAnswer, ApprovalConsumeResult, ApprovalDecision, ApprovalView};
 mod store;
 
 pub use projection::{
-    EnvironmentStatus, ExecutionDeviceStatus, JobSummary, ProjectStatus, ResourceOccupant,
+    ConversationHistoryPage, ConversationHistoryTurn, EnvironmentStatus, ExecutionDeviceStatus,
+    JobSummary, OriginJobView, OriginServiceView, OriginWorkView, ProjectStatus, ResourceOccupant,
     WorkPerson,
 };
 
@@ -89,6 +94,10 @@ impl JobState {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Job {
     pub id: String,
+    pub conversation_id: String,
+    pub origin_session_ref: Option<String>,
+    pub origin_turn_ref: Option<String>,
+    pub origin_turn_epoch: Option<u64>,
     pub root_id: String,
     pub parent_id: Option<String>,
     pub project_id: String,
@@ -98,6 +107,8 @@ pub struct Job {
     pub quota_owner_id: String,
     pub authority_generation: u64,
     pub continued_from: Option<String>,
+    #[serde(default)]
+    pub revises_job_id: Option<String>,
     pub title: String,
     pub input: Value,
     pub checkpoint: Option<Value>,
@@ -115,7 +126,25 @@ pub struct Job {
 pub struct SubmitJob {
     pub request_id: String,
     pub project_id: String,
+    /// The controller PC's current project participation, captured before Send.
+    /// Old clients may omit it only for a never-rejoined participation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_participation: Option<u64>,
+    /// All three revision fields must be supplied for a stopped turn replacement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revises_job_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revised_revision: Option<u64>,
+    #[serde(default)]
     pub environment_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_session_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_turn_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_turn_epoch: Option<u64>,
     pub title: String,
     pub input: Value,
     pub descendant_budget: u32,
@@ -146,6 +175,34 @@ pub struct Assignment {
     pub child_result: Option<Box<Job>>,
     /// Current project/environment allowlist; Runner-local policy can only narrow it.
     pub allowed_child_environments: Vec<String>,
+    /// Human-readable, authorized candidates for the model's ordinary tool choice.
+    #[serde(default)]
+    pub allowed_child_candidates: Vec<SharedCandidate>,
+    /// Services already held by this conversation on the assigned resource.
+    #[serde(default)]
+    pub retained_services: Vec<RetainedService>,
+    /// Empty for legacy shared jobs that any supported Runner can execute.
+    #[serde(default)]
+    pub required_runner_capabilities: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SharedCandidate {
+    pub environment_id: String,
+    pub device_id: String,
+    pub device_label: String,
+    pub environment_label: String,
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RetainedService {
+    pub service_id: String,
+    pub attempt_id: String,
+    pub generation: u64,
+    pub conversation_id: String,
+    pub environment_id: String,
+    pub expires_at_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -168,6 +225,17 @@ pub struct Report {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReportOutcome {
     Started,
+    RetainService {
+        service_id: String,
+        expires_at_ms: u64,
+    },
+    ServiceStopped {
+        service_id: String,
+    },
+    ServiceUncertain {
+        service_id: String,
+        reason: String,
+    },
     Uncertain {
         reason: String,
     },

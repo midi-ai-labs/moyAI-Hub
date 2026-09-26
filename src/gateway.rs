@@ -58,6 +58,8 @@ enum Phase {
 }
 struct Record {
     grant: Grant,
+    // Snapshot the key at admission; rotation must not break an issued request.
+    authorization: Option<reqwest::header::HeaderValue>,
     token: String,
     phase: Phase,
     // Observe the existing response channel without keeping the stream open or
@@ -71,6 +73,7 @@ struct Registry {
 }
 
 pub struct Gateway {
+    credential_directory: Option<std::path::PathBuf>,
     registry: Mutex<Registry>,
     control_token: String,
     hub_url: String,
@@ -119,7 +122,15 @@ fn token() -> String {
 
 impl Gateway {
     pub fn new(hub_url: String, control_token: String) -> Result<Arc<Self>, reqwest::Error> {
+        Self::new_with_credentials(hub_url, control_token, None)
+    }
+    pub fn new_with_credentials(
+        hub_url: String,
+        control_token: String,
+        credential_directory: Option<std::path::PathBuf>,
+    ) -> Result<Arc<Self>, reqwest::Error> {
         Ok(Arc::new(Self {
+            credential_directory,
             registry: Mutex::new(Registry {
                 grants: BTreeMap::new(),
                 accepting: true,
@@ -338,11 +349,26 @@ async fn admit(
     if registry.grants.len() >= 1024 {
         return Err(error(StatusCode::TOO_MANY_REQUESTS, "registry_full"));
     }
+    let authorization = if grant.deployment.upstream_credential_id.is_some() {
+        crate::upstream_auth::resolve(
+            gateway
+                .credential_directory
+                .as_deref()
+                .ok_or_else(|| error(StatusCode::BAD_GATEWAY, "provider_auth_unavailable"))?,
+            grant.deployment.upstream_credential_id.as_deref(),
+            &grant.deployment.endpoint,
+            &grant.deployment.provider_profile,
+        )
+        .map_err(|_| error(StatusCode::BAD_GATEWAY, "provider_auth_unavailable"))?
+    } else {
+        None
+    };
     let secret = token();
     registry.grants.insert(
         grant.permit.id.clone(),
         Record {
             grant,
+            authorization,
             token: secret.clone(),
             phase: Phase::Reserved,
             downstream: None,
@@ -485,7 +511,7 @@ async fn generate(
     let (head_send, head_receive) = oneshot::channel();
     let (send, receive) = mpsc::channel(8);
     let (cancel, canceled) = oneshot::channel();
-    let grant = {
+    let (grant, authorization) = {
         let mut registry = gateway.registry.lock().unwrap();
         registry.expire(now_ms());
         if !registry.accepting {
@@ -518,10 +544,18 @@ async fn generate(
         record.phase = Phase::Running;
         record.downstream = Some(send.downgrade());
         record.cancel = Some(cancel);
-        record.grant.clone()
+        (record.grant.clone(), record.authorization.take())
     };
     body["model"] = json!(grant.deployment.provider_model);
-    tokio::spawn(run_request(gateway, grant, body, head_send, send, canceled));
+    tokio::spawn(run_request(
+        gateway,
+        grant,
+        authorization,
+        body,
+        head_send,
+        send,
+        canceled,
+    ));
     match head_receive.await {
         Ok(Ok((status, content_type))) => (
             status,
@@ -644,6 +678,7 @@ impl SseTerminal {
 async fn run_request(
     gateway: Arc<Gateway>,
     grant: Grant,
+    authorization: Option<reqwest::header::HeaderValue>,
     body: Value,
     head: oneshot::Sender<ResponseHead>,
     send: mpsc::Sender<Result<Bytes, io::Error>>,
@@ -696,7 +731,11 @@ async fn run_request(
             let _ = head.send(Err(error(StatusCode::BAD_GATEWAY, "invalid_provider")));
             return false;
         };
-        let upstream = gateway.client.post(url).json(&body).send().await;
+        let mut upstream = gateway.client.post(url).json(&body);
+        if let Some(value) = authorization {
+            upstream = upstream.header(reqwest::header::AUTHORIZATION, value);
+        }
+        let upstream = upstream.send().await;
         let mut upstream = match upstream {
             Ok(value) => value,
             Err(failure) => {
@@ -801,6 +840,7 @@ mod tests {
                 endpoint: "http://127.0.0.1:9".into(),
                 provider_model: "model".into(),
                 provider_profile: "openai_compatible_chat".into(),
+                upstream_credential_id: None,
                 enabled: true,
             },
             pool_limit: 1,
@@ -812,6 +852,7 @@ mod tests {
             "permit".into(),
             Record {
                 grant,
+                authorization: None,
                 token: "test".into(),
                 phase: Phase::Running,
                 downstream: Some(send.downgrade()),

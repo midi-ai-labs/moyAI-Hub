@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 use std::net::Ipv4Addr;
 
 const HELPER: &str = include_str!("firewall_helper.ps1");
+const EXPORT_HELPER: &str = include_str!("firewall_export.ps1");
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -456,6 +457,121 @@ pub(super) async fn preview(admin: &Admin, scope: Scope) -> Result<Value, String
     output(prepare(admin, scope, (hub, gateway, &advertised)).await?)
 }
 
+fn verify_review(current: &Preview, expected: &str) -> Result<(), String> {
+    if current.conflict || current.fingerprint != expected {
+        return Err(
+            "接続先・実行ファイル・ルールが変わりました。変更内容を再確認してください。".into(),
+        );
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct ExportTarget {
+    machine_guid: String,
+    data_directory: String,
+    hub_id: String,
+    hosting_bind: String,
+    saved_gateway_port: u16,
+    gateway_port: u16,
+}
+
+fn verify_export_gateway(saved_port: u16, running_port: u16) -> Result<(), String> {
+    if saved_port == 0 {
+        return Err(
+            "Gatewayのポートが自動選択（0）のため、管理者用スクリプトは出力できません。Hub管理画面でGatewayに固定ポートを設定し、端末ネットワークを再起動してから出力してください。現在の起動中ポートへの受信許可は、この画面から直接設定できます。".into(),
+        );
+    }
+    if saved_port != running_port {
+        return Err(
+            "保存済みGatewayポートと稼働中のポートが異なります。端末ネットワークを再起動し、受信許可の内容を再確認してからスクリプトを出力してください。".into(),
+        );
+    }
+    Ok(())
+}
+
+fn export_script(current: &Preview, target: ExportTarget) -> Result<Value, String> {
+    verify_export_gateway(target.saved_gateway_port, target.gateway_port)?;
+    let mut plan = serde_json::to_value(target).map_err(|_| "設定内容を作成できません。")?;
+    plan["request"] = json!({"action":"apply", "spec":current.spec,
+        "previous":current.previous,"binary_sha256":current.binary_sha256});
+    let plan = serde_json::to_string_pretty(&plan).map_err(|_| "設定内容を作成できません。")?;
+    // JSON string escaping prevents path values from terminating this here-string.
+    // A BOM keeps Windows PowerShell 5.1 file execution independent of ANSI locale.
+    let content = format!(
+        "\u{feff}# Run on the original Hub PC in Administrator PowerShell.\n# Add -CheckOnly to inspect without changing Windows.\nparam([switch]$CheckOnly)\n{HELPER}\n{EXPORT_HELPER}\n$export = @'\n{plan}\n'@ | ConvertFrom-Json\nInvoke-MoyaiFirewallExport $export -CheckOnly:$CheckOnly\n"
+    );
+    Ok(json!({"filename":"Allow-moyAI-Hub.ps1","content":content}))
+}
+
+/// Export only the freshly reviewed target; downloading never changes the OS.
+pub(super) async fn export(admin: &Admin, scope: Scope, expected: String) -> Result<Value, String> {
+    let server = admin.network_server.lock().await;
+    let (hub, gateway) = network_admin::firewall_endpoints(&server)?;
+    let hosting = admin
+        .network_hosting
+        .lock()
+        .map_err(|_| "公開設定を確認できません。")?
+        .configured()?;
+    let current = prepare(
+        admin,
+        scope,
+        (hub, gateway, &hosting.advertise_ip.to_string()),
+    )
+    .await?;
+    verify_review(&current, &expected)?;
+    let (hub_id, saved_gateway_port) = {
+        let network = admin.network.lock().map_err(|_| "端末設定を開けません。")?;
+        (network.hub_id().to_owned(), network.gateway_port())
+    };
+    let gateway_port = reqwest::Url::parse(gateway)
+        .ok()
+        .and_then(|url| url.port_or_known_default())
+        .ok_or("Gatewayのポートを確認できません。")?;
+    verify_export_gateway(saved_gateway_port, gateway_port)?;
+    #[cfg(windows)]
+    let machine_guid = {
+        let script = format!(
+            "{EXPORT_HELPER}\n[Console]::OutputEncoding=[Text.UTF8Encoding]::new(); Get-MoyaiMachineGuid | ConvertTo-Json -Compress"
+        );
+        let result = run_script(&script, 15).await?;
+        if !result.status.success() || result.stdout.len() > 256 {
+            return Err("Hub PCの識別情報を確認できません。".into());
+        }
+        let value: String = serde_json::from_slice(&result.stdout)
+            .map_err(|_| "Hub PCの識別情報を読み取れません。")?;
+        if value.len() != 36
+            || !value.bytes().enumerate().all(|(i, byte)| {
+                if [8, 13, 18, 23].contains(&i) {
+                    byte == b'-'
+                } else {
+                    byte.is_ascii_hexdigit()
+                }
+            })
+        {
+            return Err("Hub PCの識別情報を確認できません。".into());
+        }
+        value.to_ascii_lowercase()
+    };
+    #[cfg(not(windows))]
+    let machine_guid = String::new();
+    let directory = std::fs::canonicalize(admin.path.parent().ok_or("保存先がありません。")?)
+        .map_err(|_| "保存先を確認できません。")?;
+    let target = ExportTarget {
+        machine_guid,
+        data_directory: directory
+            .to_str()
+            .ok_or("保存先を確認できません。")?
+            .trim_start_matches("\\\\?\\")
+            .to_owned(),
+        hub_id,
+        hosting_bind: hosting.bind.to_string(),
+        saved_gateway_port,
+        gateway_port,
+    };
+    export_script(&current, target)
+}
+
 pub(super) async fn change(
     admin: &Admin,
     scope: Scope,
@@ -474,11 +590,7 @@ pub(super) async fn change(
         .advertise_ip
         .to_string();
     let current = prepare(admin, scope, (hub, gateway, &advertised)).await?;
-    if current.conflict || current.fingerprint != expected {
-        return Err(
-            "接続先・実行ファイル・ルールが変わりました。変更内容を再確認してください。".into(),
-        );
-    }
+    verify_review(&current, &expected)?;
     if (remove && current.previous.is_none()) || (!remove && current.matching) {
         return Ok(json!({"status":"unchanged","preview":current}));
     }
@@ -528,6 +640,135 @@ pub(super) async fn change(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn exported_gateway_requires_a_stable_saved_port_that_matches_the_running_listener() {
+        assert!(verify_export_gateway(9472, 9472).is_ok());
+        // A legacy dynamic profile must give an actionable export error both
+        // immediately and after a restart assigns another ephemeral port.
+        for running in [51001, 51002] {
+            assert!(
+                verify_export_gateway(0, running)
+                    .unwrap_err()
+                    .contains("固定ポート")
+            );
+        }
+        assert!(
+            verify_export_gateway(9472, 51001)
+                .unwrap_err()
+                .contains("再起動")
+        );
+        assert!(verify_export_gateway(9472, 0).is_err());
+    }
+    #[test]
+    fn exported_review_rejects_any_changed_target_or_conflicting_os_rule() {
+        let current = preview_value(spec(), "a".repeat(64), None).unwrap();
+        assert!(verify_review(&current, &current.fingerprint).is_ok());
+        assert!(verify_review(&current, "obsolete").is_err());
+        let replaced = preview_value(spec(), "b".repeat(64), None).unwrap();
+        assert!(verify_review(&replaced, &current.fingerprint).is_err());
+        let conflict = preview_value(
+            spec(),
+            "a".repeat(64),
+            Some(Observed {
+                spec: spec(),
+                owned: false,
+            }),
+        )
+        .unwrap();
+        assert!(verify_review(&conflict, &conflict.fingerprint).is_err());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn exported_file_parses_and_checks_exact_local_target_without_admin_or_os_writes() {
+        let parent = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("project_sandbox/hub-firewall-export-tests");
+        std::fs::create_dir_all(&parent).unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("firewall's-export-")
+            .tempdir_in(parent)
+            .unwrap();
+        let program = directory.path().join("hub's.exe");
+        std::fs::write(&program, b"inert test executable bytes").unwrap();
+        std::fs::write(
+            directory.path().join("network-hosting.json"),
+            br#"{"schema_version":1,"bind":"0.0.0.0:9471","advertise_ip":"192.168.1.2"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("device-network.json"),
+            br#"{"schema_version":5,"hub_id":"fixture-hub","gateway_port":9472}"#,
+        )
+        .unwrap();
+        let machine = run_script(
+            &format!("{EXPORT_HELPER}\nGet-MoyaiMachineGuid | ConvertTo-Json -Compress"),
+            15,
+        )
+        .await
+        .unwrap();
+        assert!(machine.status.success());
+        let mut s = spec();
+        s.program = program.to_str().unwrap().to_owned();
+        let current = preview_value(s, digest(b"inert test executable bytes"), None).unwrap();
+        let exported = export_script(
+            &current,
+            ExportTarget {
+                machine_guid: serde_json::from_slice(&machine.stdout).unwrap(),
+                data_directory: directory.path().to_str().unwrap().to_owned(),
+                hub_id: "fixture-hub".into(),
+                hosting_bind: "0.0.0.0:9471".into(),
+                saved_gateway_port: 9472,
+                gateway_port: 9472,
+            },
+        )
+        .unwrap();
+        assert_eq!(exported["filename"], "Allow-moyAI-Hub.ps1");
+        let script_path = directory.path().join("Allow-moyAI-Hub.ps1");
+        let content = exported["content"].as_str().unwrap();
+        assert!(content.starts_with('\u{feff}'));
+        std::fs::write(&script_path, content).unwrap();
+        let foreign_module = directory
+            .path()
+            .join("modules/Microsoft.PowerShell.Utility");
+        std::fs::create_dir_all(&foreign_module).unwrap();
+        std::fs::write(
+            foreign_module.join("Microsoft.PowerShell.Utility.psd1"),
+            "@{ ModuleVersion='99.0'; FunctionsToExport=@(); CmdletsToExport=@() }",
+        )
+        .unwrap();
+        // Every NetSecurity entry available to the exported check is replaced.
+        // No real host rule is read, created, changed or removed by this fixture.
+        // A foreign Utility module simulates PS7's inherited PSModulePath, where
+        // a successful name-only import omits Windows PS5.1's Get-FileHash.
+        let check = format!(
+            "[Console]::OutputEncoding=[Text.UTF8Encoding]::new(); $env:PSModulePath='{}'; Import-Module Microsoft.PowerShell.Utility; function Get-NetFirewallRule {{ [CmdletBinding()]param($Name,$PolicyStore) }}; function New-NetFirewallRule {{ throw 'OS mutation forbidden' }}; function Set-NetFirewallRule {{ throw 'OS mutation forbidden' }}; function Remove-NetFirewallRule {{ throw 'OS mutation forbidden' }}; try {{ & '{}' -CheckOnly; exit 0 }} catch {{ [Console]::WriteLine($_.ToString()); [Console]::WriteLine($_.ScriptStackTrace); exit 22 }}",
+            foreign_module
+                .parent()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .replace('\'', "''"),
+            script_path.to_str().unwrap().replace('\'', "''")
+        );
+        let success = run_script(&check, 15).await.unwrap();
+        assert!(
+            success.status.success(),
+            "{}",
+            String::from_utf8_lossy(&success.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&success.stdout)
+                .contains("Checks passed. No firewall settings were changed.")
+        );
+        std::fs::write(&program, b"different build").unwrap();
+        assert_eq!(
+            run_script(&check, 15).await.unwrap().status.code(),
+            Some(22)
+        );
+    }
+
     #[test]
     fn listener_target_consumes_the_running_https_projections_and_never_loopback_or_other_hosts() {
         assert_eq!(

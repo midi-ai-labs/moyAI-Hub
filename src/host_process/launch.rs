@@ -1,10 +1,11 @@
 //! Explicit interactive launch. The foreground server remains the lifetime owner.
 use super::{HostClient, canonical_catalog, lock_contended, profile_busy};
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{
     ffi::OsString,
     fs::{File, OpenOptions},
+    net::IpAddr,
     path::Path,
     process::Stdio,
     time::Duration,
@@ -18,6 +19,76 @@ pub struct LaunchReport {
     pub network_running: bool,
     pub needs_setup: bool,
     pub network_error: Option<String>,
+    pub firewall_status: LaunchFirewallStatus,
+    pub firewall_error: Option<String>,
+}
+
+/// A read-only OS check, independent of listener startup and remote reachability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchFirewallStatus {
+    NotChecked,
+    NotRequired,
+    Matching,
+    Missing,
+    Mismatch,
+    Conflict,
+    Unknown,
+}
+
+impl LaunchFirewallStatus {
+    pub fn requires_setup(self) -> bool {
+        matches!(
+            self,
+            Self::Missing | Self::Mismatch | Self::Conflict | Self::Unknown
+        )
+    }
+}
+
+fn loopback_listeners(state: &Value) -> bool {
+    ["bind", "gateway_bind"].into_iter().all(|key| {
+        state["server"][key]
+            .as_str()
+            .and_then(|value| reqwest::Url::parse(value).ok())
+            .filter(|url| url.scheme() == "https")
+            .and_then(|url| {
+                url.host_str()?
+                    .trim_matches(['[', ']'])
+                    .parse::<IpAddr>()
+                    .ok()
+            })
+            .is_some_and(|ip| ip.is_loopback())
+    })
+}
+
+async fn inspect_firewall(client: &HostClient, state: &Value, report: &mut LaunchReport) {
+    if !report.network_running {
+        return;
+    }
+    if loopback_listeners(state) {
+        report.firewall_status = LaunchFirewallStatus::NotRequired;
+        return;
+    }
+    match client.dispatch("hub_firewall_status", json!({})).await {
+        Ok(status) => {
+            report.firewall_status = match status["state"].as_str() {
+                Some("matching") => LaunchFirewallStatus::Matching,
+                Some("missing") => LaunchFirewallStatus::Missing,
+                Some("mismatch") => LaunchFirewallStatus::Mismatch,
+                Some("conflict") => LaunchFirewallStatus::Conflict,
+                _ => {
+                    report.firewall_error = Some(
+                        "Windowsの受信許可を確認できません。管理画面で確認してください。".into(),
+                    );
+                    LaunchFirewallStatus::Unknown
+                }
+            };
+        }
+        Err(error) => {
+            report.firewall_status = LaunchFirewallStatus::Unknown;
+            report.firewall_error = Some(error);
+        }
+    }
 }
 
 /// The short-lived CLI owns these handles. Children get explicitly assigned
@@ -212,6 +283,8 @@ pub async fn launch_server(
         network_running: false,
         needs_setup: false,
         network_error: None,
+        firewall_status: LaunchFirewallStatus::NotChecked,
+        firewall_error: None,
     };
     let before = match client.dispatch("hub_network_snapshot", json!({})).await {
         Ok(state) => state,
@@ -228,6 +301,7 @@ pub async fn launch_server(
             report.network_error = Some("端末ネットワークは稼働中ですが Gateway を確認できません。管理画面で状態を確認してください。".into());
         }
         verify_gateway(&client, &mut report).await;
+        inspect_firewall(&client, &before, &mut report).await;
         return Ok(report);
     }
     if !hosting.is_object() {
@@ -254,15 +328,20 @@ pub async fn launch_server(
                 if !report.network_running {
                     report.network_error = Some("Hub・Gateway の開始完了を確認できません。管理画面で状態を確認してください。".into());
                 }
+                verify_gateway(&client, &mut report).await;
+                inspect_firewall(&client, &state, &mut report).await;
             }
             Err(error) => report.network_error = Some(error),
         }
     }
-    verify_gateway(&client, &mut report).await;
     Ok(report)
 }
 
-pub fn browser_launch_url(url: &str, already_running: bool) -> Result<String, String> {
+pub fn browser_launch_url(
+    url: &str,
+    already_running: bool,
+    firewall_status: LaunchFirewallStatus,
+) -> Result<String, String> {
     let (base, ticket) = url
         .split_once("#access=")
         .ok_or("管理画面の認証を準備できません。")?;
@@ -271,17 +350,26 @@ pub fn browser_launch_url(url: &str, already_running: bool) -> Result<String, St
         return Err("管理画面の認証を準備できません。".into());
     }
     Ok(format!(
-        "{url}#access={ticket}&notice={}",
+        "{url}#access={ticket}&notice={}{}",
         if already_running {
             "hub-already-running"
         } else {
             "hub-started"
-        }
+        },
+        if firewall_status.requires_setup() {
+            "&section=network-step-firewall"
+        } else {
+            ""
+        },
     ))
 }
 
-pub fn open_browser(url: &str, already_running: bool) -> Result<(), String> {
-    let url = browser_launch_url(url, already_running)?;
+pub fn open_browser(
+    url: &str,
+    already_running: bool,
+    firewall_status: LaunchFirewallStatus,
+) -> Result<(), String> {
+    let url = browser_launch_url(url, already_running, firewall_status)?;
     let error = "ブラウザーを開けません。Hub PC の moyAI Team Management を開き直してください。";
     #[cfg(windows)]
     {
@@ -369,15 +457,41 @@ mod tests {
         let url = "http://127.0.0.1:9081/admin/";
         let access = format!("{url}#access={}", "a".repeat(64));
         assert_eq!(
-            browser_launch_url(&access, true).unwrap(),
+            browser_launch_url(&access, true, LaunchFirewallStatus::Matching).unwrap(),
             format!("{access}&notice=hub-already-running")
         );
         assert_eq!(
-            browser_launch_url(&access, false).unwrap(),
+            browser_launch_url(&access, false, LaunchFirewallStatus::NotChecked).unwrap(),
             format!("{access}&notice=hub-started")
         );
-        assert!(browser_launch_url("http://example.com/admin/", true).is_err());
-        assert!(browser_launch_url("http://127.0.0.1:9081/admin/#other", true).is_err());
+        for status in [
+            LaunchFirewallStatus::Missing,
+            LaunchFirewallStatus::Mismatch,
+            LaunchFirewallStatus::Conflict,
+            LaunchFirewallStatus::Unknown,
+        ] {
+            for running in [false, true] {
+                let target = browser_launch_url(&access, running, status).unwrap();
+                assert!(target.ends_with("&section=network-step-firewall"));
+                assert!(target.starts_with(&access));
+            }
+        }
+        assert!(
+            browser_launch_url(
+                "http://example.com/admin/",
+                true,
+                LaunchFirewallStatus::Unknown
+            )
+            .is_err()
+        );
+        assert!(
+            browser_launch_url(
+                "http://127.0.0.1:9081/admin/#other",
+                true,
+                LaunchFirewallStatus::Unknown
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -390,9 +504,170 @@ mod tests {
             format!("http://127.0.0.1:9081/admin/#access={}g", "a".repeat(63)),
             "http://127.0.0.1:9081/admin/#access=too-short".to_owned(),
         ] {
-            let error = open_browser(&value, true).unwrap_err();
+            let error = open_browser(&value, true, LaunchFirewallStatus::Unknown).unwrap_err();
             assert!(!error.contains(&ticket));
             assert!(!error.contains("http"));
+        }
+    }
+
+    #[test]
+    fn only_two_loopback_listeners_skip_the_inbound_rule_check() {
+        for address in ["127.0.0.1", "[::1]"] {
+            assert!(loopback_listeners(&json!({"server":{
+                "bind":format!("https://{address}:9471"),
+                "gateway_bind":format!("https://{address}:11473")
+            }})));
+        }
+        for gateway in [
+            "https://192.168.1.10:11473",
+            "https://0.0.0.0:11473",
+            "https://localhost:11473",
+            "http://127.0.0.1:11473",
+            "invalid",
+        ] {
+            assert!(!loopback_listeners(&json!({"server":{
+                "bind":"https://127.0.0.1:9471","gateway_bind":gateway
+            }})));
+        }
+        assert!(!loopback_listeners(
+            &json!({"server":{"bind":"https://127.0.0.1:9471"}})
+        ));
+    }
+
+    #[tokio::test]
+    async fn repeated_and_resumed_launch_inspect_rules_without_requesting_a_change() {
+        use super::super::{Descriptor, write_descriptor};
+        use axum::{
+            Json, Router,
+            routing::{get, post},
+        };
+        use std::sync::{Arc, Mutex};
+
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("project_sandbox/hub-launch-firewall-tests");
+        std::fs::create_dir_all(&fixtures).unwrap();
+        for start_running in [true, false] {
+            for (reply, expected) in [
+                (
+                    json!({"ok":true,"value":{"state":"matching"}}),
+                    LaunchFirewallStatus::Matching,
+                ),
+                (
+                    json!({"ok":true,"value":{"state":"missing"}}),
+                    LaunchFirewallStatus::Missing,
+                ),
+                (
+                    json!({"ok":true,"value":{"state":"mismatch"}}),
+                    LaunchFirewallStatus::Mismatch,
+                ),
+                (
+                    json!({"ok":true,"value":{"state":"conflict"}}),
+                    LaunchFirewallStatus::Conflict,
+                ),
+                (
+                    json!({"ok":true,"value":{"state":"new-unknown-state"}}),
+                    LaunchFirewallStatus::Unknown,
+                ),
+                (
+                    json!({"ok":false,"error":"OS inspection unavailable"}),
+                    LaunchFirewallStatus::Unknown,
+                ),
+            ] {
+                let directory = tempfile::tempdir_in(&fixtures).unwrap();
+                let catalog =
+                    canonical_catalog(&directory.path().join("catalog.json"), true).unwrap();
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let descriptor = Descriptor {
+                    schema_version: 1,
+                    instance_id: "A".repeat(26),
+                    pid: std::process::id(),
+                    port: listener.local_addr().unwrap().port(),
+                    token: "a".repeat(52),
+                    catalog_path: catalog.clone(),
+                };
+                write_descriptor(&descriptor).unwrap();
+                let health = json!({"closing":false,"instance_id":descriptor.instance_id,
+                    "pid":descriptor.pid,"catalog_path":catalog});
+                let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+                let recorded = calls.clone();
+                let running = Arc::new(Mutex::new(start_running));
+                let router = Router::new()
+                    .route(
+                        "/host/health",
+                        get(move || {
+                            let health = health.clone();
+                            async move { Json(health) }
+                        }),
+                    )
+                    .route(
+                        "/host/command",
+                        post(move |Json(request): Json<Value>| {
+                            let reply = reply.clone();
+                            let recorded = recorded.clone();
+                            let running = running.clone();
+                            async move {
+                                let command = request["command"].as_str().unwrap();
+                                recorded.lock().unwrap().push(command.to_owned());
+                                let value = match command {
+                                    "hub_web_status" => {
+                                        json!({"local_url":"http://127.0.0.1:9080/admin/"})
+                                    }
+                                    "hub_network_snapshot" => json!({"server":{
+                                    "running":*running.lock().unwrap(),
+                                    "bind":"https://192.168.1.10:9471",
+                                    "gateway_bind":"https://192.168.1.10:11473"
+                                },"hosting":{"configured":true}}),
+                                    "hub_snapshot" => {
+                                        json!({"server":{"running":true},"gateway":{"ready":true}})
+                                    }
+                                    "hub_network_start_saved" => {
+                                        *running.lock().unwrap() = true;
+                                        json!({})
+                                    }
+                                    "hub_firewall_status" => return Json(reply),
+                                    other => panic!("unexpected launcher command: {other}"),
+                                };
+                                Json(json!({"ok":true,"value":value}))
+                            }
+                        }),
+                    );
+                let server =
+                    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+                let report = launch_server(Path::new("unused-existing-host.exe"), &catalog, &[])
+                    .await
+                    .unwrap();
+                server.abort();
+                let _ = server.await;
+                assert!(report.already_running && report.network_running);
+                assert!(!report.needs_setup);
+                assert!(report.network_error.is_none());
+                assert_eq!(report.firewall_status, expected);
+                assert_eq!(
+                    report.firewall_error.is_some(),
+                    expected == LaunchFirewallStatus::Unknown
+                );
+                let calls = calls.lock().unwrap();
+                assert_eq!(
+                    calls
+                        .iter()
+                        .filter(|v| v.as_str() == "hub_firewall_status")
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    calls
+                        .iter()
+                        .filter(|v| v.as_str() == "hub_network_start_saved")
+                        .count(),
+                    usize::from(!start_running)
+                );
+                assert!(!calls.iter().any(|v| matches!(
+                    v.as_str(),
+                    "hub_firewall_apply" | "hub_firewall_remove" | "hub_web_open"
+                )));
+            }
         }
     }
 }

@@ -121,7 +121,14 @@ impl AdmissionFixture {
             &SubmitJob {
                 request_id: "request".into(),
                 project_id: "project".into(),
+                project_participation: None,
+                conversation_id: None,
+                revises_job_id: None,
+                expected_revised_revision: None,
                 environment_id: "environment".into(),
+                origin_session_ref: None,
+                origin_turn_ref: None,
+                origin_turn_epoch: None,
                 title: "Work".into(),
                 input: json!({}),
                 descendant_budget: 1,
@@ -193,6 +200,798 @@ impl AdmissionFixture {
         drop(guard);
         future.await
     }
+}
+
+#[tokio::test]
+async fn runner_data_http_routes_stage_child_input_and_scope_child_artifacts() {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    let fixture = AdmissionFixture::new();
+    let app = super::data::routes()
+        .layer(Extension(fixture.device.clone()))
+        .with_state(fixture.state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let parent = fixture.assignment.clone();
+    {
+        let mut work = fixture.state.store.lock().unwrap();
+        work.report(
+            &fixture.device.device_id,
+            &fixture.report("http-parent-start", ReportOutcome::Started),
+            crate::service::now_ms(),
+        )
+        .unwrap();
+    }
+    let content = b"print('hello')\n";
+    let input = body(
+        client
+            .post(format!(
+                "{endpoint}/v1/shared/runner/attempts/{}/assets",
+                parent.attempt_id
+            ))
+            .json(
+                &json!({"generation":parent.generation,"kind":"input","base_sha256":null,
+            "upload":{"request_id":"http-child-input","name":"src/app.py",
+            "content_base64":base64::engine::general_purpose::STANDARD.encode(content),
+            "sha256":format!("{:x}",Sha256::digest(content))}}),
+            )
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(input["kind"], "input");
+    assert_eq!(input["job_id"], parent.job.id);
+    let child = {
+        let mut work = fixture.state.store.lock().unwrap();
+        work.report(&fixture.device.device_id,&fixture.report("http-parent-yield",ReportOutcome::YieldToChild {
+            checkpoint:json!({"version":1}),child_environment_id:"environment".into(),
+            child_title:"Child".into(),child_input:json!({"version":2,"prompt":"Use input","input_refs":[input["id"]]}),
+            resources_released:true,
+        }),crate::service::now_ms()).unwrap();
+        let child = work
+            .claim(&fixture.device.device_id, crate::service::now_ms())
+            .unwrap()
+            .unwrap();
+        work.report(
+            &fixture.device.device_id,
+            &Report {
+                event_id: "http-child-start".into(),
+                attempt_id: child.attempt_id.clone(),
+                generation: child.generation,
+                outcome: ReportOutcome::Started,
+            },
+            crate::service::now_ms(),
+        )
+        .unwrap();
+        child
+    };
+    let child_input = body(
+        client
+            .get(format!(
+                "{endpoint}/v1/shared/runner/attempts/{}/assets/{}",
+                child.attempt_id,
+                input["id"].as_str().unwrap()
+            ))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(child_input["asset"]["id"], input["id"]);
+    let bytes = b"child output";
+    let artifact = body(
+        client
+            .post(format!(
+                "{endpoint}/v1/shared/runner/attempts/{}/assets",
+                child.attempt_id
+            ))
+            .json(
+                &json!({"generation":child.generation,"kind":"artifact","base_sha256":null,
+            "upload":{"request_id":"http-child-artifact","name":"result.txt",
+            "content_base64":base64::engine::general_purpose::STANDARD.encode(bytes),
+            "sha256":format!("{:x}",Sha256::digest(bytes))}}),
+            )
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    let resumed = {
+        let mut work = fixture.state.store.lock().unwrap();
+        work.report(
+            &fixture.device.device_id,
+            &Report {
+                event_id: "http-child-done".into(),
+                attempt_id: child.attempt_id.clone(),
+                generation: child.generation,
+                outcome: ReportOutcome::Finished {
+                    success: true,
+                    result: json!({"done":true}),
+                    resources_released: true,
+                },
+            },
+            crate::service::now_ms(),
+        )
+        .unwrap();
+        work.claim(&fixture.device.device_id, crate::service::now_ms())
+            .unwrap()
+            .unwrap()
+    };
+    let list_url = format!(
+        "{endpoint}/v1/shared/runner/attempts/{}/children/{}/artifacts?generation={}",
+        resumed.attempt_id, child.job.id, resumed.generation
+    );
+    let listed = body(client.get(&list_url).send().await.unwrap()).await;
+    assert_eq!(listed["items"][0]["id"], artifact["id"]);
+    assert_eq!(listed["items"].as_array().unwrap().len(), 1);
+    let download_url = format!(
+        "{endpoint}/v1/shared/runner/attempts/{}/children/{}/artifacts/{}?generation={}",
+        resumed.attempt_id,
+        child.job.id,
+        artifact["id"].as_str().unwrap(),
+        resumed.generation
+    );
+    let downloaded = body(client.get(&download_url).send().await.unwrap()).await;
+    assert_eq!(downloaded["asset"]["id"], artifact["id"]);
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(downloaded["content_base64"].as_str().unwrap())
+            .unwrap(),
+        bytes
+    );
+    assert_eq!(
+        client
+            .get(format!("{list_url}0"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn origin_lookup_route_requires_bound_session_and_keeps_independent_pages() {
+    let fixture = AdmissionFixture::new();
+    let job = {
+        let mut work = fixture.state.store.lock().unwrap();
+        work.submit_for_device(
+            &fixture.actor,
+            &SubmitJob {
+                request_id: "origin-route".into(),
+                project_id: "project".into(),
+                project_participation: None,
+                conversation_id: None,
+                revises_job_id: None,
+                expected_revised_revision: None,
+                environment_id: "environment".into(),
+                origin_session_ref: Some("private-chat".into()),
+                origin_turn_ref: None,
+                origin_turn_epoch: None,
+                title: "From chat".into(),
+                input: json!({"prompt":"test"}),
+                descendant_budget: 0,
+                start_before_ms: None,
+            },
+            crate::service::now_ms(),
+            Some(&fixture.device.device_id),
+        )
+        .unwrap()
+    };
+    let input = || OriginWorkQuery {
+        job_before: None,
+        service_before: None,
+        include_jobs: None,
+        include_services: None,
+    };
+    assert_eq!(
+        origin_work(
+            State(fixture.state.clone()),
+            HeaderMap::new(),
+            Extension(fixture.device.clone()),
+            Path("private-chat".into()),
+            Query(input()),
+        )
+        .await
+        .unwrap_err()
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let session = device_session(
+        State(fixture.state.clone()),
+        Extension(fixture.device.clone()),
+    )
+    .await
+    .unwrap()
+    .0;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "authorization",
+        format!("Bearer {}", session.token).parse().unwrap(),
+    );
+    let result = origin_work(
+        State(fixture.state.clone()),
+        headers.clone(),
+        Extension(fixture.device.clone()),
+        Path("private-chat".into()),
+        Query(input()),
+    )
+    .await
+    .unwrap()
+    .0;
+    assert_eq!(result.jobs.len(), 1);
+    assert_eq!(result.jobs[0].project_id, "project");
+    assert_eq!(result.jobs[0].job.id, job.id);
+    assert_eq!(result.jobs[0].job.conversation_id, job.conversation_id);
+    assert!(result.retained_services.is_empty());
+    let no_jobs = origin_work(
+        State(fixture.state.clone()),
+        headers.clone(),
+        Extension(fixture.device.clone()),
+        Path("private-chat".into()),
+        Query(OriginWorkQuery {
+            include_jobs: Some(false),
+            ..input()
+        }),
+    )
+    .await
+    .unwrap()
+    .0;
+    assert!(no_jobs.jobs.is_empty());
+    let wrong_device = DeviceIdentity {
+        device_id: "foreign".into(),
+        ..fixture.device.clone()
+    };
+    assert_eq!(
+        origin_work(
+            State(fixture.state.clone()),
+            headers,
+            Extension(wrong_device),
+            Path("private-chat".into()),
+            Query(input()),
+        )
+        .await
+        .unwrap_err()
+        .0,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn origin_stop_and_history_routes_require_the_bound_device_and_fence_submit() {
+    let fixture = AdmissionFixture::new();
+    let session = device_session(
+        State(fixture.state.clone()),
+        Extension(fixture.device.clone()),
+    )
+    .await
+    .unwrap()
+    .0;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "authorization",
+        format!("Bearer {}", session.token).parse().unwrap(),
+    );
+    let admit = || OriginTurnAdmit {
+        request_id: "turn-admit".into(),
+        create: true,
+        origin_turn_revision: 1,
+    };
+    assert_eq!(
+        origin_turn_admit(
+            State(fixture.state.clone()),
+            HeaderMap::new(),
+            Extension(fixture.device.clone()),
+            Path(("chat".into(), "turn-1".into())),
+            Json(admit())
+        )
+        .await
+        .unwrap_err()
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let wrong = DeviceIdentity {
+        device_id: "foreign".into(),
+        ..fixture.device.clone()
+    };
+    assert_eq!(
+        origin_turn_admit(
+            State(fixture.state.clone()),
+            headers.clone(),
+            Extension(wrong),
+            Path(("chat".into(), "turn-1".into())),
+            Json(admit())
+        )
+        .await
+        .unwrap_err()
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    let admitted = origin_turn_admit(
+        State(fixture.state.clone()),
+        headers.clone(),
+        Extension(fixture.device.clone()),
+        Path(("chat".into(), "turn-1".into())),
+        Json(admit()),
+    )
+    .await
+    .unwrap()
+    .0;
+    let job = submit(
+        State(fixture.state.clone()),
+        headers.clone(),
+        Extension(fixture.device.clone()),
+        Json(SubmitJob {
+            request_id: "turn-job".into(),
+            project_id: "project".into(),
+            project_participation: None,
+            conversation_id: None,
+            revises_job_id: None,
+            expected_revised_revision: None,
+            environment_id: "environment".into(),
+            origin_session_ref: Some("chat".into()),
+            origin_turn_ref: Some("turn-1".into()),
+            origin_turn_epoch: admitted["epoch"].as_u64(),
+            title: "Turn job".into(),
+            input: json!({"prompt":"test"}),
+            descendant_budget: 0,
+            start_before_ms: None,
+        }),
+    )
+    .await
+    .unwrap()
+    .0;
+    let page = conversation_history(
+        State(fixture.state.clone()),
+        headers.clone(),
+        Extension(fixture.device.clone()),
+        Path(job.id.clone()),
+        Query(ConversationHistoryQuery {
+            project_id: "project".into(),
+            snapshot: None,
+            before: None,
+            limit: Some(1),
+        }),
+    )
+    .await
+    .unwrap()
+    .0;
+    assert_eq!(page.jobs[0].job.id, job.id);
+    let wrong = DeviceIdentity {
+        device_id: "foreign".into(),
+        ..fixture.device.clone()
+    };
+    assert_eq!(
+        conversation_history(
+            State(fixture.state.clone()),
+            headers.clone(),
+            Extension(wrong),
+            Path(job.id.clone()),
+            Query(ConversationHistoryQuery {
+                project_id: "project".into(),
+                snapshot: None,
+                before: None,
+                limit: Some(1)
+            })
+        )
+        .await
+        .unwrap_err()
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    let accepted = origin_turn_stop(
+        State(fixture.state.clone()),
+        headers.clone(),
+        Extension(fixture.device.clone()),
+        Path(("chat".into(), "turn-1".into())),
+        Json(OriginTurnStop {
+            request_id: "stop-turn".into(),
+            origin_turn_revision: 1,
+        }),
+    )
+    .await
+    .unwrap()
+    .0;
+    assert_eq!(accepted["accepted"], true);
+    assert_eq!(
+        fixture
+            .state
+            .store
+            .lock()
+            .unwrap()
+            .job(&fixture.actor, &job.id)
+            .unwrap()
+            .state,
+        JobState::Cancelled
+    );
+    assert_eq!(
+        submit(
+            State(fixture.state.clone()),
+            headers.clone(),
+            Extension(fixture.device.clone()),
+            Json(SubmitJob {
+                request_id: "late-turn-job".into(),
+                project_id: "project".into(),
+                project_participation: None,
+                conversation_id: None,
+                revises_job_id: None,
+                expected_revised_revision: None,
+                environment_id: "environment".into(),
+                origin_session_ref: Some("chat".into()),
+                origin_turn_ref: Some("turn-1".into()),
+                origin_turn_epoch: admitted["epoch"].as_u64(),
+                title: "Late".into(),
+                input: json!({}),
+                descendant_budget: 0,
+                start_before_ms: None,
+            })
+        )
+        .await
+        .unwrap_err()
+        .0,
+        StatusCode::CONFLICT
+    );
+    let stopped = origin_stop(
+        State(fixture.state.clone()),
+        headers.clone(),
+        Extension(fixture.device.clone()),
+        Path("chat".into()),
+        Json(OriginStop {
+            request_id: "stop-all".into(),
+            through_revision: 1,
+        }),
+    )
+    .await
+    .unwrap()
+    .0;
+    assert_eq!(stopped["origin_turn_ref"], Value::Null);
+    assert_eq!(
+        origin_turn_admit(
+            State(fixture.state.clone()),
+            headers.clone(),
+            Extension(fixture.device.clone()),
+            Path(("chat".into(), "delayed-turn".into())),
+            Json(OriginTurnAdmit {
+                request_id: "delayed".into(),
+                create: true,
+                origin_turn_revision: 1
+            })
+        )
+        .await
+        .unwrap_err()
+        .0,
+        StatusCode::CONFLICT
+    );
+    assert!(
+        origin_turn_admit(
+            State(fixture.state.clone()),
+            headers,
+            Extension(fixture.device.clone()),
+            Path(("chat".into(), "next-turn".into())),
+            Json(OriginTurnAdmit {
+                request_id: "next".into(),
+                create: true,
+                origin_turn_revision: 2
+            })
+        )
+        .await
+        .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn runner_capability_header_gates_claim_poll_and_attempt_detail() {
+    let fixture = AdmissionFixture::new();
+    let job_id = fixture.assignment.job.id.clone();
+    fixture
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .db
+        .execute(
+            "UPDATE shared_jobs SET required_capability=?2 WHERE id=?1",
+            rusqlite::params![job_id, store::MULTI_DEVICE_SESSION_CAPABILITY],
+        )
+        .unwrap();
+    let scope = || AssignmentScope {
+        environment_ids: None,
+    };
+    let old_poll = assignments(
+        State(fixture.state.clone()),
+        HeaderMap::new(),
+        Extension(fixture.device.clone()),
+        Query(scope()),
+    )
+    .await
+    .unwrap()
+    .0;
+    assert!(old_poll.is_empty());
+    assert!(
+        claim(
+            State(fixture.state.clone()),
+            HeaderMap::new(),
+            Extension(fixture.device.clone()),
+            None,
+        )
+        .await
+        .unwrap()
+        .0
+        .is_none()
+    );
+    assert_eq!(
+        attempt(
+            State(fixture.state.clone()),
+            HeaderMap::new(),
+            Extension(fixture.device.clone()),
+            Path(fixture.assignment.attempt_id.clone()),
+        )
+        .await
+        .unwrap_err()
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    let mut capable = HeaderMap::new();
+    capable.insert(
+        "x-moyai-runner-capabilities",
+        store::MULTI_DEVICE_SESSION_CAPABILITY.parse().unwrap(),
+    );
+    let poll = assignments(
+        State(fixture.state.clone()),
+        capable.clone(),
+        Extension(fixture.device.clone()),
+        Query(scope()),
+    )
+    .await
+    .unwrap()
+    .0;
+    assert_eq!(poll.len(), 1);
+    assert_eq!(
+        poll[0].required_runner_capabilities,
+        [store::MULTI_DEVICE_SESSION_CAPABILITY]
+    );
+    assert_eq!(
+        claim(
+            State(fixture.state.clone()),
+            capable.clone(),
+            Extension(fixture.device.clone()),
+            None,
+        )
+        .await
+        .unwrap()
+        .0
+        .unwrap()
+        .attempt_id,
+        fixture.assignment.attempt_id
+    );
+    assert_eq!(
+        attempt(
+            State(fixture.state.clone()),
+            capable,
+            Extension(fixture.device.clone()),
+            Path(fixture.assignment.attempt_id.clone()),
+        )
+        .await
+        .unwrap()
+        .0
+        .assignment
+        .attempt_id,
+        fixture.assignment.attempt_id
+    );
+}
+
+#[tokio::test]
+async fn runner_service_stop_route_requires_current_attempt_generation() {
+    let fixture = AdmissionFixture::new();
+    let now = crate::service::now_ms();
+    {
+        let mut work = fixture.state.store.lock().unwrap();
+        work.report(
+            &fixture.device.device_id,
+            &fixture.report("started", ReportOutcome::Started),
+            now,
+        )
+        .unwrap();
+        work.report(
+            &fixture.device.device_id,
+            &fixture.report(
+                "retain",
+                ReportOutcome::RetainService {
+                    service_id: "preview".into(),
+                    expires_at_ms: now + 60_000,
+                },
+            ),
+            now,
+        )
+        .unwrap();
+    }
+    let stale = conversation_service_stop(
+        State(fixture.state.clone()),
+        Extension(fixture.device.clone()),
+        Path("preview".into()),
+        Json(ConversationServiceStop {
+            attempt_id: fixture.assignment.attempt_id.clone(),
+            generation: fixture.assignment.generation + 1,
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(stale.0, StatusCode::FORBIDDEN);
+    let stopped = conversation_service_stop(
+        State(fixture.state.clone()),
+        Extension(fixture.device.clone()),
+        Path("preview".into()),
+        Json(ConversationServiceStop {
+            attempt_id: fixture.assignment.attempt_id.clone(),
+            generation: fixture.assignment.generation,
+        }),
+    )
+    .await
+    .unwrap()
+    .0;
+    assert!(stopped.stop_requested);
+    assert!(stopped.can_stop);
+    let lease = runner_services(
+        State(fixture.state.clone()),
+        Extension(fixture.device.clone()),
+    )
+    .await
+    .unwrap()
+    .0;
+    assert_eq!(lease.len(), 1);
+    assert!(lease[0].stop_requested);
+    let scoped = conversation_services_for_attempt(
+        State(fixture.state.clone()),
+        Extension(fixture.device.clone()),
+        Query(ConversationServicesQuery {
+            attempt_id: fixture.assignment.attempt_id.clone(),
+            generation: fixture.assignment.generation,
+        }),
+    )
+    .await
+    .unwrap()
+    .0;
+    assert_eq!(scoped.len(), 1);
+    assert_eq!(scoped[0].service_id, "preview");
+    let stale_discovery = conversation_services_for_attempt(
+        State(fixture.state.clone()),
+        Extension(fixture.device.clone()),
+        Query(ConversationServicesQuery {
+            attempt_id: fixture.assignment.attempt_id.clone(),
+            generation: fixture.assignment.generation + 1,
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(stale_discovery.0, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn conversation_stop_handler_requires_device_bound_person_and_project_control() {
+    let fixture = AdmissionFixture::new();
+    let now = crate::service::now_ms();
+    {
+        let mut work = fixture.state.store.lock().unwrap();
+        let command = ManagementCommand {
+            request_id: "enable-controller-for-stop".into(),
+            expected_revision: work.management_snapshot(&fixture.actor).unwrap()["revision"]
+                .as_str()
+                .unwrap()
+                .into(),
+            request: ManagementRequest::SaveProject {
+                id: "project".into(),
+                label: "Project".into(),
+                archived: false,
+                members: Some(vec![ProjectMember {
+                    user_id: fixture.actor.user_id.clone(),
+                    role: ProjectRole::Manager,
+                }]),
+                controller_device_ids: vec![fixture.device.device_id.clone()],
+                runner_device_ids: vec![fixture.device.device_id.clone()],
+            },
+        };
+        work.manage(&fixture.actor, &command, now).unwrap();
+        work.report(
+            &fixture.device.device_id,
+            &fixture.report("started", ReportOutcome::Started),
+            now,
+        )
+        .unwrap();
+        work.report(
+            &fixture.device.device_id,
+            &fixture.report(
+                "retained",
+                ReportOutcome::RetainService {
+                    service_id: "api-preview".into(),
+                    expires_at_ms: now + 60_000,
+                },
+            ),
+            now,
+        )
+        .unwrap();
+    }
+    let session = device_session(
+        State(fixture.state.clone()),
+        Extension(fixture.device.clone()),
+    )
+    .await
+    .unwrap()
+    .0;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "authorization",
+        format!("Bearer {}", session.token).parse().unwrap(),
+    );
+    let conversation_id = fixture.assignment.job.conversation_id.clone();
+    let input = || StopConversationServices {
+        project_id: "project".into(),
+        request_id: "stop-api-request".into(),
+    };
+    assert_eq!(
+        stop_conversation_services(
+            State(fixture.state.clone()),
+            HeaderMap::new(),
+            Extension(fixture.device.clone()),
+            Path(conversation_id.clone()),
+            Json(input()),
+        )
+        .await
+        .unwrap_err()
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        stop_conversation_services(
+            State(fixture.state.clone()),
+            headers.clone(),
+            Extension(fixture.device.clone()),
+            Path("other-conversation".into()),
+            Json(input()),
+        )
+        .await
+        .unwrap_err()
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    let first = stop_conversation_services(
+        State(fixture.state.clone()),
+        headers.clone(),
+        Extension(fixture.device.clone()),
+        Path(conversation_id.clone()),
+        Json(input()),
+    )
+    .await
+    .unwrap()
+    .0;
+    assert_eq!(first["accepted"], true);
+    assert_eq!(first["conversation_id"], conversation_id);
+    assert_eq!(
+        stop_conversation_services(
+            State(fixture.state.clone()),
+            headers,
+            Extension(fixture.device.clone()),
+            Path(conversation_id),
+            Json(input()),
+        )
+        .await
+        .unwrap()
+        .0,
+        first
+    );
+    assert!(
+        fixture
+            .state
+            .store
+            .lock()
+            .unwrap()
+            .runner_services(&fixture.device.device_id, now)
+            .unwrap()[0]
+            .stop_requested
+    );
 }
 
 #[tokio::test]
@@ -395,7 +1194,14 @@ async fn real_tls_requires_person_and_device_and_preserves_job_across_client_con
     let old_request = SubmitJob {
         request_id: "offline-expired".into(),
         project_id: "alpha".into(),
+        project_participation: None,
+        conversation_id: None,
+        revises_job_id: None,
+        expected_revised_revision: None,
         environment_id: "solver".into(),
+        origin_session_ref: None,
+        origin_turn_ref: None,
+        origin_turn_epoch: None,
         title: "Offline request".into(),
         input: json!({"version":1,"prompt":"old"}),
         descendant_budget: 0,
@@ -1064,7 +1870,14 @@ async fn revoked_runner_can_settle_its_existing_attempts_but_cannot_start_or_del
     let input = |id: &str| SubmitJob {
         request_id: id.into(),
         project_id: "alpha".into(),
+        project_participation: None,
+        conversation_id: None,
+        revises_job_id: None,
+        expected_revised_revision: None,
         environment_id: "solver".into(),
+        origin_session_ref: None,
+        origin_turn_ref: None,
+        origin_turn_epoch: None,
         title: "停止確認".into(),
         input: json!({}),
         descendant_budget: 1,

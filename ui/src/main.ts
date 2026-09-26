@@ -54,7 +54,8 @@ let snapshot: Snapshot | null = null;
 let pending: Snapshot | null = null;
 let pollInFlight = false;
 let launchNotice = window.location.hash === "#hub-already-running" ? "moyAI Hub は起動済みです。稼働中の Hub の管理画面を開きました。"
-    : window.location.hash === "#hub-started" ? "moyAI Hub を起動しました。ブラウザーを閉じても Hub は動作を続けます。" : null;
+    : window.location.hash === "#hub-started" ? "moyAI Hub を起動しました。ブラウザーを閉じても Hub は動作を続けます。"
+    : window.location.hash === "#network-step-firewall" ? "Hubは起動しています。別PCを接続するため、Windowsの受信許可を確認してください。" : null;
 let pointerActive = false;
 const keys = new Set<string>();
 let composing = false;
@@ -180,6 +181,8 @@ async function poll() {
         if (launchNotice) {
             notify(launchNotice);
             launchNotice = null;
+            if (window.location.hash === "#network-step-firewall" && !interactionActive())
+                el("network-step-firewall").scrollIntoView({block:"start"});
             if (["#hub-started", "#hub-already-running"].includes(window.location.hash))
                 window.history.replaceState(null, "", window.location.pathname + window.location.search);
         }
@@ -206,13 +209,13 @@ interface Evidence {
 const discoveryOwner = new DiscoveryOwner();
 let evidence: Evidence | null = null;
 let timer: ReturnType<typeof setTimeout> | undefined;
-let discovering: number | null = null;
+let discovering: { generation: number; endpoint: string; providerProfile: string } | null = null;
 function discoveryStatus(message: string, error = false) {
     const target = el("discovery-status");
     target.textContent = message;
     target.classList.toggle("error", error);
 }
-function invalidateDiscovery() {
+function invalidateDiscovery(schedule = true) {
     input("allow-tools").checked = false;
     discoveryOwner.invalidate();
     evidence = null;
@@ -221,16 +224,17 @@ function invalidateDiscovery() {
     select("model").disabled = true;
     button("register").disabled = true;
     discoveryStatus("入力したホストを確認します…");
-    if (input("endpoint").value.trim() && !composing)
+    if (schedule && input("endpoint").value.trim() && !input("api-key").value && !composing)
         timer = setTimeout(() => void discover(), 650);
     else
-        discoveryStatus("ホストを指定してください。");
+        discoveryStatus(input("endpoint").value.trim() ? "接続先とAPIキーを確認して「モデルを取得」を押してください。" : "ホストを指定してください。");
 }
-input("endpoint").addEventListener("input", invalidateDiscovery);
-select("profile").addEventListener("change", invalidateDiscovery);
-input("endpoint").addEventListener("blur", () => {
+input("endpoint").addEventListener("input", () => invalidateDiscovery());
+select("profile").addEventListener("change", () => invalidateDiscovery());
+input("api-key").addEventListener("input", () => invalidateDiscovery(false));
+input("endpoint").addEventListener("blur", event => {
     clearTimeout(timer);
-    if (!evidence)
+    if (!evidence && event.relatedTarget !== input("api-key"))
         void discover();
 });
 input("endpoint").addEventListener("compositionend", () => {
@@ -239,17 +243,29 @@ input("endpoint").addEventListener("compositionend", () => {
 });
 button("discover").addEventListener("click", () => {
     clearTimeout(timer);
-    discoveryOwner.invalidate();
-    void discover();
+    // Clicking the button blurs the endpoint field first. That blur may have
+    // already started this exact discovery; a second request would replace its
+    // server-side evidence while the first candidate is still on screen.
+    if (!discovering || !discoveryOwner.accepts(discovering.generation)
+        || discovering.endpoint !== input("endpoint").value.trim()
+        || discovering.providerProfile !== select("profile").value)
+        discoveryOwner.invalidate();
+    void discover(true);
 });
-async function discover() {
+async function discover(explicit = false) {
     const endpoint = input("endpoint").value.trim(), providerProfile = select("profile").value;
+    const apiKey = input("api-key").value || null;
     if (!endpoint || composing)
         return;
-    const generation = discoveryOwner.capture();
-    if (discovering === generation)
+    if (!explicit && (apiKey || document.activeElement === input("api-key"))) {
+        if (apiKey)
+            discoveryStatus("接続先とAPIキーを確認して「モデルを取得」を押してください。");
         return;
-    discovering = generation;
+    }
+    const generation = discoveryOwner.capture();
+    if (discovering?.generation === generation)
+        return;
+    discovering = { generation, endpoint, providerProfile };
     evidence = null;
     button("register").disabled = true;
     select("model").disabled = true;
@@ -257,7 +273,8 @@ async function discover() {
     try {
         const result = await invoke<Evidence>("hub_discover", {
             endpoint,
-            providerProfile
+            providerProfile,
+            apiKey
         });
         if (!discoveryOwner.accepts(generation))
             return;
@@ -271,7 +288,7 @@ async function discover() {
             discoveryStatus(errorText(error), true);
     }
     finally {
-        if (discovering === generation)
+        if (discovering?.generation === generation)
             discovering = null;
     }
 }
@@ -311,6 +328,11 @@ el<HTMLFormElement>("register-form").addEventListener("submit", async (event) =>
             select("model").value = "";
             input("label").value = "";
             input("allow-tools").checked = false;
+            if (input("api-key").value) {
+                input("api-key").value = "";
+                invalidateDiscovery(false);
+                discoveryStatus("登録しました。別のモデルを追加する場合は、接続先とAPIキーを確認してモデルを取得してください。");
+            }
         }
         await poll();
     }
@@ -392,6 +414,13 @@ el("model-rows").addEventListener("click", event => {
         revision: snapshot.store.revision
     };
     input("edit-label").value = row.deployment.label;
+    input("edit-api-key").value = "";
+    input("edit-api-key").disabled = false;
+    input("edit-api-key").placeholder = row.deployment.upstream_credential_id ? "変更する場合だけ入力" : "APIキーを入力";
+    input("edit-api-key-clear").checked = false;
+    el("edit-api-key-clear-label").hidden = !row.deployment.upstream_credential_id;
+    setText("edit-api-key-status", row.deployment.upstream_credential_id
+        ? "設定済みです。空欄のまま保存すると変更しません。" : "APIキーは未設定です。");
     input("edit-enabled").checked = row.deployment.enabled;
     input("edit-capacity").value = String(snapshot.store.catalog.capacity_pools.find(pool => pool.id === row.deployment.capacity_pool_id)?.max_concurrent ?? 1);
     setText("edit-target", `${row.deployment.provider_model} · ${row.deployment.endpoint}`);
@@ -401,9 +430,20 @@ el("model-rows").addEventListener("click", event => {
     dialog.showModal();
 });
 button("close-edit").addEventListener("click", () => dialog.close());
+input("edit-api-key-clear").addEventListener("change", () => {
+    input("edit-api-key").disabled = input("edit-api-key-clear").checked;
+    if (input("edit-api-key-clear").checked)
+        input("edit-api-key").value = "";
+});
 dialog.addEventListener("close", () => {
+    input("edit-api-key").value = "";
     editTarget = null;
     flush();
+});
+window.addEventListener("pagehide", () => {
+    input("api-key").value = "";
+    input("edit-api-key").value = "";
+    invalidateDiscovery(false);
 });
 async function saveEdit(remove: boolean) {
     if (!editTarget)
@@ -418,6 +458,7 @@ async function saveEdit(remove: boolean) {
                 label: input("edit-label").value,
                 capacity: Number(input("edit-capacity").value),
                 enabled: input("edit-enabled").checked,
+                api_key: remove ? null : input("edit-api-key-clear").checked ? "" : input("edit-api-key").value || null,
                 remove
             }
         });

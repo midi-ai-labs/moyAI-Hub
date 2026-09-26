@@ -113,6 +113,26 @@ test("Model registration, profile discovery, edit and deletion use the real cata
     } finally { await provider.close(); }
 });
 
+test("Blur and Discover click share one in-flight model evidence", async ({ page, hub }) => {
+    const provider = await createMetadataProvider();
+    const hold = provider.holdNext();
+    try {
+        await ready(page, hub.url);
+        await page.locator('nav a[href="#models"]').click();
+        await page.locator("#endpoint").fill(provider.url);
+        await page.locator("#discover").click();
+        await hold.arrival;
+        hold.release();
+        await expect(page.locator("#model option")).toHaveCount(3);
+        expect(provider.requests.filter(row => row.path === "/v1/models")).toHaveLength(1);
+        await page.locator("#model").selectOption("fixture-alpha");
+        await page.locator("#label").fill("Blur candidate");
+        await page.locator("#register").click();
+        await expect(page.locator("#model-rows")).toContainText("Blur candidate");
+        await expect(page.locator("#discovery-status")).not.toContainText("候補の有効期限が切れました");
+    } finally { hold.release(); await provider.close(); }
+});
+
 test("Delayed discovery from a previous host cannot replace the selected host's models", async ({ page, hub }, testInfo) => {
     const older = await createMetadataProvider(), current = await createMetadataProvider();
     older.setModels(["old-host-model"]); current.setModels(["current-host-model"]);
@@ -137,6 +157,44 @@ test("Delayed discovery from a previous host cannot replace the selected host's 
         expect(catalog.deployments[0].deployment.provider_model).toBe("current-host-model");
         await screenshot(page, testInfo, "discovery-current-host");
     } finally { hold.release(); await older.close(); await current.close(); }
+});
+
+test("Out-of-order host requests preserve the candidate shown in this view", async ({ page, hub }) => {
+    const older = await createMetadataProvider(), current = await createMetadataProvider();
+    older.setModels(["old-host-model"]); current.setModels(["current-host-model"]);
+    let release, arrived;
+    const gate = new Promise(resolve => { release = resolve; });
+    const arrival = new Promise(resolve => { arrived = resolve; });
+    let held = false;
+    await page.route("**/admin/command", async route => {
+        const request = route.request().postDataJSON();
+        if (!held && request?.command === "hub_discover" && request.args?.endpoint === older.url) {
+            held = true;
+            arrived();
+            await gate;
+        }
+        await route.continue();
+    });
+    try {
+        await ready(page, hub.url);
+        await page.locator('nav a[href="#models"]').click();
+        await page.locator("#endpoint").fill(older.url);
+        await page.locator("#discover").click();
+        await arrival;
+        await page.locator("#endpoint").fill(current.url);
+        await page.locator("#discover").click();
+        await expect(page.locator("#model option")).toHaveText(["モデルを選択", "current-host-model — current-host-model"]);
+        const oldResponse = page.waitForResponse(response => response.url().endsWith("/admin/command")
+            && response.request().postDataJSON()?.command === "hub_discover"
+            && response.request().postDataJSON()?.args?.endpoint === older.url);
+        release();
+        await oldResponse;
+        await page.locator("#model").selectOption("current-host-model");
+        await page.locator("#label").fill("Current after reverse arrival");
+        await page.locator("#register").click();
+        await expect(page.locator("#model-rows")).toContainText("Current after reverse arrival");
+        expect((await hub.command("hub_snapshot")).deployments[0].deployment.endpoint).toBe(current.url);
+    } finally { release(); await page.unroute("**/admin/command"); await older.close(); await current.close(); }
 });
 
 test("Unavailable and empty providers clear candidates, and shared model capacity stays consistent", async ({ page, hub }, testInfo) => {

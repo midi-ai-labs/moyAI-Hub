@@ -27,6 +27,8 @@ mod hosting_options;
 mod network_admin;
 pub(crate) use network_admin::dispatch_network_locked;
 mod network_hosting;
+#[cfg(test)]
+mod upstream_auth_tests;
 
 #[cfg(test)]
 pub(crate) mod test_support {
@@ -48,6 +50,8 @@ struct Evidence {
     id: String,
     discovery: Discovery,
     observed_at_ms: u64,
+    #[serde(skip)]
+    api_key: Option<String>,
 }
 pub struct Admin {
     pub(crate) shared_work: crate::shared_work::SharedStore,
@@ -57,7 +61,7 @@ pub struct Admin {
     path: PathBuf,
     _lock: File,
     server: tokio::sync::Mutex<Option<Server>>,
-    evidence: Mutex<Option<Evidence>>,
+    evidence: Mutex<BTreeMap<String, Evidence>>,
     discovery_generation: AtomicU64,
     refresh_running: std::sync::atomic::AtomicBool,
     pub(crate) network: crate::network::SharedNetwork,
@@ -130,7 +134,7 @@ impl Admin {
             path,
             _lock: lock,
             server: tokio::sync::Mutex::new(None),
-            evidence: Mutex::new(None),
+            evidence: Mutex::new(BTreeMap::new()),
             discovery_generation: AtomicU64::new(0),
             refresh_running: std::sync::atomic::AtomicBool::new(false),
             network: Arc::new(Mutex::new(network)),
@@ -156,6 +160,11 @@ impl Admin {
                     self,
                     argument(&args, "endpoint")?,
                     argument(&args, "providerProfile")?,
+                    args.get("apiKey")
+                        .map(|value| serde_json::from_value(value.clone()))
+                        .transpose()
+                        .map_err(|_| "APIキーの入力を確認してください。")?
+                        .flatten(),
                 )
                 .await?,
             ),
@@ -174,6 +183,14 @@ impl Admin {
             "hub_hosting_options" => hosting_options::snapshot().await,
             "hub_firewall_status" => firewall::status(self).await,
             "hub_firewall_preview" => firewall::preview(self, argument(&args, "scope")?).await,
+            "hub_firewall_export" => {
+                firewall::export(
+                    self,
+                    argument(&args, "scope")?,
+                    argument(&args, "expectedFingerprint")?,
+                )
+                .await
+            }
             "hub_firewall_apply" | "hub_firewall_remove" => {
                 firewall::change(
                     self,
@@ -391,26 +408,47 @@ async fn hub_discover(
     admin: &Admin,
     endpoint: String,
     provider_profile: String,
+    api_key: Option<String>,
 ) -> Result<Evidence, String> {
     let id = admin.discovery_generation.fetch_add(1, Ordering::SeqCst) + 1;
-    *admin
-        .evidence
-        .lock()
-        .map_err(|_| "モデル候補を更新できません。")? = None;
-    let discovered = discovery::discover(&endpoint, &provider_profile)
+    let api_key = api_key.filter(|key| !key.is_empty());
+    let authorization = api_key
+        .as_ref()
+        .map(|key| {
+            crate::upstream_auth::validate_key(key)?;
+            let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}"))
+                .map_err(|_| "APIキーの形式を確認してください。")?;
+            value.set_sensitive(true);
+            Ok::<_, String>(value)
+        })
+        .transpose()?;
+    let discovered = discovery::discover_authenticated(&endpoint, &provider_profile, authorization)
         .await
         .map_err(|error| error.to_string())?;
     let evidence = Evidence {
         id: id.to_string(),
         discovery: discovered,
+        api_key,
         observed_at_ms: now_ms(),
     };
-    if admin.discovery_generation.load(Ordering::SeqCst) == id {
-        *admin
-            .evidence
-            .lock()
-            .map_err(|_| "モデル候補を更新できません。")? = Some(evidence.clone());
+    let mut pending = admin
+        .evidence
+        .lock()
+        .map_err(|_| "モデル候補を更新できません。")?;
+    // A different view's later or earlier discovery must not invalidate the
+    // exact candidate ID already shown to this view. Keep only recent bounded
+    // evidence; registration still checks endpoint, profile and catalog state.
+    pending.retain(|_, row| evidence.observed_at_ms.saturating_sub(row.observed_at_ms) <= 120_000);
+    if pending.len() >= 128 {
+        let oldest = pending
+            .iter()
+            .min_by_key(|(_, row)| row.observed_at_ms)
+            .map(|(id, _)| id.clone());
+        if let Some(oldest) = oldest {
+            pending.remove(&oldest);
+        }
     }
+    pending.insert(evidence.id.clone(), evidence.clone());
     Ok(evidence)
 }
 
@@ -433,10 +471,12 @@ fn hub_register(admin: &Admin, request: Register) -> Result<(), String> {
         .evidence
         .lock()
         .map_err(|_| "モデル候補を確認できません。")?
-        .clone()
-        .ok_or("モデル候補を取得してください。")?;
-    if evidence.id != request.evidence_id
-        || now_ms().saturating_sub(evidence.observed_at_ms) > 120_000
+        .get(&request.evidence_id)
+        .cloned()
+        .ok_or(
+            "ホスト情報が変わったか、候補の有効期限が切れました。モデルを再取得してください。",
+        )?;
+    if now_ms().saturating_sub(evidence.observed_at_ms) > 120_000
         || evidence.discovery.endpoint != discovery::normalize_endpoint(&request.endpoint)?
         || evidence.discovery.provider_profile != request.provider_profile
     {
@@ -456,7 +496,9 @@ fn hub_register(admin: &Admin, request: Register) -> Result<(), String> {
         model.capabilities.insert("tools".into());
     }
     let deployment_id = ulid::Ulid::new().to_string();
-    edit_catalog(admin, parse_revision(&request.revision)?, |catalog| {
+    let directory = admin.path.parent().ok_or("保存先がありません。")?;
+    let mut created_credential = None;
+    let saved = edit_catalog(admin, parse_revision(&request.revision)?, |catalog| {
         if catalog.deployments.iter().any(|row| {
             row.endpoint == evidence.discovery.endpoint
                 && row.provider_model == model.id
@@ -508,10 +550,32 @@ fn hub_register(admin: &Admin, request: Register) -> Result<(), String> {
             endpoint: evidence.discovery.endpoint.clone(),
             provider_model: model.id.clone(),
             provider_profile: request.provider_profile.clone(),
+            upstream_credential_id: None,
             enabled: true,
         });
+        catalog.validate().map_err(|error| error.to_string())?;
+        if let Some(key) = &evidence.api_key {
+            let id = crate::upstream_auth::store(
+                directory,
+                &evidence.discovery.endpoint,
+                &request.provider_profile,
+                key,
+            )?;
+            catalog
+                .deployments
+                .last_mut()
+                .expect("new deployment")
+                .upstream_credential_id = Some(id.clone());
+            created_credential = Some(id);
+        }
         Ok(())
-    })?;
+    });
+    if let Err(error) = saved {
+        if let Some(id) = created_credential {
+            let _ = crate::upstream_auth::remove(directory, &id);
+        }
+        return Err(error);
+    }
     admin
         .core
         .lock()
@@ -529,9 +593,15 @@ struct Edit {
     capacity: u32,
     enabled: bool,
     remove: bool,
+    /// Missing/null preserves the saved key; empty explicitly clears it.
+    #[serde(default)]
+    api_key: Option<String>,
 }
 fn hub_edit(admin: &Admin, request: Edit) -> Result<(), String> {
-    edit_catalog(admin, parse_revision(&request.revision)?, |catalog| {
+    let directory = admin.path.parent().ok_or("保存先がありません。")?;
+    let mut created_credential = None;
+    let mut retired_credential = None;
+    let saved = edit_catalog(admin, parse_revision(&request.revision)?, |catalog| {
         let row = catalog
             .deployments
             .iter()
@@ -539,6 +609,7 @@ fn hub_edit(admin: &Admin, request: Edit) -> Result<(), String> {
             .ok_or("この配置は削除されています。")?
             .clone();
         if request.remove {
+            retired_credential = row.upstream_credential_id.clone();
             catalog.deployments.retain(|d| d.id != row.id);
             if !catalog
                 .deployments
@@ -573,9 +644,49 @@ fn hub_edit(admin: &Admin, request: Edit) -> Result<(), String> {
                 .find(|p| p.id == row.capacity_pool_id)
                 .ok_or("容量プールがありません。")?
                 .max_concurrent = request.capacity;
+            catalog.validate().map_err(|error| error.to_string())?;
+            if let Some(key) = &request.api_key {
+                let next_id = if key.is_empty() {
+                    None
+                } else {
+                    Some(crate::upstream_auth::store(
+                        directory,
+                        &row.endpoint,
+                        &row.provider_profile,
+                        key,
+                    )?)
+                };
+                created_credential = next_id.clone();
+                retired_credential = row.upstream_credential_id.clone();
+                catalog
+                    .deployments
+                    .iter_mut()
+                    .find(|d| d.id == row.id)
+                    .expect("edited deployment")
+                    .upstream_credential_id = next_id;
+            }
         }
         Ok(())
-    })
+    });
+    if let Err(error) = saved {
+        if let Some(id) = created_credential {
+            let _ = crate::upstream_auth::remove(directory, &id);
+        }
+        return Err(error);
+    }
+    if let Some(id) = retired_credential {
+        let core = admin.core.lock().map_err(|_| "カタログを開けません。")?;
+        if !core
+            .catalog_store()
+            .catalog
+            .deployments
+            .iter()
+            .any(|d| d.upstream_credential_id.as_ref() == Some(&id))
+        {
+            crate::upstream_auth::remove(directory, &id).map_err(|_| "モデルの設定は保存しましたが、以前のAPIキーを削除できませんでした。Hub PCの保存先の権限を確認してください。")?;
+        }
+    }
+    Ok(())
 }
 
 async fn hub_refresh(admin: &Admin) -> Result<(), String> {
@@ -590,7 +701,7 @@ async fn hub_refresh(admin: &Admin) -> Result<(), String> {
         return Err("モデルの確認中です。".into());
     }
     let _reset = Reset(&admin.refresh_running);
-    let mut groups: BTreeMap<(String, String), Vec<Deployment>> = BTreeMap::new();
+    let mut groups: BTreeMap<(String, String, Option<String>), Vec<Deployment>> = BTreeMap::new();
     for row in &admin
         .core
         .lock()
@@ -600,7 +711,11 @@ async fn hub_refresh(admin: &Admin) -> Result<(), String> {
         .deployments
     {
         groups
-            .entry((row.endpoint.clone(), row.provider_profile.clone()))
+            .entry((
+                row.endpoint.clone(),
+                row.provider_profile.clone(),
+                row.upstream_credential_id.clone(),
+            ))
             .or_default()
             .push(row.clone());
     }
@@ -608,10 +723,18 @@ async fn hub_refresh(admin: &Admin) -> Result<(), String> {
     let mut pending = tokio::task::JoinSet::new();
     loop {
         while pending.len() < 4 {
-            let Some(((endpoint, profile), rows)) = queue.next() else {
+            let Some((_, rows)) = queue.next() else {
                 break;
             };
-            pending.spawn(async move { (rows, discovery::discover(&endpoint, &profile).await) });
+            let directory = admin
+                .path
+                .parent()
+                .ok_or("保存先がありません。")?
+                .to_path_buf();
+            pending.spawn(async move {
+                let result = discovery::discover_deployment(&rows[0], Some(&directory)).await;
+                (rows, result)
+            });
         }
         let Some(result) = pending.join_next().await else {
             break;

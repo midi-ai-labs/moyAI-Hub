@@ -4,7 +4,14 @@ fn request(key: &str, environment: &str, deadline: Option<u64>) -> SubmitJob {
     SubmitJob {
         request_id: key.into(),
         project_id: "alpha".into(),
+        project_participation: None,
+        conversation_id: None,
+        revises_job_id: None,
+        expected_revised_revision: None,
         environment_id: environment.into(),
+        origin_session_ref: None,
+        origin_turn_ref: None,
+        origin_turn_epoch: None,
         title: key.into(),
         input: json!({"version":1,"prompt":"test"}),
         descendant_budget: 2,
@@ -394,7 +401,7 @@ fn shared_deadline_v9_forward_migration_is_finite_and_keeps_started_authority() 
             .db
             .pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
             .unwrap(),
-        15
+        22
     );
     for id in [&root.id, &child.job.id] {
         assert_eq!(

@@ -8,7 +8,8 @@ const MAX_RETAINED_JOBS: u64 = 100_000;
 const MAX_RESERVED_DESCENDANTS: u64 = 32_000;
 const MAX_ROOTS: u64 = 1_000;
 const MAX_RUNNER_ATTEMPTS: u32 = 128;
-const JOB_COLUMNS: &str = "id,root_id,parent_id,project_id,environment_id,requestor_id,assignee_id,title,input_json,checkpoint_json,result_json,state,awaiting_child_id,revision,created_at_ms,updated_at_ms,COALESCE(quota_owner_id,requestor_id),authority_generation,(SELECT previous_job_id FROM shared_continuations WHERE job_id=shared_jobs.id),start_before_ms";
+const JOB_COLUMNS: &str = "id,root_id,parent_id,project_id,environment_id,requestor_id,assignee_id,title,input_json,checkpoint_json,result_json,state,awaiting_child_id,revision,created_at_ms,updated_at_ms,COALESCE(quota_owner_id,requestor_id),authority_generation,(SELECT previous_job_id FROM shared_continuations WHERE job_id=shared_jobs.id),start_before_ms,conversation_id,origin_session_ref,origin_turn_ref,origin_turn_epoch,revises_job_id";
+pub(super) const MULTI_DEVICE_SESSION_CAPABILITY: &str = "multi_device_session_v1";
 
 pub(super) fn id(value: &str) -> Result<()> {
     if value.is_empty()
@@ -76,6 +77,11 @@ fn row_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         authority_generation: row.get(17)?,
         continued_from: row.get(18)?,
         start_before_ms: row.get(19)?,
+        conversation_id: row.get(20)?,
+        origin_session_ref: row.get(21)?,
+        origin_turn_ref: row.get(22)?,
+        origin_turn_epoch: row.get(23)?,
+        revises_job_id: row.get(24)?,
     })
 }
 pub(super) fn load(db: &Connection, job_id: &str) -> Result<Job> {
@@ -90,7 +96,7 @@ pub(super) fn load(db: &Connection, job_id: &str) -> Result<Job> {
 pub(super) fn may_use(db: &Connection, user: &str, project: &str, environment: &str) -> Result<()> {
     identity::require_project_role(db, user, project, ProjectRole::Contributor)?;
     let enabled: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM shared_environments e JOIN shared_environment_projects p ON p.environment_id=e.id JOIN shared_projects project ON project.id=p.project_id WHERE e.id=?1 AND e.enabled=1 AND p.project_id=?2 AND project.archived=0 AND NOT EXISTS(SELECT 1 FROM shared_provisioning provision WHERE provision.environment_id=e.id AND provision.state<>'ready'))",
+        "SELECT EXISTS(SELECT 1 FROM shared_environments e JOIN shared_environment_projects p ON p.environment_id=e.id JOIN shared_projects project ON project.id=p.project_id WHERE e.id=?1 AND e.enabled=1 AND p.project_id=?2 AND project.archived=0 AND project.deleted_at_ms IS NULL AND NOT EXISTS(SELECT 1 FROM shared_provisioning provision WHERE provision.environment_id=e.id AND provision.state<>'ready'))",
         params![environment, project], |r| r.get(0))?;
     if !enabled {
         return Err(WorkError::Forbidden);
@@ -119,12 +125,48 @@ fn set_state(db: &Connection, job_id: &str, state: &str, now: u64) -> Result<()>
     )?;
     Ok(())
 }
+pub(super) fn resource_occupancy(db: &Connection, resource: &str) -> Result<u32> {
+    Ok(db.query_row(
+        "SELECT
+            (SELECT COUNT(*) FROM shared_attempts WHERE resource_id=?1 AND state IN ('assigned','running','stop_requested'))
+          + (SELECT COUNT(DISTINCT held.conversation_id) FROM (
+                SELECT j.conversation_id,a.resource_id
+                FROM shared_service_leases s
+                JOIN shared_attempts a ON a.id=s.attempt_id
+                JOIN shared_jobs j ON j.id=a.job_id
+                WHERE s.state IN ('active','uncertain') AND a.resource_id=?1
+            ) held WHERE NOT EXISTS (
+                SELECT 1 FROM shared_attempts active
+                JOIN shared_jobs active_job ON active_job.id=active.job_id
+                WHERE active.resource_id=held.resource_id
+                  AND active.state IN ('assigned','running','stop_requested')
+                  AND active_job.conversation_id=held.conversation_id
+            ))",
+        [resource],
+        |row| row.get(0),
+    )?)
+}
 pub(super) fn settle_cancel(db: &Connection, root: &str, now: u64) -> Result<()> {
     // A cancellation request is not evidence that any issued attempt has stopped.
     let active: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM shared_attempts a JOIN shared_jobs j ON j.id=a.job_id WHERE j.root_id=?1 AND a.state IN ('assigned','running','stop_requested'))", [root], |r| r.get(0))?;
     if !active {
         db.execute("UPDATE shared_jobs SET state='cancelled',revision=revision+1,updated_at_ms=?2 WHERE root_id=?1 AND state='cancelling'", params![root,now])?;
     }
+    Ok(())
+}
+pub(super) fn cancel_root_in_transaction(db: &Connection, root_id: &str, now: u64) -> Result<()> {
+    let root = load(db, root_id)?;
+    if root.id != root.root_id {
+        return Err(WorkError::Invalid);
+    }
+    if root.state.terminal() {
+        return Ok(());
+    }
+    db.execute("UPDATE shared_jobs SET state=CASE WHEN state='queued' THEN 'cancelled' ELSE 'cancelling' END,revision=revision+1,updated_at_ms=?2 WHERE root_id=?1 AND state NOT IN ('succeeded','failed','cancelled')", params![root_id,now])?;
+    db.execute("UPDATE shared_attempts SET state='stop_requested',updated_at_ms=?2 WHERE job_id IN (SELECT id FROM shared_jobs WHERE root_id=?1) AND state IN ('assigned','running')", params![root_id,now])?;
+    set_state(db, root_id, "cancelling", now)?;
+    settle_cancel(db, root_id, now)?;
+    super::handover::settle(db, root_id, now)?;
     Ok(())
 }
 pub(super) fn root_capacity(db: &Connection, budget: u32) -> Result<()> {
@@ -147,39 +189,152 @@ pub(super) fn submit_in_transaction(
     actor: &Principal,
     request: &SubmitJob,
     now: u64,
+    controller_device: Option<&str>,
 ) -> Result<Job> {
     id(&request.request_id)?;
+    if let Some(origin) = &request.origin_session_ref {
+        id(origin)?;
+    }
+    if let Some(turn) = &request.origin_turn_ref {
+        id(turn)?;
+    }
+    if request.origin_turn_ref.is_some() != request.origin_turn_epoch.is_some()
+        || (request.origin_turn_ref.is_some() && request.origin_session_ref.is_none())
+    {
+        return Err(WorkError::Invalid);
+    }
+    let revision_fields = (
+        request.conversation_id.as_deref(),
+        request.revises_job_id.as_deref(),
+        request.expected_revised_revision,
+    );
+    if !matches!(
+        revision_fields,
+        (None, None, None) | (Some(_), Some(_), Some(_))
+    ) {
+        return Err(WorkError::Invalid);
+    }
+    if let (Some(conversation), Some(target), Some(_)) = revision_fields {
+        id(conversation)?;
+        id(target)?;
+    }
     label(&request.title)?;
     timestamp(now)?;
     let input = json(&request.input)?;
     if request.descendant_budget > 1000 {
         return Err(WorkError::Invalid);
     }
+    let controller_participation_generation = if let Some(device) = controller_device {
+        let current: Option<u64> = db.query_row(
+            "SELECT d.participation_generation FROM shared_project_devices d JOIN shared_projects p ON p.id=d.project_id WHERE d.project_id=?1 AND d.device_id=?2 AND d.can_control=1 AND p.archived=0 AND p.deleted_at_ms IS NULL",
+            params![request.project_id,device],|row|row.get(0),
+        ).optional()?;
+        let current = match current {
+            Some(current) => current,
+            None if db.query_row("SELECT EXISTS(SELECT 1 FROM shared_projects WHERE id=?1 AND archived=0 AND deleted_at_ms IS NULL AND legacy_devices_unrestricted=1)",[&request.project_id],|row|row.get::<_,bool>(0))? => 1,
+            None => return Err(WorkError::Forbidden),
+        };
+        if request.project_participation.unwrap_or(1) != current {
+            return Err(WorkError::Conflict);
+        }
+        Some(current)
+    } else {
+        None
+    };
     let request_json = serde_json::to_string(request)?;
-    may_use(
-        &db,
-        &actor.user_id,
-        &request.project_id,
-        &request.environment_id,
-    )?;
     super::data::validate_inputs(&db, &request.project_id, &request.input)?;
-    let existing: Option<(String, String)> = db
+    let existing: Option<(String, String, Option<String>)> = db
         .query_row(
-            "SELECT id,request_json FROM shared_jobs WHERE requestor_id=?1 AND request_id=?2",
+            "SELECT id,request_json,origin_device_id FROM shared_jobs WHERE requestor_id=?1 AND request_id=?2",
             params![actor.user_id, request.request_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
-    if let Some((job_id, old)) = existing {
+    if let Some((job_id, old, origin_device_id)) = existing {
         if old != request_json {
             return Err(WorkError::Conflict);
         }
-        return load(&db, &job_id);
+        if request.origin_session_ref.is_some()
+            && controller_device.is_some()
+            && origin_device_id.as_deref() != controller_device
+        {
+            return Err(WorkError::Forbidden);
+        }
+        let prior = load(&db, &job_id)?;
+        may_use(
+            &db,
+            &actor.user_id,
+            &prior.project_id,
+            &prior.environment_id,
+        )?;
+        return Ok(prior);
     }
+    let revision_predecessor =
+        if let (Some(conversation), Some(target), Some(revision)) = revision_fields {
+            let prior = load(db, target)?;
+            if prior.project_id != request.project_id || prior.conversation_id != conversation {
+                return Err(WorkError::Conflict);
+            }
+            Some(super::conversation_catalog::revision_predecessor(
+                db,
+                &actor.user_id,
+                &prior,
+                revision,
+            )?)
+        } else {
+            None
+        };
+    super::stop_scope::validate_submission(db, actor, controller_device, request)?;
+    let environment_id = if request.environment_id.is_empty() {
+        let mut statement = db.prepare("SELECT e.id FROM shared_environments e JOIN shared_environment_projects ep ON ep.environment_id=e.id WHERE ep.project_id=?1 ORDER BY CASE WHEN e.runner_id=?2 THEN 0 ELSE 1 END,e.id LIMIT 1000")?;
+        let candidates = statement
+            .query_map(params![request.project_id, controller_device], |row| {
+                row.get::<_, String>(0)
+            })?;
+        let mut selected = None;
+        for candidate in candidates {
+            let candidate = candidate?;
+            match may_use(db, &actor.user_id, &request.project_id, &candidate) {
+                Ok(()) => {
+                    selected = Some(candidate);
+                    break;
+                }
+                Err(WorkError::Forbidden) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        selected.ok_or(WorkError::Forbidden)?
+    } else {
+        may_use(
+            &db,
+            &actor.user_id,
+            &request.project_id,
+            &request.environment_id,
+        )?;
+        request.environment_id.clone()
+    };
     root_capacity(&db, request.descendant_budget)?;
     let start_before_ms = super::deadlines::resolve(request.start_before_ms, now)?;
     let job_id = ulid::Ulid::new().to_string();
-    db.execute("INSERT INTO shared_jobs(id,root_id,project_id,environment_id,requestor_id,assignee_id,request_id,request_json,title,input_json,state,descendant_budget,revision,created_at_ms,updated_at_ms) VALUES(?1,?1,?2,?3,?4,?4,?5,?6,?7,?8,'queued',?9,1,?10,?10)", params![job_id,request.project_id,request.environment_id,actor.user_id,request.request_id,request_json,request.title,input,request.descendant_budget,now])?;
+    let conversation_id = request.conversation_id.as_deref().unwrap_or(&job_id);
+    db.execute("INSERT INTO shared_jobs(id,root_id,conversation_id,revises_job_id,origin_session_ref,origin_device_id,origin_turn_ref,origin_turn_epoch,required_capability,project_id,environment_id,requestor_id,assignee_id,request_id,request_json,title,input_json,state,descendant_budget,revision,created_at_ms,updated_at_ms) VALUES(?1,?1,?16,?17,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12,?13,'queued',?14,1,?15,?15)", params![job_id,request.origin_session_ref,controller_device.filter(|_|request.origin_session_ref.is_some()),request.origin_turn_ref,request.origin_turn_epoch,request.origin_session_ref.as_ref().map(|_| "multi_device_session_v1"),request.project_id,environment_id,actor.user_id,request.request_id,request_json,request.title,input,request.descendant_budget,now,conversation_id,request.revises_job_id])?;
+    if request.conversation_id.is_some() {
+        super::conversation_catalog::appended_root(db, &request.project_id, conversation_id, now)?;
+    }
+    if let Some(Some(predecessor)) = revision_predecessor {
+        db.execute(
+            "INSERT INTO shared_continuations(job_id,previous_job_id) VALUES(?1,?2)",
+            params![job_id, predecessor],
+        )?;
+    }
+    db.execute("UPDATE shared_jobs SET controller_device_id=?2,controller_participation_generation=?3 WHERE id=?1",params![job_id,controller_device,controller_participation_generation])?;
+    if let (Some(origin), Some(turn), Some(device)) = (
+        &request.origin_session_ref,
+        &request.origin_turn_ref,
+        controller_device,
+    ) {
+        db.execute("UPDATE shared_jobs SET origin_turn_revision=(SELECT turn_revision FROM shared_origin_turns WHERE origin_device_id=?2 AND origin_owner_id=?3 AND origin_session_ref=?4 AND origin_turn_ref=?5 AND epoch=?6) WHERE id=?1",params![job_id,device,actor.user_id,origin,turn,request.origin_turn_epoch])?;
+    }
     db.execute(
         "UPDATE shared_jobs SET quota_owner_id=?2,start_before_ms=?3 WHERE id=?1",
         params![job_id, actor.user_id, start_before_ms],
@@ -213,8 +368,14 @@ pub(super) fn reserve_job(
     if owner != runner {
         return Err(WorkError::Forbidden);
     }
-    let (occupied,runner_active):(u32,u32)=db.query_row("SELECT (SELECT COUNT(*) FROM shared_attempts WHERE resource_id=?1 AND state IN ('assigned','running','stop_requested')),(SELECT COUNT(*) FROM shared_attempts WHERE runner_id=?2 AND state IN ('assigned','running','stop_requested'))",params![resource,runner],|r|Ok((r.get(0)?,r.get(1)?)))?;
-    if occupied >= capacity || runner_active >= MAX_RUNNER_ATTEMPTS {
+    let occupied = resource_occupancy(db, &resource)?;
+    let runner_active:u32=db.query_row("SELECT COUNT(*) FROM shared_attempts WHERE runner_id=?1 AND state IN ('assigned','running','stop_requested')",[runner],|r|r.get(0))?;
+    let owned_lease:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM shared_service_leases s JOIN shared_attempts a ON a.id=s.attempt_id JOIN shared_jobs j ON j.id=a.job_id WHERE s.state='active' AND a.resource_id=?1 AND a.runner_id=?2 AND j.conversation_id=?3)",params![resource,runner,job.conversation_id],|r|r.get(0))?;
+    let same_conversation_active:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM shared_attempts a JOIN shared_jobs j ON j.id=a.job_id WHERE a.resource_id=?1 AND j.conversation_id=?2 AND a.state IN ('assigned','running','stop_requested'))",params![resource,job.conversation_id],|r|r.get(0))?;
+    if (occupied >= capacity && !owned_lease)
+        || (owned_lease && same_conversation_active)
+        || runner_active >= MAX_RUNNER_ATTEMPTS
+    {
         return Err(WorkError::Capacity);
     }
     let generation: u64 = db.query_row(
@@ -236,7 +397,7 @@ impl SharedWork {
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.pragma_update(None, "synchronous", "FULL")?;
         let version: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 15 {
+        if version > 22 {
             return Err(WorkError::Conflict);
         }
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -300,7 +461,42 @@ impl SharedWork {
         if version < 15 {
             tx.execute_batch(include_str!("../../migrations/V15__web_device_access.sql"))?;
         }
-        tx.pragma_update(None, "user_version", 15)?;
+        if version < 16 {
+            tx.execute_batch(include_str!(
+                "../../migrations/V16__shared_conversations_and_capabilities.sql"
+            ))?;
+        }
+        if version < 17 {
+            tx.execute_batch(include_str!(
+                "../../migrations/V17__retained_service_leases.sql"
+            ))?;
+        }
+        if version < 18 {
+            tx.execute_batch(include_str!(
+                "../../migrations/V18__local_conversation_origin.sql"
+            ))?;
+        }
+        if version < 19 {
+            tx.execute_batch(include_str!(
+                "../../migrations/V19__local_conversation_origin_device.sql"
+            ))?;
+        }
+        if version < 20 {
+            tx.execute_batch(include_str!(
+                "../../migrations/V20__shared_runner_capability.sql"
+            ))?;
+        }
+        if version < 21 {
+            tx.execute_batch(include_str!(
+                "../../migrations/V21__origin_turn_stop_fences.sql"
+            ))?;
+        }
+        if version < 22 {
+            tx.execute_batch(include_str!(
+                "../../migrations/V22__project_participation_and_conversation_lifecycle.sql"
+            ))?;
+        }
+        tx.pragma_update(None, "user_version", 22)?;
         tx.commit()?;
         let check: String = db.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
         if check != "ok" {
@@ -406,10 +602,20 @@ impl SharedWork {
     }
 
     pub fn submit(&mut self, actor: &Principal, request: &SubmitJob, now: u64) -> Result<Job> {
+        self.submit_for_device(actor, request, now, None)
+    }
+
+    pub fn submit_for_device(
+        &mut self,
+        actor: &Principal,
+        request: &SubmitJob,
+        now: u64,
+        controller_device: Option<&str>,
+    ) -> Result<Job> {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let job = submit_in_transaction(&tx, actor, request, now)?;
+        let job = submit_in_transaction(&tx, actor, request, now, controller_device)?;
         tx.commit()?;
         Ok(job)
     }
@@ -422,6 +628,9 @@ impl SharedWork {
             &job.project_id,
             ProjectRole::Reader,
         )?;
+        if !super::conversation_catalog::visible(&self.db, &job.project_id, &job.conversation_id)? {
+            return Err(WorkError::NotFound);
+        }
         Ok(job)
     }
 
@@ -440,7 +649,17 @@ impl SharedWork {
         let rows = stmt
             .query_map(params![project, before, limit], row_job)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
+        let mut visible_rows = Vec::new();
+        for job in rows {
+            if super::conversation_catalog::visible(
+                &self.db,
+                &job.project_id,
+                &job.conversation_id,
+            )? {
+                visible_rows.push(job);
+            }
+        }
+        Ok(visible_rows)
     }
 
     /// Redelivery returns the existing assigned attempt. No timeout creates a replacement.
@@ -452,6 +671,21 @@ impl SharedWork {
         &mut self,
         runner: &str,
         environments: Option<&[String]>,
+        now: u64,
+    ) -> Result<Option<Assignment>> {
+        self.claim_for_capability(
+            runner,
+            environments,
+            Some(MULTI_DEVICE_SESSION_CAPABILITY),
+            now,
+        )
+    }
+
+    pub(super) fn claim_for_capability(
+        &mut self,
+        runner: &str,
+        environments: Option<&[String]>,
+        capability: Option<&str>,
         now: u64,
     ) -> Result<Option<Assignment>> {
         id(runner)?;
@@ -473,7 +707,7 @@ impl SharedWork {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         super::deadlines::expire_due(&tx, now)?;
-        let existing: Option<String> = tx.query_row("SELECT a.id FROM shared_attempts a JOIN shared_jobs j ON j.id=a.job_id WHERE a.runner_id=?1 AND a.state IN ('assigned','stop_requested') AND NOT EXISTS(SELECT 1 FROM shared_external_attempts x WHERE x.attempt_id=a.id) AND (?2 IS NULL OR j.environment_id IN (SELECT value FROM json_each(?2))) ORDER BY a.created_at_ms,a.id LIMIT 1", params![runner, filter], |r|r.get(0)).optional()?;
+        let existing: Option<String> = tx.query_row("SELECT a.id FROM shared_attempts a JOIN shared_jobs j ON j.id=a.job_id WHERE a.runner_id=?1 AND a.state IN ('assigned','stop_requested') AND NOT EXISTS(SELECT 1 FROM shared_external_attempts x WHERE x.attempt_id=a.id) AND (?2 IS NULL OR j.environment_id IN (SELECT value FROM json_each(?2))) AND (j.required_capability IS NULL OR j.required_capability=?3) ORDER BY a.created_at_ms,a.id LIMIT 1", params![runner, filter, capability], |r|r.get(0)).optional()?;
         if let Some(attempt) = existing {
             let prior = assignment(&tx, &attempt)?;
             super::deadlines::expire_job(&tx, &prior.job.id, now)?;
@@ -490,8 +724,8 @@ impl SharedWork {
         }
         // Oldest-served person first; a blocked resource never blocks another resource.
         let candidates: Vec<String> = {
-            let mut stmt = tx.prepare("SELECT j.id FROM shared_jobs j JOIN shared_environments e ON e.id=j.environment_id WHERE j.state='queued' AND e.runner_id=?1 AND e.enabled=1 AND NOT EXISTS(SELECT 1 FROM shared_external_attempts x JOIN shared_attempts external ON external.id=x.attempt_id WHERE external.job_id=j.id) AND (?2 IS NULL OR e.id IN (SELECT value FROM json_each(?2))) ORDER BY COALESCE((SELECT MAX(a.created_at_ms) FROM shared_attempts a JOIN shared_jobs served ON served.id=a.job_id WHERE COALESCE(served.quota_owner_id,served.requestor_id)=COALESCE(j.quota_owner_id,j.requestor_id)),0),j.created_at_ms,j.id LIMIT 1000")?;
-            stmt.query_map(params![runner, filter], |r| r.get(0))?
+            let mut stmt = tx.prepare("SELECT j.id FROM shared_jobs j JOIN shared_environments e ON e.id=j.environment_id WHERE j.state='queued' AND e.runner_id=?1 AND e.enabled=1 AND NOT EXISTS(SELECT 1 FROM shared_external_attempts x JOIN shared_attempts external ON external.id=x.attempt_id WHERE external.job_id=j.id) AND (?2 IS NULL OR e.id IN (SELECT value FROM json_each(?2))) AND (j.required_capability IS NULL OR j.required_capability=?3) ORDER BY COALESCE((SELECT MAX(a.created_at_ms) FROM shared_attempts a JOIN shared_jobs served ON served.id=a.job_id WHERE COALESCE(served.quota_owner_id,served.requestor_id)=COALESCE(j.quota_owner_id,j.requestor_id)),0),j.created_at_ms,j.id LIMIT 1000")?;
+            stmt.query_map(params![runner, filter, capability], |r| r.get(0))?
                 .collect::<std::result::Result<_, _>>()?
         };
         for job_id in candidates {
@@ -521,10 +755,18 @@ impl SharedWork {
     }
 
     pub fn assignments(&self, runner: &str) -> Result<Vec<Assignment>> {
+        self.assignments_for_capability(runner, Some(MULTI_DEVICE_SESSION_CAPABILITY))
+    }
+
+    pub(super) fn assignments_for_capability(
+        &self,
+        runner: &str,
+        capability: Option<&str>,
+    ) -> Result<Vec<Assignment>> {
         id(runner)?;
-        let mut stmt=self.db.prepare("SELECT id FROM shared_attempts WHERE runner_id=?1 AND state IN ('assigned','running','stop_requested') ORDER BY created_at_ms,id LIMIT ?2")?;
+        let mut stmt=self.db.prepare("SELECT a.id FROM shared_attempts a JOIN shared_jobs j ON j.id=a.job_id WHERE a.runner_id=?1 AND a.state IN ('assigned','running','stop_requested') AND (j.required_capability IS NULL OR j.required_capability=?3) ORDER BY a.created_at_ms,a.id LIMIT ?2")?;
         let ids = stmt
-            .query_map(params![runner, MAX_RUNNER_ATTEMPTS], |r| {
+            .query_map(params![runner, MAX_RUNNER_ATTEMPTS, capability], |r| {
                 r.get::<_, String>(0)
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -603,10 +845,70 @@ impl SharedWork {
             tx.commit()?;
             return Err(WorkError::StartDeadline);
         }
-        if !matches!(state.as_str(), "assigned" | "running" | "stop_requested") {
+        if !matches!(state.as_str(), "assigned" | "running" | "stop_requested")
+            && !matches!(
+                report.outcome,
+                ReportOutcome::ServiceStopped { .. } | ReportOutcome::ServiceUncertain { .. }
+            )
+        {
             return Err(WorkError::Conflict);
         }
         match &report.outcome {
+            ReportOutcome::RetainService {
+                service_id,
+                expires_at_ms,
+            } => {
+                id(service_id)?;
+                if cancelling
+                    || state != "running"
+                    || uncertainty.is_some()
+                    || *expires_at_ms <= now
+                    || *expires_at_ms > now.saturating_add(24 * 60 * 60 * 1000)
+                {
+                    return Err(WorkError::Conflict);
+                }
+                let retained:u32=tx.query_row("SELECT COUNT(*) FROM shared_service_leases WHERE attempt_id=?1 AND state IN ('active','uncertain')",[&report.attempt_id],|r|r.get(0))?;
+                if retained >= 16 {
+                    return Err(WorkError::Capacity);
+                }
+                let runner_held:u32=tx.query_row("SELECT COUNT(*) FROM shared_service_leases s JOIN shared_attempts a ON a.id=s.attempt_id WHERE a.runner_id=?1 AND s.state IN ('active','uncertain')",[runner],|r|r.get(0))?;
+                if runner_held >= 128 {
+                    return Err(WorkError::Capacity);
+                }
+                let conversation_held: u32 = tx.query_row(
+                    "SELECT COUNT(*) FROM shared_service_leases s JOIN shared_attempts a ON a.id=s.attempt_id JOIN shared_jobs j ON j.id=a.job_id WHERE j.conversation_id=?1 AND s.state IN ('active','uncertain')",
+                    [&job.conversation_id],
+                    |row| row.get(0),
+                )?;
+                if conversation_held >= 128 {
+                    return Err(WorkError::Capacity);
+                }
+                // A retained process changes the contract for later turns of
+                // this conversation. Older Runners cannot safely rejoin it.
+                tx.execute(
+                    "UPDATE shared_jobs SET required_capability=?2 WHERE conversation_id=?1 AND required_capability IS NULL",
+                    params![job.conversation_id, MULTI_DEVICE_SESSION_CAPABILITY],
+                )?;
+                tx.execute("INSERT INTO shared_service_leases(service_id,attempt_id,generation,expires_at_ms,state,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,'active',?5,?5)",params![service_id,report.attempt_id,report.generation,expires_at_ms,now])?;
+            }
+            ReportOutcome::ServiceStopped { service_id } => {
+                id(service_id)?;
+                let changed=tx.execute("UPDATE shared_service_leases SET state='stopped',updated_at_ms=?4 WHERE service_id=?1 AND attempt_id=?2 AND generation=?3 AND state IN ('active','uncertain')",params![service_id,report.attempt_id,report.generation,now])?;
+                if changed == 0 {
+                    return Err(WorkError::Conflict);
+                }
+                if cancelling {
+                    settle_cancel(&tx, &job.root_id, now)?;
+                }
+            }
+            ReportOutcome::ServiceUncertain { service_id, reason } => {
+                id(service_id)?;
+                label(reason)?;
+                let changed=tx.execute("UPDATE shared_service_leases SET state='uncertain',uncertainty_reason=?4,updated_at_ms=?5 WHERE service_id=?1 AND attempt_id=?2 AND generation=?3 AND state='active'",params![service_id,report.attempt_id,report.generation,reason,now])?;
+                if changed == 0 {
+                    return Err(WorkError::Conflict);
+                }
+            }
             ReportOutcome::ApprovalRequested {
                 approval_id,
                 request,
@@ -680,7 +982,8 @@ impl SharedWork {
                 }
                 let child = ulid::Ulid::new().to_string();
                 let request_id = format!("child:{}", child);
-                tx.execute("INSERT INTO shared_jobs(id,root_id,parent_id,project_id,environment_id,requestor_id,assignee_id,request_id,request_json,title,input_json,state,descendant_budget,revision,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'queued',0,1,?12,?12)", params![child,job.root_id,job.id,job.project_id,child_environment_id,job.requestor_id,job.assignee_id,request_id,payload,child_title,input,now])?;
+                tx.execute("INSERT INTO shared_jobs(id,root_id,conversation_id,origin_session_ref,origin_device_id,origin_turn_ref,origin_turn_epoch,origin_turn_revision,required_capability,parent_id,project_id,environment_id,requestor_id,assignee_id,request_id,request_json,title,input_json,state,descendant_budget,revision,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,(SELECT origin_device_id FROM shared_jobs WHERE id=?5),?15,?16,(SELECT origin_turn_revision FROM shared_jobs WHERE id=?5),(SELECT required_capability FROM shared_jobs WHERE id=?5),?5,?6,?7,?8,?9,?10,?11,?12,?13,'queued',0,1,?14,?14)", params![child,job.root_id,job.conversation_id,job.origin_session_ref,job.id,job.project_id,child_environment_id,job.requestor_id,job.assignee_id,request_id,payload,child_title,input,now,job.origin_turn_ref,job.origin_turn_epoch])?;
+                tx.execute("UPDATE shared_jobs SET controller_device_id=(SELECT controller_device_id FROM shared_jobs WHERE id=?2),controller_participation_generation=(SELECT controller_participation_generation FROM shared_jobs WHERE id=?2) WHERE id=?1",params![child,job.id])?;
                 tx.execute(
                     "UPDATE shared_jobs SET quota_owner_id=?2,authority_generation=?3,start_before_ms=?4 WHERE id=?1",
                     params![child, job.quota_owner_id, job.authority_generation,job.start_before_ms],
@@ -787,15 +1090,7 @@ impl SharedWork {
                 ProjectRole::Manager,
             )?;
         }
-        if job.state.terminal() {
-            return Ok(job);
-        }
-        tx.execute("UPDATE shared_jobs SET state=CASE WHEN state='queued' THEN 'cancelled' ELSE 'cancelling' END,revision=revision+1,updated_at_ms=?2 WHERE root_id=?1 AND state NOT IN ('succeeded','failed','cancelled')", params![job.root_id,now])?;
-        tx.execute("UPDATE shared_attempts SET state='stop_requested',updated_at_ms=?2 WHERE job_id IN (SELECT id FROM shared_jobs WHERE root_id=?1) AND state IN ('assigned','running')", params![job.root_id,now])?;
-        // Keep the root nonterminal while an issued descendant is unconfirmed.
-        set_state(&tx, &job.id, "cancelling", now)?;
-        settle_cancel(&tx, &job.root_id, now)?;
-        super::handover::settle(&tx, &job.root_id, now)?;
+        cancel_root_in_transaction(&tx, &job.root_id, now)?;
         let result = load(&tx, &job.id)?;
         tx.commit()?;
         Ok(result)
@@ -809,17 +1104,58 @@ pub(super) fn assignment(db: &Connection, attempt: &str) -> Result<Assignment> {
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?,r.get(4)?)),
     )?;
     let job = load(db, &job_id)?;
+    let required_capability: Option<String> = db.query_row(
+        "SELECT required_capability FROM shared_jobs WHERE id=?1",
+        [&job_id],
+        |row| row.get(0),
+    )?;
     let child_result = job
         .awaiting_child_id
         .as_deref()
         .map(|id| load(db, id).map(Box::new))
         .transpose()?;
-    let allowed_child_environments = {
+    let allowed_child_environments: Vec<String> = {
         let mut statement=db.prepare("SELECT e.id FROM shared_environments e JOIN shared_environment_projects ep ON ep.environment_id=e.id JOIN identity_effective_project_memberships m ON m.project_id=ep.project_id JOIN shared_job_environment_ceiling c ON c.environment_id=e.id AND c.root_id=?3 JOIN shared_projects p ON p.id=ep.project_id WHERE ep.project_id=?1 AND m.user_id=?2 AND m.role IN ('contributor','manager') AND e.enabled=1 AND p.archived=0 ORDER BY e.id LIMIT 1000")?;
         statement
             .query_map(params![job.project_id, job.assignee_id, job.root_id], |r| {
                 r.get(0)
             })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let mut allowed_child_candidates = Vec::with_capacity(allowed_child_environments.len());
+    for environment_id in &allowed_child_environments {
+        let (device_id, environment_label): (String, String) = db.query_row(
+            "SELECT runner_id,label FROM shared_environments WHERE id=?1",
+            [environment_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let capabilities=db.prepare("SELECT name FROM shared_environment_capabilities WHERE environment_id=?1 ORDER BY name LIMIT 32")?
+            .query_map([environment_id],|row|row.get::<_,String>(0))?
+            .collect::<std::result::Result<Vec<_>,_>>()?;
+        allowed_child_candidates.push(SharedCandidate {
+            environment_id: environment_id.clone(),
+            device_label: device_id.clone(),
+            device_id,
+            environment_label,
+            capabilities,
+        });
+    }
+    let retained_services = {
+        let mut statement=db.prepare("SELECT s.service_id,s.attempt_id,s.generation,j.conversation_id,j.environment_id,s.expires_at_ms FROM shared_service_leases s JOIN shared_attempts a ON a.id=s.attempt_id JOIN shared_jobs j ON j.id=a.job_id JOIN shared_environments e ON e.id=?1 WHERE s.state='active' AND j.conversation_id=?2 AND a.resource_id=e.resource_id AND a.runner_id=?3 ORDER BY s.service_id LIMIT 16")?;
+        statement
+            .query_map(
+                params![job.environment_id, job.conversation_id, runner_id],
+                |r| {
+                    Ok(RetainedService {
+                        service_id: r.get(0)?,
+                        attempt_id: r.get(1)?,
+                        generation: r.get(2)?,
+                        conversation_id: r.get(3)?,
+                        environment_id: r.get(4)?,
+                        expires_at_ms: r.get(5)?,
+                    })
+                },
+            )?
             .collect::<std::result::Result<Vec<_>, _>>()?
     };
     Ok(Assignment {
@@ -831,5 +1167,8 @@ pub(super) fn assignment(db: &Connection, attempt: &str) -> Result<Assignment> {
         job,
         child_result,
         allowed_child_environments,
+        allowed_child_candidates,
+        retained_services,
+        required_runner_capabilities: required_capability.into_iter().collect(),
     })
 }

@@ -35,6 +35,14 @@ export function compareAdminEdit(kind: AdminOperation, draft: AdminDraft, origin
     if (saved.setup_pending && draft.administrator === true) return block("この利用者は旧方式の未完了登録です。利用者の状態を確認してください。");
     return result;
   }
+  if (kind === "set_environment_capabilities") {
+    const id=value("environment_id");
+    const saved=latest.environments.find(environment=>environment.id===id);
+    if (!saved || !original.environments.some(environment=>environment.id===id)) return block("この実行先は削除されました。対象を開き直してください。");
+    row("実行先",saved.label,saved.label);
+    row("このPCで使えるもの",saved.capabilities?.map(capability=>capability.name) ?? [],value("names").split(/\r?\n/).map(name=>name.trim()).filter(Boolean));
+    return result;
+  }
   if (kind === "save_project") {
     const saved = latest.projects.find(p => p.id === value("id"));
     if (original.projects.some(p => p.id === value("id")) && !saved) return block("このプロジェクトは削除されました。同じ入力から作り直さず、対象を開き直してください。");

@@ -20,6 +20,10 @@ pub struct HandoverView {
 pub struct ContinueJob {
     pub request_id: String,
     pub expected_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_participation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_epoch: Option<u64>,
     pub prompt: String,
     #[serde(default)]
     pub input_refs: Vec<String>,
@@ -144,6 +148,17 @@ impl SharedWork {
         request: &ContinueJob,
         now: u64,
     ) -> Result<Job> {
+        self.continue_job_for_device(actor, None, id, request, now)
+    }
+
+    pub fn continue_job_for_device(
+        &mut self,
+        actor: &Principal,
+        controller_device: Option<&str>,
+        id: &str,
+        request: &ContinueJob,
+        now: u64,
+    ) -> Result<Job> {
         super::store::id(&request.request_id)?;
         super::store::timestamp(now)?;
         if request.prompt.trim().is_empty() || request.prompt.len() > 32 * 1024 {
@@ -160,6 +175,27 @@ impl SharedWork {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let previous = super::store::load(&tx, id)?;
         may_handover(&tx, actor, &previous)?;
+        if !super::conversation_catalog::visible(
+            &tx,
+            &previous.project_id,
+            &previous.conversation_id,
+        )? {
+            return Err(WorkError::NotFound);
+        }
+        if let Some(device) = controller_device {
+            let generation:Option<u64>=tx.query_row(
+                "SELECT d.participation_generation FROM shared_project_devices d JOIN shared_projects p ON p.id=d.project_id WHERE d.project_id=?1 AND d.device_id=?2 AND d.can_control=1 AND p.archived=0 AND p.deleted_at_ms IS NULL",
+                params![previous.project_id,device],|row|row.get(0),
+            ).optional()?;
+            let generation=match generation {
+                Some(value)=>value,
+                None if tx.query_row("SELECT EXISTS(SELECT 1 FROM shared_projects WHERE id=?1 AND archived=0 AND deleted_at_ms IS NULL AND legacy_devices_unrestricted=1)",[&previous.project_id],|row|row.get::<_,bool>(0))?=>1,
+                None=>return Err(WorkError::Forbidden),
+            };
+            if request.project_participation.unwrap_or(1) != generation {
+                return Err(WorkError::Conflict);
+            }
+        }
         super::store::may_use(
             &tx,
             &actor.user_id,
@@ -178,6 +214,32 @@ impl SharedWork {
                 return Err(WorkError::Conflict);
             }
             return super::store::load(&tx, &id);
+        }
+        if super::conversation_catalog::deletion_requested(
+            &tx,
+            &previous.project_id,
+            &previous.conversation_id,
+        )? {
+            return Err(WorkError::Conflict);
+        }
+        if !super::conversation_catalog::is_latest_root(&tx, &previous)?
+            || super::conversation_catalog::execution_pending(
+                &tx,
+                &previous.project_id,
+                &previous.conversation_id,
+            )?
+        {
+            return Err(WorkError::Conflict);
+        }
+        super::stop_scope::validate_continuation(&tx, &previous)?;
+        if request.conversation_epoch.unwrap_or(0)
+            != super::stop_scope::project_conversation_epoch(
+                &tx,
+                &previous.project_id,
+                &previous.conversation_id,
+            )?
+        {
+            return Err(WorkError::Conflict);
         }
         if !previous.state.terminal() || previous.revision != request.expected_revision {
             return Err(WorkError::Conflict);
@@ -199,7 +261,14 @@ impl SharedWork {
         )?;
         super::store::root_capacity(&tx, budget)?;
         let next = ulid::Ulid::new().to_string();
-        tx.execute("INSERT INTO shared_jobs(id,root_id,project_id,environment_id,requestor_id,assignee_id,request_id,request_json,title,input_json,state,descendant_budget,revision,created_at_ms,updated_at_ms,quota_owner_id) VALUES(?1,?1,?2,?3,?4,?4,?5,?6,?7,?8,'queued',?9,1,?10,?10,?11)",params![next,previous.project_id,previous.environment_id,actor.user_id,request.request_id,payload,previous.title,encoded,budget,now,previous.quota_owner_id])?;
+        tx.execute("INSERT INTO shared_jobs(id,root_id,conversation_id,origin_session_ref,origin_device_id,origin_turn_revision,required_capability,project_id,environment_id,requestor_id,assignee_id,request_id,request_json,title,input_json,state,descendant_budget,revision,created_at_ms,updated_at_ms,quota_owner_id) VALUES(?1,?1,?2,?3,(SELECT origin_device_id FROM shared_jobs WHERE id=?14),(SELECT origin_turn_revision FROM shared_jobs WHERE id=?14),(SELECT required_capability FROM shared_jobs WHERE id=?14),?4,?5,?6,?6,?7,?8,?9,?10,'queued',?11,1,?12,?12,?13)",params![next,previous.conversation_id,previous.origin_session_ref,previous.project_id,previous.environment_id,actor.user_id,request.request_id,payload,previous.title,encoded,budget,now,previous.quota_owner_id,previous.id])?;
+        super::conversation_catalog::appended_root(
+            &tx,
+            &previous.project_id,
+            &previous.conversation_id,
+            now,
+        )?;
+        tx.execute("UPDATE shared_jobs SET controller_device_id=?2,controller_participation_generation=?3 WHERE id=?1",params![next,controller_device,request.project_participation])?;
         tx.execute(
             "UPDATE shared_jobs SET start_before_ms=?2 WHERE id=?1",
             params![next, start_before_ms],

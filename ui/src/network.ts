@@ -1,5 +1,5 @@
 import { copyText, invoke, savedMessage } from "./management.ts";
-import { NetworkEdits, networkAdmissionStatus, networkCertificateStatus, networkClientAction, networkClients, networkDeviceDeletion, networkDeviceStatus, networkDiagnosticMatches, networkDiagnosticStages, networkDiagnosticTarget, networkGatewayPort, networkSetupStep, networkSubject } from "./network_state.ts";
+import { NetworkEdits, networkAdmissionStatus, networkCanDistribute, networkIsLocalOnly, networkCertificateStatus, networkClientAction, networkClients, networkDeviceDeletion, networkDeviceStatus, networkDiagnosticMatches, networkDiagnosticStages, networkDiagnosticTarget, networkGatewayPort, networkSetupStep, networkSubject } from "./network_state.ts";
 import type { NetworkClientAction, NetworkClientFilter, NetworkDiagnostics, NetworkSnapshot, NetworkSubject } from "./network_state.ts";
 import "./network.css";
 import { reconcileNetworkRows } from "./network_rows.ts";
@@ -28,12 +28,14 @@ export function attachDeviceNetwork(host: HTMLElement, clientsHost: HTMLElement,
           <p id="network-certificate-status" class="footnote" role="status"></p><dl id="network-certificate-times" class="network-certificate-times"></dl>
           <button id="network-renew-certificate" type="button" class="secondary">証明書を今すぐ更新</button><p class="footnote">HubとGatewayの証明書を更新します。新しい接続から適用し、進行中の通信は継続します。</p>
         </details></section>
-      <section id="network-step-firewall" class="network-card"><h3>2. Windowsで受信を許可</h3><p>Hub PCで設定する場合は、下の「このHub PCで受信許可を設定する」を開いてください。Windowsの管理者権限がない場合や会社で一括管理している場合は、PC管理者へ設定を依頼します。</p><p id="network-firewall-prerequisite" class="footnote"></p>
+      <section id="network-step-firewall" class="network-card"><h3>2. Windowsで受信を許可</h3><p>未設定の場合は、下に表示する変更内容を確認して接続を許可します。管理者へ作業を依頼する場合は、同じ内容の設定スクリプトを保存できます。</p><p id="network-firewall-prerequisite" class="footnote"></p>
         <div id="network-firewall-native"></div><details><summary>受信許可の設定を管理者へ依頼</summary><p>次の実行ファイルとHub・Gatewayの受信TCPポートに限定します。利用する接続元PCまたはサブネットと、社内LANのネットワークプロファイルを管理者が確認してください。</p><pre id="network-firewall-info"></pre><button id="network-firewall-copy" type="button" class="secondary">設定依頼をコピー</button><p class="footnote">コピーした内容をPC管理者へ渡し、設定を依頼してください。設定後は参加するDesktopから接続を診断します。許可が引き続き有効になるよう、更新後もHubの実行ファイルは同じ場所に置いてください。</p></details><p><a href="#network-step-file">受信許可を設定したら、接続ファイルを配布する →</a></p></section>
       <section id="network-step-file" class="network-card"><h3>3. 接続ファイルの配布</h3>
         <p class="subtle">hub-config.moyai-joinを保存して、まず接続を試すPCへ渡します。そのPCにmoyAIをセットアップし、ファイルをダブルクリックしてDesktopで接続先を確認してください。Desktopの「moyAI Hub → PCの接続」からも読み込めます。IPや証明書をPCごとに入力する必要はありません。</p>
         <div class="network-actions"><button id="network-save-config" type="button" class="primary">接続ファイルを保存</button><button id="network-copy-config" type="button" class="secondary">接続設定をコピー</button></div>
-        <p class="footnote">接続を開始すると保存・コピーできます。含まれるのはHubのURLと公開CAです。管理画面のURLや利用者のパスワードは含みません。</p>
+        <p id="network-distribution-status" role="status"></p>
+        <details id="network-external-firewall"><summary>受信許可を会社・PC管理者が設定している場合</summary><p>moyAI以外で設定したルールは自動確認できません。管理者が現在のHubの実行ファイルとポートへの受信を許可した場合に選んでください。この確認は画面を開き直すか、接続先・受信許可の確認結果が変わると解除されます。</p><label class="network-check"><input id="network-firewall-external-confirm" type="checkbox"><span>管理者が現在のHubへの受信を許可済みであることを確認した</span></label></details>
+        <p class="footnote">受信許可を確認してから保存・コピーします。含まれるのはHubのURLと公開CAです。管理画面のURLや利用者のパスワードは含みません。</p>
         <details id="network-config-preview" hidden><summary>接続設定を選択してコピー</summary><textarea id="network-config-text" readonly rows="7" aria-label="Desktopに渡す接続設定"></textarea></details>
         <p><a href="#network-step-confirm">Desktopで接続ファイルを開いたら、参加を許可する →</a></p></section>
       <section id="network-step-confirm" class="network-card"><h3>4. 参加を許可して、Desktopで接続を診断</h3>
@@ -73,7 +75,13 @@ export function attachDeviceNetwork(host: HTMLElement, clientsHost: HTMLElement,
     const value = (id: string) => node<HTMLInputElement | HTMLSelectElement>(id).value;
     const firewallHost = node("network-firewall-native");
     let firewallState: FirewallStatus["state"] | null = null;
-    const firewall = attachFirewall(firewallHost, state => { firewallState = state; render(); });
+    const firewall = attachFirewall(firewallHost, state => {
+        if (state === null || state !== firewallState) node<HTMLInputElement>("network-firewall-external-confirm").checked = false;
+        firewallState = state; render();
+    }, () => {
+        window.location.hash = "network-step-file";
+        node("network-step-file").scrollIntoView({block:"start"});
+    });
     const message = (text: string, error = false) => { for (const id of ["network-notice", "network-clients-notice"]) { node(id).textContent = text; node(id).classList.toggle("error", error); } };
     const owner = new NetworkEdits();
     let busy = false;
@@ -126,7 +134,8 @@ export function attachDeviceNetwork(host: HTMLElement, clientsHost: HTMLElement,
         node<HTMLButtonElement>("network-lan-refresh").disabled = busy || loadingOptions;
         node<HTMLButtonElement>("network-renew-certificate").disabled = busy || !owner.snapshot?.server.running;
         node<HTMLButtonElement>("network-diagnose").disabled = busy || !owner.snapshot?.server.running;
-        for (const id of ["network-copy-config", "network-save-config"]) node<HTMLButtonElement>(id).disabled = busy || !owner.snapshot?.server.running || !owner.snapshot.server.bind;
+        for (const id of ["network-copy-config", "network-save-config"]) node<HTMLButtonElement>(id).disabled = busy || !canDistribute();
+        node<HTMLInputElement>("network-firewall-external-confirm").disabled = busy || !owner.snapshot?.server.running;
         node<HTMLButtonElement>("network-device-revoked").disabled = busy || !owner.snapshot || Boolean(owner.snapshot.devices.find(device => device.device_id === selectedClient?.id)?.revoked);
         node<HTMLButtonElement>("network-device-save").disabled = busy || !owner.snapshot || (selectedClient?.kind === "request"
             ? !owner.snapshot.join_requests.some(request => request.request_id === selectedClient?.id && request.status === "pending")
@@ -143,11 +152,18 @@ export function attachDeviceNetwork(host: HTMLElement, clientsHost: HTMLElement,
         }
         node("network-server-status").textContent = snapshot.server.running ? "稼働中" : "停止中";
         firewall.refresh(networkDiagnosticTarget(snapshot), snapshot.server.running);
-        const step = networkSetupStep(snapshot, firewallState);
+        const external = node<HTMLInputElement>("network-firewall-external-confirm").checked;
+        const step = networkSetupStep(snapshot, firewallState, external);
         node("network-next-title").textContent = step.title;
         node("network-next-detail").textContent = step.detail;
         node<HTMLAnchorElement>("network-next-link").href = `#${step.anchor}`;
         node("network-next-link").textContent = step.action;
+        node("network-external-firewall").hidden = firewallState === "matching" || networkIsLocalOnly(snapshot);
+        node("network-distribution-status").textContent = !snapshot.server.running ? "Hubの開始後、受信許可を確認してから配布します。"
+            : networkIsLocalOnly(snapshot) ? "この接続ファイルはHubと同じPCでのみ使えます。別PCへの配布にはLAN側の接続先が必要です。"
+            : firewallState === "matching" ? "受信許可を確認しました。接続ファイルを配布し、別PCのDesktopで接続を確認してください。"
+            : external ? "管理者による設定済みの確認に基づいて保存できます。別PCからの接続はまだ確認していません。"
+            : "先に手順2で受信を許可してください。管理者が別途設定済みの場合は下の確認欄を使います。";
         node("network-firewall-prerequisite").textContent = snapshot.server.running ? "現在のHubとGatewayのポートを使って受信許可を設定します。設定後の接続確認はDesktopで行ってください。" : "手順1で接続の受付を開始してから、受信許可を設定してください。";
         node("network-server-status").className = `badge ${snapshot.server.running ? "green" : "gray"}`;
         node("network-start").hidden = snapshot.server.running;
@@ -266,6 +282,10 @@ export function attachDeviceNetwork(host: HTMLElement, clientsHost: HTMLElement,
                 ? "接続の受付を開始し、起動設定を保存しました。次回は起動ショートカットで再開できます。" : "設定を更新しました。");
             receipt?.(result);
             await readSnapshot();
+            if (name === "hub_network_start" && owner.snapshot && !networkIsLocalOnly(owner.snapshot)) {
+                window.location.hash = "network-step-firewall";
+                node("network-step-firewall").scrollIntoView({block:"start"});
+            }
         } catch (error) {
             const text = typeof error === "string" ? error : "操作を完了できませんでした。入力内容を確認してください。";
             message(text, true); if (dialog.open) node("network-device-error").textContent = text;
@@ -337,10 +357,15 @@ export function attachDeviceNetwork(host: HTMLElement, clientsHost: HTMLElement,
             .finally(() => { busy = false; lock(); render(); });
     });
     const exportArgs = (): { hubUrl: string } | null => {
+        if (!canDistribute()) { message("受信許可を確認してから接続ファイルを配布してください。", true); return null; }
         const hubUrl = owner.snapshot?.server.running ? owner.snapshot.server.bind : null;
         if (!hubUrl) { message("共通設定を取得するには、端末接続の受付を開始してください。", true); return null; }
         return { hubUrl };
     };
+    function canDistribute(): boolean {
+        return networkCanDistribute(owner.snapshot, firewallState, node<HTMLInputElement>("network-firewall-external-confirm").checked);
+    }
+    node("network-firewall-external-confirm").addEventListener("change", render);
     node("network-copy-config").addEventListener("click", () => {
         const args = exportArgs(); if (!args) return;
         void perform("export", "hub_network_export", args, result => {

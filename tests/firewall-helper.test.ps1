@@ -3,6 +3,7 @@ $ErrorActionPreference='Stop'
 # Load built-in utility commands before installing fakes. Windows PowerShell 5.1
 # otherwise imports its Get-FileHash function lazily over the test double.
 Import-Module Microsoft.PowerShell.Utility
+. (Join-Path $PSScriptRoot '../src/admin/firewall_helper.ps1')
 $script:rule=$null; $script:mutations=0; $script:partial=$false
 function Get-NetFirewallRule { [CmdletBinding()] param($Name,$PolicyStore) if ($PolicyStore -ne 'PersistentStore') { throw 'Unexpected store' }; if ($script:rule -and $script:rule.Name -ceq $Name) { $script:rule } }
 function Get-NetFirewallApplicationFilter { [CmdletBinding()] param([Parameter(ValueFromPipeline)]$InputObject) process { [pscustomobject]@{Program=$script:rule.Program;Package='Any'} } }
@@ -27,7 +28,6 @@ function Set-NetFirewallRule {
     if ($script:partial) { $script:rule.RemoteAddress=@('10.9.9.9/32'); throw 'Partial OS write' }
 }
 function Remove-NetFirewallRule { [CmdletBinding(SupportsShouldProcess)] param($PolicyStore,$Name) if ($PolicyStore -ne 'PersistentStore' -or $script:rule.Name -cne $Name) { throw 'Wrong removal target' }; $script:mutations++; $script:rule=$null }
-. (Join-Path $PSScriptRoot '../src/admin/firewall_helper.ps1')
 $script:checks=0
 function Assert($Value,[string]$Message) { $script:checks++; if (-not $Value) { throw $Message } }
 function Reject([scriptblock]$Action,[string]$Message) { $before=$script:mutations; $caught=$false; try { & $Action } catch { $caught=$true }; Assert $caught $Message; Assert ($script:mutations -eq $before) 'Rejected action mutated a rule' }
@@ -77,4 +77,66 @@ Invoke-MoyaiFirewall (Request $spec $current 'remove')
 Assert ($null -eq (Get-MoyaiRule $spec.name)) 'Exact removal verified'
 $before=$script:mutations; Invoke-MoyaiFirewall (Request $spec $null 'remove')
 Assert ($before -eq $script:mutations) 'Repeated absence removal is idempotent'
+. (Join-Path $PSScriptRoot '../src/admin/firewall_export.ps1')
+$script:machine='11111111-1111-1111-1111-111111111111'
+$script:hosting=[pscustomobject]@{schema_version=1;bind='0.0.0.0:9471';advertise_ip='192.168.1.2'}
+$script:network=[pscustomobject]@{schema_version=5;hub_id='test-hub';gateway_port=9472}
+$script:isAdministrator=$true; $script:answer='APPLY'; $script:afterPrompt=$null
+function Get-MoyaiMachineGuid { $script:machine }
+function Read-MoyaiExportSettings($Path,$MaximumBytes) {
+    switch ($Path) {
+        'C:\Data\network-hosting.json' { if ($MaximumBytes -ne 16384) { throw 'Wrong hosting bound' }; $script:hosting }
+        'C:\Data\device-network.json' { if ($MaximumBytes -ne 33554432) { throw 'Wrong network bound' }; $script:network }
+        default { throw 'Unexpected data path' }
+    }
+}
+function Test-MoyaiAdministrator { $script:isAdministrator }
+function Read-Host($Prompt) { if ($script:afterPrompt) { & $script:afterPrompt }; $script:answer }
+function ExportPlan { [pscustomobject]@{machine_guid='11111111-1111-1111-1111-111111111111';data_directory='C:\Data';hub_id='test-hub';hosting_bind='0.0.0.0:9471';saved_gateway_port=9472;gateway_port=9472;request=(Request (Spec))} }
+$plan=ExportPlan
+$script:isAdministrator=$false
+$before=$script:mutations
+Invoke-MoyaiFirewallExport $plan -CheckOnly | Out-Null
+Assert ($before -eq $script:mutations) 'Unprivileged exported check never changes firewall'
+Reject { Invoke-MoyaiFirewallExport $plan | Out-Null } 'Exported apply needs administrator'
+$script:isAdministrator=$true; $script:answer='cancel'
+Invoke-MoyaiFirewallExport $plan | Out-Null
+Assert ($before -eq $script:mutations) 'Declined exported confirmation never changes firewall'
+$script:answer='APPLY'
+$script:machine='22222222-2222-2222-2222-222222222222'
+Reject { Invoke-MoyaiFirewallExport $plan -CheckOnly | Out-Null } 'Exported script rejects another machine'
+$script:machine=$plan.machine_guid
+$script:hosting.bind='0.0.0.0:9944'
+Reject { Invoke-MoyaiFirewallExport $plan -CheckOnly | Out-Null } 'Exported script rejects changed Hub port'
+$script:hosting.bind=$plan.hosting_bind
+$script:network.gateway_port=9945
+Reject { Invoke-MoyaiFirewallExport $plan -CheckOnly | Out-Null } 'Exported script rejects changed Gateway port'
+$script:network.gateway_port=$plan.gateway_port
+$dynamic=ExportPlan; $dynamic.saved_gateway_port=0
+Reject { Invoke-MoyaiFirewallExport $dynamic -CheckOnly | Out-Null } 'Legacy dynamic Gateway export requires a fixed port before first use'
+$dynamic.gateway_port=51002
+Reject { Invoke-MoyaiFirewallExport $dynamic -CheckOnly | Out-Null } 'Restarted dynamic Gateway cannot reuse its earlier exported target'
+$stale=ExportPlan; $stale.saved_gateway_port=9945
+Reject { Invoke-MoyaiFirewallExport $stale -CheckOnly | Out-Null } 'Saved and running Gateway ports must agree'
+$script:network.gateway_port=0
+Reject { Invoke-MoyaiFirewallExport $plan -CheckOnly | Out-Null } 'Fixed export rejects later switch to dynamic Gateway'
+$script:network.gateway_port=$plan.saved_gateway_port
+$script:network.hub_id='replacement-hub'
+Reject { Invoke-MoyaiFirewallExport $plan -CheckOnly | Out-Null } 'Exported script rejects replaced Hub identity'
+$script:network.hub_id=$plan.hub_id
+$script:afterPrompt={ $script:hosting.advertise_ip='192.168.1.99' }
+Reject { Invoke-MoyaiFirewallExport $plan | Out-Null } 'Exported script rechecks target after confirmation'
+$script:hosting.advertise_ip='192.168.1.2'; $script:afterPrompt=$null
+$bad=ExportPlan; $bad.request.binary_sha256='c'*64
+Reject { Invoke-MoyaiFirewallExport $bad -CheckOnly | Out-Null } 'Exported script rejects changed binary'
+Invoke-MoyaiFirewallExport $plan | Out-Null
+Assert ($script:mutations -eq $before+1) 'Confirmed exported apply writes exactly one combined rule'
+Assert ((Get-MoyaiRule $plan.request.spec.name).owned) 'Exported apply retains exact managed ownership'
+Reject { Invoke-MoyaiFirewallExport $plan -CheckOnly | Out-Null } 'Prior absent export becomes stale after rule creation'
+$current=(Get-MoyaiRule $spec.name).spec
+$plan.request.previous=$current
+Invoke-MoyaiFirewallExport $plan -CheckOnly | Out-Null
+Assert ($script:mutations -eq $before+1) 'Fresh matching exported check is read-only'
+$script:rule.Description='Manual edit'
+Reject { Invoke-MoyaiFirewallExport $plan -CheckOnly | Out-Null } 'Exported script cannot replace a conflicting rule'
 Write-Output "Firewall helper fake checks: $script:checks PASS; host firewall untouched"

@@ -90,6 +90,7 @@ fn provision_catalog_is_stable_and_exact_generation_fences_old_receipts() {
                 environment_id: "solver".into(),
                 template_id: "approved".into(),
                 generation: 0,
+                state: None,
             },
             12,
         )
@@ -111,6 +112,7 @@ fn provision_catalog_is_stable_and_exact_generation_fences_old_receipts() {
                 environment_id: "solver".into(),
                 template_id: "approved".into(),
                 generation: 1,
+                state: None,
             },
             15,
         )

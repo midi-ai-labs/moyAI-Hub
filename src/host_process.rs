@@ -1,7 +1,7 @@
 //! Private local control for the foreground Hub server.
 //! The browser never receives this credential; --status and --stop connect here.
 pub mod launch;
-mod private_file;
+pub(crate) mod private_file;
 
 use crate::admin::Admin;
 use axum::{
