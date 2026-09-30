@@ -48,6 +48,16 @@ test("new project identity collisions require a fresh target but people changes 
   assert.equal(compareAdminEdit("save_project",{id:"project","participant:alice":"manager"},snapshot(),latest,[]).blocked,null);
 });
 
+test("project conflict review shows the latest overview beside the intact multiline draft", () => {
+  const original=snapshot(), latest=snapshot("2");
+  latest.projects[0].overview="保存済みの概要\nWinC: DB";
+  const draft={id:"project",label:"元の名前",overview:"入力中の概要\nWinB: Worker",controller_device_ids:[],runner_device_ids:[]};
+  const before=JSON.stringify(draft);
+  const review=compareAdminEdit("save_project",draft,original,latest,[]);
+  assert.deepEqual(review.rows.find(row=>row.label==="プロジェクト概要"),{label:"プロジェクト概要",saved:latest.projects[0].overview,input:draft.overview});
+  assert.equal(JSON.stringify(draft),before);
+});
+
 test("selected deleted or revoked PCs cannot continue through a project comparison", () => {
   for (const key of ["controller_device_ids", "runner_device_ids"]) {
     const draft={id:"project",label:"入力",[key]:["removed-pc"]};

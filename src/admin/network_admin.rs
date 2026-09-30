@@ -180,11 +180,15 @@ pub(super) fn hub_network_approve(
     Ok(())
 }
 pub(super) fn hub_network_admission(
+    store: &crate::shared_work::SharedWork,
     network: &mut DeviceNetwork,
     expected_revision: String,
     device_id: String,
     stopped: bool,
 ) -> Result<(), String> {
+    if stopped && network.admission_revision(&device_id, now_ms()).is_ok() {
+        invalidate_device_approvals(store, network, &expected_revision, &device_id)?;
+    }
     network
         .set_admission(&expected_revision, &device_id, stopped)
         .map_err(message)
@@ -208,6 +212,9 @@ pub(super) fn hub_network_device(
     groups: BTreeSet<String>,
     revoked: bool,
 ) -> Result<(), String> {
+    if revoked {
+        invalidate_device_approvals(store, network, &expected_revision, &device_id)?;
+    }
     network
         .set_device(&expected_revision, &device_id, label, groups, revoked)
         .map_err(message)?;
@@ -220,6 +227,25 @@ pub(super) fn hub_network_device(
         .ok_or("保存したPC名を確認できません。")?;
     crate::identity::device::rename_dedicated(store.identity_connection(), &device_id, label, now_ms())
         .map_err(|_| "PCの設定は保存済みですが、表示名を反映できませんでした。同じ内容でもう一度保存してください。".to_string())
+}
+
+fn invalidate_device_approvals(
+    store: &crate::shared_work::SharedWork,
+    network: &DeviceNetwork,
+    expected_revision: &str,
+    device: &str,
+) -> Result<(), String> {
+    if network.revision() != expected_revision {
+        return Err(message(NetworkError::StaleRevision));
+    }
+    if network.device_label(device).is_none() {
+        return Err(message(NetworkError::InvalidRequest));
+    }
+    // These stores cannot commit atomically. Retiring approval authority first
+    // means a later registry persistence error remains fail-closed. The caller
+    // holds store -> network locks throughout both writes.
+    crate::identity::device::invalidate_approvals(store.identity_connection(), device)
+        .map_err(|_| "以前の承認を無効化できなかったため、PCの停止・失効を保存していません。再試行してください。".to_string())
 }
 pub(super) fn hub_network_delete_device(
     network: &mut DeviceNetwork,
@@ -546,6 +572,7 @@ pub(crate) fn dispatch_network_locked(
             argument(args, "groups")?,
         )?),
         "hub_network_admission" => output(hub_network_admission(
+            store,
             network,
             argument(args, "expectedRevision")?,
             argument(args, "deviceId")?,

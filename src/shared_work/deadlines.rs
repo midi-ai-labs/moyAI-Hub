@@ -2,6 +2,8 @@
 use super::*;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
+/// Historical window, retained for migration and compatibility tests only.
+#[cfg(test)]
 pub const DEFAULT_START_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
 pub(super) const EXPIRED_MESSAGE: &str =
     "新しい実行の開始期限を過ぎました。必要な場合は新しい仕事として依頼してください。";
@@ -18,23 +20,25 @@ pub(super) fn is_expired_result(job: &Job) -> bool {
         == Some("start_deadline_exceeded")
 }
 
-pub(super) fn resolve(requested: Option<u64>, now: u64) -> Result<u64> {
-    let deadline = requested.unwrap_or_else(|| now.saturating_add(DEFAULT_START_WINDOW_MS));
+pub(super) fn resolve(requested: Option<u64>, now: u64) -> Result<Option<u64>> {
+    let Some(deadline) = requested else {
+        return Ok(None);
+    };
     store::timestamp(deadline)?;
     if deadline <= now {
         return Err(WorkError::StartDeadline);
     }
-    Ok(deadline)
+    Ok(Some(deadline))
 }
 
 /// The caller holds the shared-work transaction. A missing Started receipt is
 /// authoritative only while the attempt is still known, never after uncertainty.
 pub(super) fn expire_job(db: &Connection, job_id: &str, now: u64) -> Result<()> {
-    let root_id = store::load(db, job_id)?.root_id;
     let mut next = Some(job_id.to_owned());
     while let Some(id) = next.take() {
         let job = store::load(db, &id)?;
-        if now < job.start_before_ms || !matches!(job.state, JobState::Queued | JobState::Assigned)
+        if job.start_before_ms.is_none_or(|deadline| now < deadline)
+            || !matches!(job.state, JobState::Queued | JobState::Assigned)
         {
             break;
         }
@@ -66,7 +70,6 @@ pub(super) fn expire_job(db: &Connection, job_id: &str, now: u64) -> Result<()> 
             }
         }
     }
-    super::handover::settle(db, &root_id, now)?;
     Ok(())
 }
 

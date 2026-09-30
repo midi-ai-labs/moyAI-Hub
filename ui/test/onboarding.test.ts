@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { onboardingNextStep, projectPreparation } from "../src/onboarding_state.ts";
-import type { SharedAdminSnapshot } from "../src/shared_admin_state.ts";
+import { projectPreparationLabel, type SharedAdminSnapshot } from "../src/shared_admin_state.ts";
 import type { NetworkSnapshot } from "../src/network_state.ts";
 
 test("preparation uses the selected project's allowed PCs and preserved individual roles, without treating folders as AI success", () => {
@@ -112,6 +112,13 @@ test("executor preparation names the PC and distinguishes local setup, in-progre
   assert.equal(next().location, "WinB のDesktop");
   assert.equal(next().owner, "実行PCの担当者");
   assert.match(next().detail, /Hubのモデルを確認/);
+  shared.project_devices![1].preparation_state = "waiting_local_folder";
+  assert.equal(next().kind, "execution_setup");
+  assert.equal(next().location, "WinB のDesktop");
+  assert.match(next().title, /プロジェクトの作業フォルダーを選/);
+  assert.match(next().detail, /2. プロジェクトの作業フォルダー/);
+  assert.match(next().detail, /「集計」の「作業フォルダーを選ぶ」/);
+  assert.match(next().detail, /既存の成果物/);
   shared.project_devices![1].preparation_state = "pending";
   assert.equal(next().kind, "preparing");
   shared.project_devices![1].preparation_state = "failed";
@@ -127,7 +134,10 @@ test("one prepared executor enables a real sample while another incomplete execu
   assert.equal(step.kind, "sample");
   assert.equal(step.location, "WinA のDesktop");
   assert.equal(step.action?.kind, "first");
-  assert.match(step.detail, /実行先に WinB/);
+  assert.match(step.detail, /通常のチャット欄から依頼/);
+  assert.match(step.detail, /AIが準備済みのPC（WinB）から判断/);
+  assert.match(step.detail, /依頼文にPC名/);
+  assert.doesNotMatch(step.detail, /実行先に.*選んで/);
   assert.match(step.detail, /WinC は準備が未完了/);
   assert.match(step.detail, /AIの接続・実行結果はこのサンプルで確認/);
   assert.equal("executionSucceeded" in step, false);
@@ -144,6 +154,16 @@ test("legacy unrestricted projects ask for review without presenting missing exp
   assert.match(next().detail, /利用可否を判定していません/);
 });
 
+test("project preparation labels distinguish old setup, local folder selection, failure and unknown states", () => {
+  assert.equal(projectPreparationLabel("waiting_setup"), "このPCの実行設定待ち");
+  assert.match(projectPreparationLabel("waiting_local_folder"), /プロジェクトの作業フォルダーを選/);
+  assert.match(projectPreparationLabel("pending"), /準備中/);
+  assert.match(projectPreparationLabel("ready"), /準備完了/);
+  assert.match(projectPreparationLabel("failed"), /利用できません/);
+  assert.equal(projectPreparationLabel("not_selected"), "実行しない");
+  assert.equal(projectPreparationLabel("new_internal_state"), "準備状態を確認できません。最新情報を取得してください");
+});
+
 test("prepared PCs require an observed Hub model before the sample handoff", () => {
   const { shared, network } = setup();
   const before = JSON.stringify({ shared, network });
@@ -152,7 +172,7 @@ test("prepared PCs require an observed Hub model before the sample handoff", () 
   assert.equal(missing.kind, "models");
   assert.equal(missing.owner, "Hub管理者");
   assert.deepEqual(missing.action, { kind: "link", href: "#models", label: "共有AIを登録する" });
-  assert.match(missing.detail, /作業フォルダーは作成済み/);
+  assert.match(missing.detail, /作業フォルダーは準備済み/);
   assert.equal(onboardingNextStep(shared, network, "project", 1).kind, "sample");
   assert.equal(onboardingNextStep(shared, network, "project", 0).kind, "models");
   assert.equal(JSON.stringify({ shared, network }), before);

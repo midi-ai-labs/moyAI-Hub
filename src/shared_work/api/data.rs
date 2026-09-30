@@ -121,7 +121,7 @@ async fn transcript(
     Path(id): Path<String>,
     Query(page): Query<Page>,
 ) -> ApiResult<TranscriptPage> {
-    authenticated(
+    authenticated_with_network(
         state,
         headers,
         device,
@@ -129,7 +129,21 @@ async fn transcript(
             target: ControllerTarget::Job(id.clone()),
             new_usage: false,
         },
-        move |store, actor| store.transcript(&actor, &id, page.after, page.limit),
+        move |store, actor, network| {
+            let mut result = store.transcript(&actor, &id, page.after, page.limit)?;
+            if let Some(activity) = &result.activity {
+                let controller: Option<String> = store.db.query_row(
+                    "SELECT COALESCE(controller_device_id,origin_device_id) FROM shared_jobs WHERE id=?1",
+                    [&activity.job_id], |row| row.get(0),
+                )?;
+                let now = crate::service::now_ms();
+                if network.admission_revision(&activity.runner_id, now).is_err()
+                    || controller.as_ref().is_some_and(|controller| network.admission_revision(controller, now).is_err()) {
+                    result.activity = None;
+                }
+            }
+            Ok(result)
+        },
     )
     .await
 }

@@ -1,5 +1,5 @@
 use super::*;
-use crate::identity::{self, Principal, ProjectRole};
+use crate::identity::Principal;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 const MAX_APPROVAL_LIFETIME_MS: u64 = 15 * 60 * 1000;
@@ -30,6 +30,35 @@ pub struct ApprovalView {
     pub decision: Option<ApprovalDecision>,
     pub expires_at_ms: u64,
     pub can_decide: bool,
+    pub can_reconfirm: bool,
+    pub context: ApprovalContext,
+}
+
+/// The exact operation owner stays separate from the conversation being shown.
+/// Child execution never moves human approval to the receiving Runner PC.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ApprovalContext {
+    pub job_id: String,
+    pub project_id: String,
+    pub root_id: String,
+    pub conversation_id: String,
+    pub job_title: String,
+    pub controller_device_id: Option<String>,
+    pub controller_device_label: Option<String>,
+    pub execution_device_id: String,
+    pub execution_device_label: Option<String>,
+}
+impl ApprovalContext {
+    pub(super) fn label_devices(&mut self, network: &crate::network::DeviceNetwork) {
+        self.controller_device_label = self
+            .controller_device_id
+            .as_deref()
+            .and_then(|id| network.device_label(id))
+            .map(str::to_owned);
+        self.execution_device_label = network
+            .device_label(&self.execution_device_id)
+            .map(str::to_owned);
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -73,12 +102,21 @@ fn load(db: &Connection, id: &str) -> Result<Record> {
 }
 
 fn may_decide(db: &Connection, actor: &str, job: &Job) -> Result<()> {
-    let role =
-        identity::require_project_role(db, actor, &job.project_id, ProjectRole::Contributor)?;
-    if actor != job.assignee_id && role != ProjectRole::Manager {
-        return Err(WorkError::Forbidden);
-    }
-    Ok(())
+    let controller: Option<String> = db.query_row(
+        "SELECT COALESCE(controller_device_id,origin_device_id) FROM shared_jobs WHERE id=?1",
+        [&job.root_id],
+        |row| row.get(0),
+    )?;
+    super::origin_control::require_origin(db, actor, job, controller.as_deref())
+}
+
+fn may_decide_from_device(
+    db: &Connection,
+    actor: &str,
+    job: &Job,
+    device: Option<&str>,
+) -> Result<()> {
+    super::origin_control::require_origin(db, actor, job, device)
 }
 
 fn running_job(db: &Connection, record: &Record) -> Result<Job> {
@@ -102,11 +140,10 @@ fn running_job(db: &Connection, record: &Record) -> Result<Job> {
     Ok(job)
 }
 
-fn live(db: &Connection, record: &Record, now: u64) -> Result<Job> {
+fn current_record(db: &Connection, record: &Record, now: u64) -> Result<()> {
     if record.expires <= now || record.invalidated_at.is_some() {
         return Err(WorkError::Conflict);
     }
-    let job = running_job(db, record)?;
     if let Some(decider) = &record.decided_by {
         let current:Option<(u64,u64)>=db.query_row("SELECT credential_generation,authorization_generation FROM identity_users WHERE id=?1 AND disabled=0",[decider],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
         if current
@@ -117,17 +154,73 @@ fn live(db: &Connection, record: &Record, now: u64) -> Result<Job> {
             return Err(WorkError::Conflict);
         }
     }
+    Ok(())
+}
+
+fn live(db: &Connection, record: &Record, now: u64) -> Result<Job> {
+    current_record(db, record, now)?;
+    running_job(db, record)
+}
+
+/// A human refusal cancels this root turn immediately. Its exact negative
+/// answer still needs durable delivery/retry while the Runner stops. This is
+/// never used by effect admission or by a new approval decision.
+fn answer_job(db: &Connection, record: &Record, now: u64) -> Result<Job> {
+    if !matches!(
+        record.decision,
+        Some(ApprovalDecision::Deny | ApprovalDecision::Stop)
+    ) {
+        return live(db, record, now);
+    }
+    current_record(db, record, now)?;
+    // Retain compatibility with negative answers saved before root cancellation
+    // became part of the decision transaction. Consumption cancels them below.
+    if let Ok(job) = running_job(db, record) {
+        return Ok(job);
+    }
+    let (job_id, state, authority): (String, String, u64) = db.query_row(
+        "SELECT job_id,state,authority_generation FROM shared_attempts WHERE id=?1",
+        [&record.attempt_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let job = super::store::load(db, &job_id)?;
+    let root = super::store::load(db, &job.root_id)?;
+    if record.decided_by.is_none()
+        || !matches!(state.as_str(), "stop_requested" | "cancelled")
+        || !matches!(job.state, JobState::Cancelling | JobState::Cancelled)
+        || !matches!(root.state, JobState::Cancelling | JobState::Cancelled)
+        || record.authority_generation != authority
+        || record.authority_generation != job.authority_generation
+    {
+        return Err(WorkError::Conflict);
+    }
     Ok(job)
 }
 
-fn view(db: &Connection, actor: &Principal, record: Record, now: u64) -> Result<ApprovalView> {
+fn cancel_refused_turn(db: &Connection, job: &Job, now: u64) -> Result<()> {
+    if !matches!(
+        super::store::load(db, &job.root_id)?.state,
+        JobState::Cancelling | JobState::Cancelled
+    ) {
+        super::store::cancel_root_in_transaction(db, &job.root_id, now)?;
+    }
+    Ok(())
+}
+
+fn view(
+    db: &Connection,
+    actor: &Principal,
+    record: Record,
+    now: u64,
+    device: Option<&str>,
+) -> Result<ApprovalView> {
     let status = if record.invalidated_at.is_some() {
         "cancelled"
     } else if record.consumed_at.is_some() {
         "consumed"
     } else if record.expires <= now {
         "expired"
-    } else if live(db, &record, now).is_err() {
+    } else if answer_job(db, &record, now).is_err() {
         "cancelled"
     } else if record.decision.is_some() {
         "decided"
@@ -136,10 +229,41 @@ fn view(db: &Connection, actor: &Principal, record: Record, now: u64) -> Result<
     };
     let can_decide = record.decision.is_none()
         && live(db, &record, now).is_ok_and(|job| {
-            may_decide(db, &actor.user_id, &job).is_ok()
+            may_decide_from_device(db, &actor.user_id, &job, device).is_ok()
                 && super::store::may_use(db, &job.assignee_id, &job.project_id, &job.environment_id)
                     .is_ok()
         });
+    let can_reconfirm = record.expires <= now
+        && record.invalidated_at.is_none()
+        && record.consumed_at.is_none()
+        && !matches!(
+            record.decision,
+            Some(ApprovalDecision::Deny | ApprovalDecision::Stop)
+        )
+        && running_job(db, &record).is_ok_and(|job| {
+            may_decide_from_device(db, &actor.user_id, &job, device).is_ok()
+                && super::store::may_use(db, &job.assignee_id, &job.project_id, &job.environment_id)
+                    .is_ok()
+        });
+    let context = db.query_row(
+        "SELECT j.id,j.project_id,j.root_id,j.conversation_id,j.title,
+           COALESCE(j.controller_device_id,j.origin_device_id),a.runner_id
+         FROM shared_attempts a JOIN shared_jobs j ON j.id=a.job_id WHERE a.id=?1",
+        [&record.attempt_id],
+        |row| {
+            Ok(ApprovalContext {
+                job_id: row.get(0)?,
+                project_id: row.get(1)?,
+                root_id: row.get(2)?,
+                conversation_id: row.get(3)?,
+                job_title: row.get(4)?,
+                controller_device_id: row.get(5)?,
+                controller_device_label: None,
+                execution_device_id: row.get(6)?,
+                execution_device_label: None,
+            })
+        },
+    )?;
     Ok(ApprovalView {
         id: record.id,
         attempt_id: record.attempt_id,
@@ -148,6 +272,8 @@ fn view(db: &Connection, actor: &Principal, record: Record, now: u64) -> Result<
         decision: record.decision,
         expires_at_ms: record.expires,
         can_decide,
+        can_reconfirm,
+        context,
     })
 }
 
@@ -156,8 +282,9 @@ pub(super) fn view_by_id(
     actor: &Principal,
     id: &str,
     now: u64,
+    device: Option<&str>,
 ) -> Result<ApprovalView> {
-    view(db, actor, load(db, id)?, now)
+    view(db, actor, load(db, id)?, now, device)
 }
 
 pub(super) fn record_request(
@@ -174,7 +301,7 @@ pub(super) fn record_request(
         return Err(WorkError::Invalid);
     }
     let request = super::store::json(request)?;
-    let (exists,pending,count):(bool,bool,u32)=db.query_row("SELECT EXISTS(SELECT 1 FROM shared_approvals WHERE id=?1),EXISTS(SELECT 1 FROM shared_approvals WHERE attempt_id=?2 AND consumed_at_ms IS NULL AND invalidated_at_ms IS NULL AND expires_at_ms>?3),(SELECT COUNT(*) FROM shared_approvals WHERE attempt_id=?2)",params![id,attempt,now],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+    let (exists,pending,count):(bool,bool,u32)=db.query_row("SELECT EXISTS(SELECT 1 FROM shared_approvals WHERE id=?1),EXISTS(SELECT 1 FROM shared_approvals WHERE attempt_id=?2 AND consumed_at_ms IS NULL AND invalidated_at_ms IS NULL),(SELECT COUNT(*) FROM shared_approvals WHERE attempt_id=?2)",params![id,attempt],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
     if exists || pending {
         return Err(WorkError::Conflict);
     }
@@ -187,6 +314,40 @@ pub(super) fn record_request(
 }
 
 impl SharedWork {
+    /// Expiry is not refusal. Only the original controller can reopen the exact
+    /// still-suspended operation; the Runner supplies its replacement identity.
+    pub fn reconfirm_expired_approval_for_device(
+        &mut self,
+        actor: &Principal,
+        job_id: &str,
+        approval_id: &str,
+        now: u64,
+        device: Option<&str>,
+    ) -> Result<ApprovalView> {
+        super::store::timestamp(now)?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let record = load(&tx, approval_id)?;
+        let job = running_job(&tx, &record)?;
+        if job.id != job_id
+            || record.expires > now
+            || matches!(
+                record.decision,
+                Some(ApprovalDecision::Deny | ApprovalDecision::Stop)
+            )
+            || record.consumed_at.is_some()
+        {
+            return Err(WorkError::Conflict);
+        }
+        may_decide_from_device(&tx, &actor.user_id, &job, device)?;
+        super::store::may_use(&tx, &job.assignee_id, &job.project_id, &job.environment_id)?;
+        tx.execute("UPDATE shared_approvals SET invalidated_at_ms=COALESCE(invalidated_at_ms,?2) WHERE id=?1", params![approval_id, now])?;
+        let result = view_by_id(&tx, actor, approval_id, now, device)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
     pub fn authorize_effect(
         &self,
         runner: &str,
@@ -234,9 +395,64 @@ impl SharedWork {
         job_id: &str,
         now: u64,
     ) -> Result<Option<ApprovalView>> {
+        self.approval_exact_for_device(actor, job_id, now, None)
+    }
+
+    pub fn approval_for_device(
+        &self,
+        actor: &Principal,
+        job_id: &str,
+        now: u64,
+        device: Option<&str>,
+    ) -> Result<Option<ApprovalView>> {
+        let job = self.job(actor, job_id)?;
+        // Keep the normal conversation selected while a descendant waits. An old
+        // consumed root request must never hide a current child confirmation.
+        let ids = self
+            .db
+            .prepare(
+                "SELECT p.id FROM shared_approvals p JOIN shared_attempts a ON a.id=p.attempt_id
+             JOIN shared_jobs j ON j.id=a.job_id
+             WHERE j.root_id=?1 AND (p.decision IS NULL OR p.decision='approve') AND p.consumed_at_ms IS NULL
+               AND p.invalidated_at_ms IS NULL AND a.state='running' AND j.state='running'
+             ORDER BY p.created_at_ms,p.id LIMIT 1001",
+            )?
+            .query_map(params![job.root_id], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for id in ids {
+            let candidate = view_by_id(&self.db, actor, &id, now, device)?;
+            if candidate.status == "pending" || candidate.status == "expired" {
+                return Ok(Some(candidate));
+            }
+        }
+        // Keep the child refusal visible on its originating conversation after
+        // it has stopped the whole turn, even if the parent had an older answer.
+        let root = super::store::load(&self.db, &job.root_id)?;
+        if matches!(root.state, JobState::Cancelling | JobState::Cancelled) {
+            let refusal: Option<String> = self.db.query_row(
+                "SELECT p.id FROM shared_approvals p JOIN shared_attempts a ON a.id=p.attempt_id
+                 JOIN shared_jobs j ON j.id=a.job_id WHERE j.root_id=?1
+                 AND p.decision IN ('deny','stop') AND p.invalidated_at_ms IS NULL
+                 ORDER BY p.decided_at_ms DESC,p.id DESC LIMIT 1",
+                [&job.root_id], |row| row.get(0),
+            ).optional()?;
+            if let Some(id) = refusal {
+                return view_by_id(&self.db, actor, &id, now, device).map(Some);
+            }
+        }
+        self.approval_exact_for_device(actor, job_id, now, device)
+    }
+
+    pub(crate) fn approval_exact_for_device(
+        &self,
+        actor: &Principal,
+        job_id: &str,
+        now: u64,
+        device: Option<&str>,
+    ) -> Result<Option<ApprovalView>> {
         self.job(actor, job_id)?;
         let id:Option<String>=self.db.query_row("SELECT p.id FROM shared_approvals p JOIN shared_attempts a ON a.id=p.attempt_id WHERE a.job_id=?1 ORDER BY p.created_at_ms DESC,p.id DESC LIMIT 1",[job_id],|r|r.get(0)).optional()?;
-        id.map(|id| view_by_id(&self.db, actor, &id, now))
+        id.map(|id| view_by_id(&self.db, actor, &id, now, device))
             .transpose()
     }
 
@@ -248,16 +464,28 @@ impl SharedWork {
         decision: ApprovalDecision,
         now: u64,
     ) -> Result<ApprovalView> {
+        self.decide_approval_for_device(actor, job_id, id, decision, now, None)
+    }
+
+    pub fn decide_approval_for_device(
+        &mut self,
+        actor: &Principal,
+        job_id: &str,
+        id: &str,
+        decision: ApprovalDecision,
+        now: u64,
+        device: Option<&str>,
+    ) -> Result<ApprovalView> {
         super::store::timestamp(now)?;
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let record = load(&tx, id)?;
-        let job = live(&tx, &record, now)?;
+        let job = answer_job(&tx, &record, now)?;
         if job.id != job_id {
             return Err(WorkError::Conflict);
         }
-        may_decide(&tx, &actor.user_id, &job)?;
+        may_decide_from_device(&tx, &actor.user_id, &job, device)?;
         // Human authorization never widens the execution environment's current grant.
         super::store::may_use(&tx, &job.assignee_id, &job.project_id, &job.environment_id)?;
         if let Some(previous) = record.decision {
@@ -271,7 +499,12 @@ impl SharedWork {
                 params![job.id, now],
             )?;
         }
-        let result = view(&tx, actor, load(&tx, id)?, now)?;
+        if matches!(decision, ApprovalDecision::Deny | ApprovalDecision::Stop) {
+            // One cancellation owner fences descendants, retained services,
+            // later grants and parent wake-up in this same transaction.
+            cancel_refused_turn(&tx, &job, now)?;
+        }
+        let result = view(&tx, actor, load(&tx, id)?, now, device)?;
         tx.commit()?;
         Ok(result)
     }
@@ -304,9 +537,6 @@ impl SharedWork {
             return Err(WorkError::Conflict);
         }
         if record.invalidated_at.is_some() {
-            if record.expires <= now {
-                return Err(WorkError::Conflict);
-            }
             let job = running_job(&tx, &record)?;
             super::handover::may_continue(&tx, &job, &job.environment_id)?;
             // This read changes neither the invalidated record nor execution
@@ -316,7 +546,19 @@ impl SharedWork {
                 reconfirmation_required: true,
             }));
         }
-        let job = live(&tx, &record, now)?;
+        if record.expires <= now
+            && !matches!(
+                record.decision,
+                Some(ApprovalDecision::Deny | ApprovalDecision::Stop)
+            )
+            && record.consumed_at.is_none()
+        {
+            let job = running_job(&tx, &record)?;
+            super::store::may_use(&tx, &job.assignee_id, &job.project_id, &job.environment_id)?;
+            // The exact tool remains paused; only its origin can request a new review.
+            return Ok(None);
+        }
+        let job = answer_job(&tx, &record, now)?;
         let Some(decision) = record.decision else {
             return Ok(None);
         };
@@ -326,6 +568,9 @@ impl SharedWork {
             &job,
         )?;
         super::store::may_use(&tx, &job.assignee_id, &job.project_id, &job.environment_id)?;
+        if matches!(decision, ApprovalDecision::Deny | ApprovalDecision::Stop) {
+            cancel_refused_turn(&tx, &job, now)?;
+        }
         if record.consumed_at.is_none() {
             tx.execute(
                 "UPDATE shared_approvals SET consumed_at_ms=?2 WHERE id=?1",

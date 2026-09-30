@@ -200,6 +200,7 @@ impl Fixture {
         let catalog = Catalog {
             team_default_model_id: None,
             models: vec![LogicalModel {
+                system_prompt: String::new(),
                 id: "logical-qwen".into(),
                 label: "Selected Qwen".into(),
                 capabilities: BTreeSet::from(["tools".into()]),
@@ -322,6 +323,40 @@ impl Fixture {
         .await
         .unwrap()
     }
+}
+
+#[tokio::test]
+async fn model_system_prompt_requires_client_support_before_any_permit_and_gateway_does_not_inject()
+{
+    let fixture = Fixture::new(false, false).await;
+    {
+        let mut core = fixture.core.lock().unwrap();
+        let mut catalog = core.catalog_store().catalog.clone();
+        catalog.models[0].system_prompt = "日本語で回答してください。".into();
+        core.replace_catalog(catalog, now_ms()).unwrap();
+    }
+    let client = fixture.register().await;
+    let (status, rejected) = fixture.prepare(&client, "main", "turn", "legacy").await;
+    assert_eq!(status, 409);
+    assert_eq!(rejected["error"], "model_system_prompt_unsupported");
+    fixture
+        .wait_status(|status| status["reserved"] == 0 && status["running"] == 0)
+        .await;
+    let (status, ready) = fixture.post("/v1/requests/prepare", client["client_token"].as_str().unwrap(), json!({
+        "id":client["id"],"context":"main","turn_id":"turn","request_id":"supported",
+        "expected_hub_id":client["hub_id"],"reviewed_revision":client["revision"],"supports_model_system_prompt":true
+    })).await;
+    assert_eq!(status, 200);
+    assert_eq!(ready["state"], "ready");
+    fixture.generate(&ready).await.bytes().await.unwrap();
+    let records = fixture.provider.records.lock().unwrap();
+    assert_eq!(records.len(), 1);
+    assert!(
+        !serde_json::to_string(&*records)
+            .unwrap()
+            .contains("日本語で回答"),
+        "the gateway forwards client composition without a second prompt owner"
+    );
 }
 
 #[tokio::test]

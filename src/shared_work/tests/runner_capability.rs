@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn old_runner_claims_plain_jobs_but_not_origin_jobs_or_their_existing_attempts() {
+fn old_runner_claims_legacy_jobs_but_not_new_unbounded_jobs() {
     let mut f = Fixture::new();
     let origin = f
         .work
@@ -28,6 +28,13 @@ fn old_runner_claims_plain_jobs_but_not_origin_jobs_or_their_existing_attempts()
         )
         .unwrap();
     let plain = f.submit("solver", "plain", 0);
+    f.work
+        .db
+        .execute(
+            "UPDATE shared_jobs SET required_capability=NULL WHERE id=?1",
+            [&plain.id],
+        )
+        .unwrap();
     let old = f
         .work
         .claim_for_capability("WinE", None, None, 11)
@@ -115,6 +122,13 @@ fn old_runner_claims_plain_jobs_but_not_origin_jobs_or_their_existing_attempts()
 fn retaining_service_upgrades_plain_conversation_before_old_runner_redelivery() {
     let mut f = Fixture::new();
     let plain = f.submit("solver", "plain-preview", 0);
+    f.work
+        .db
+        .execute(
+            "UPDATE shared_jobs SET required_capability=NULL WHERE id=?1",
+            [&plain.id],
+        )
+        .unwrap();
     let assignment = f
         .work
         .claim_for_capability(
@@ -133,7 +147,7 @@ fn retaining_service_upgrades_plain_conversation_before_old_runner_redelivery() 
         "retained",
         ReportOutcome::RetainService {
             service_id: "preview-capability".into(),
-            expires_at_ms: 1000,
+            expires_at_ms: Some(1000),
         },
     );
     assert_eq!(
@@ -158,5 +172,42 @@ fn retaining_service_upgrades_plain_conversation_before_old_runner_redelivery() 
             .claim_for_capability("WinE", None, None, 22)
             .unwrap()
             .is_none()
+    );
+}
+
+#[test]
+fn current_runner_accepts_legacy_v1_but_v1_runner_cannot_start_new_lifetime_contract() {
+    let mut f = Fixture::new();
+    let legacy = f.submit("solver", "old-v1", 0);
+    f.work
+        .db
+        .execute(
+            "UPDATE shared_jobs SET required_capability='multi_device_session_v1' WHERE id=?1",
+            [&legacy.id],
+        )
+        .unwrap();
+    let attempt = f
+        .work
+        .claim_for_capability(
+            "WinE",
+            None,
+            Some(store::MULTI_DEVICE_SESSION_CAPABILITY),
+            11,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(attempt.job.id, legacy.id);
+    f.report(&attempt, "start", ReportOutcome::Started);
+    f.report(&attempt, "finish", finished());
+    let current = f.submit("solver", "current", 0);
+    assert!(
+        f.work
+            .claim_for_capability("WinE", None, Some("multi_device_session_v1"), 21)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        f.work.claim("WinE", 22).unwrap().unwrap().job.id,
+        current.id
     );
 }

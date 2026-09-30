@@ -39,7 +39,8 @@ export async function createDeviceParticipant(network, label, windowsUsername = 
                 method: data ? "POST" : "GET", ca: network.ca_certificate_pem,
                 ...(authenticated && certificate ? { key, cert: certificate.certificate_pem } : {}),
                 agent: false, timeout: 5000,
-                headers: { ...(data ? { "content-type": "application/json", "content-length": data.length } : {}), ...(sharedToken ? { authorization: `Bearer ${sharedToken}` } : {}) },
+                headers: { ...(data ? { "content-type": "application/json", "content-length": data.length } : {}), ...(sharedToken ? { authorization: `Bearer ${sharedToken}` } : {}),
+                    ...(namespace === "shared" && path.startsWith("runner/") ? { "x-moyai-runner-capabilities": "multi_device_session_v2" } : {}) },
             }, response => {
                 const chunks = [];
                 response.on("data", chunk => chunks.push(chunk));
@@ -85,6 +86,10 @@ export async function createDeviceParticipant(network, label, windowsUsername = 
         sharedAssignments(environmentIds) {
             if (!certificate || !Array.isArray(environmentIds) || environmentIds.length === 0 || environmentIds.length > 32 || environmentIds.some(id => typeof id !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(id))) throw new Error("Assignments require an enrolled runner and bounded environment IDs");
             return request(`runner/assignments?environment_ids=${encodeURIComponent(environmentIds.join(","))}`, undefined, true, null, "shared");
+        },
+        sharedConsumeApproval(approvalId, attemptId, generation) {
+            if (!certificate || ![approvalId, attemptId].every(id => typeof id === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(id)) || !Number.isSafeInteger(generation) || generation < 1) throw new Error("Approval consumption requires an enrolled Runner and exact approval/attempt identities");
+            return request(`runner/approvals/${approvalId}/consume`, { attempt_id: attemptId, generation }, true, null, "shared");
         },
         sharedTemplates: templates => request("runner/templates", { templates }, true, null, "shared"),
         sharedProvisioning: () => request("runner/provisioning", undefined, true, null, "shared"),

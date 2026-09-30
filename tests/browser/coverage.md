@@ -1,6 +1,6 @@
 # Hub Web管理 GUI試験の範囲
 
-2026-09-22時点のHub Web管理にある現役の操作を対象にする。以下は再利用する試験の対応表であり、全操作の受入完了表ではない。各実行のPASS/FAIL・バイナリーSHA-256・画像の目視結果は、その実行の`project_sandbox`レポートを正とする。
+2026-09-27時点のHub Web管理にある現役の操作を対象にする。以下は再利用する試験の対応表であり、全操作の受入完了表ではない。各実行のPASS/FAIL・バイナリーSHA-256・画像の目視結果は、その実行の`project_sandbox`レポートを正とする。
 
 ## 管理画面と対応する試験
 
@@ -11,6 +11,7 @@
 | 競合したプロジェクトの編集 | `shared-management.spec.mjs`で入力保持→最新値と比較→明示継続→通常保存、再競合、削除対象、遅延比較後の利用終了と新ticketで再開 | 実行結果はtask-local reportを参照。破壊的・世代依存の操作は対象を開き直す |
 | 最初のPCへの接続手順 | `onboarding.spec.mjs`で設定・開始→受信許可案内→ファイル取得→実TLS申請・承認→Desktop診断案内、停止時の戻り、Gateway変更が任意で開始前に見えること | このケースはloopbackのprotocol fixture。実UAC・Firewall書込み・物理LAN到達・実AI応答を確認した意味ではない |
 | PC参加と用途の一括判断 | `onboarding.spec.mjs`でWindowsユーザー名の参考表示、同じPCの操作／実行用途、非管理者の専用actor発行とPWなしのproject閲覧、並行更新後の部分保存と同一PC再開 | 複数の物理PC、申請元と現物の照合 |
+| 自動更新とフォーカス | `device-management.spec.mjs`で手動更新なしの参加許可・PC名・用途・online・次の申請、native SELECTのクリック／Alt+ArrowDown／focus跨ぎTab、一覧／導入案内のfocus保持、削除された操作targetの退役。`stable-rows.spec.mjs`で存続行の移動時focus。`management-workflows.spec.mjs`で入力draft・caret保持と競合拒否 | headlessの結果と実画面操作は各証跡で区別。物理PCでのIME・ブラウザーのnative操作は実環境でも確認 |
 | LAN候補・固定Gateway・受信許可 | 候補読み取り、固定Gateway、`firewall.spec.mjs`のloopback拒否・起動時の現在ルール照合・LAN候補の明示入力・取得済み社内IPv4での実ルール読取preview・入力変更時の確認無効化。試験はapply/remove/UACを操作しない | 実Firewall書込み・UAC取消／権限拒否・GPO・物理別PC到達は専用実環境の受入。模擬NetSecurityのPS5.1検証とは区別 |
 | 最初に使う共有モデル | `management-workflows.spec.mjs`で管理者の明示選択、保存値と最後のモデル削除後の指定解除 | 新規Desktopへの初期選択と保存済み選択維持はconsumer側の結合。生成成功は別確認 |
 | Hubログオン開始 | コマンド生成unit、remote management拒否、unitで登録状態のread-only表示 | Windowsユーザーの実Run登録／解除・再ログオン・設置先変更は未自動化。ブラウザー試験は実PCの登録を変更しない |

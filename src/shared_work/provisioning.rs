@@ -4,6 +4,29 @@ use crate::identity::{self, Principal};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 pub(super) const MAX_RUNNER_ENVIRONMENTS: u32 = 128;
+pub(super) const MAX_HUB_ENVIRONMENTS: u32 = 1000;
+
+// An archived or not-yet-prepared binding still reserves a workspace. Only
+// disabled, ungranted, unbound Desktop-folder history is retired. Legacy manual
+// settings remain explicit reservations even when disabled; job references stay intact.
+// Every query using this predicate aliases shared_environments as `e`.
+pub(super) const CURRENT_ENVIRONMENT: &str = "(e.enabled=1 OR NOT EXISTS(SELECT 1 FROM shared_provisioning s WHERE s.environment_id=e.id AND s.template_id IN ('local-folder','desktop-default')) OR EXISTS(SELECT 1 FROM shared_environment_projects ep WHERE ep.environment_id=e.id) OR EXISTS(SELECT 1 FROM shared_project_devices d JOIN shared_projects p ON p.id=d.project_id WHERE d.environment_id=e.id AND d.can_execute=1 AND p.deleted_at_ms IS NULL))";
+
+pub(super) fn check_environment_capacity(
+    db: &Connection,
+    runner: &str,
+    replacing: Option<&str>,
+) -> Result<()> {
+    let (total, pc): (u32, u32) = db.query_row(
+        &format!("SELECT COUNT(*),COALESCE(SUM(e.runner_id=?1),0) FROM shared_environments e WHERE {CURRENT_ENVIRONMENT} AND (?2 IS NULL OR e.id<>?2)"),
+        params![runner, replacing], |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if total >= MAX_HUB_ENVIRONMENTS || pc >= MAX_RUNNER_ENVIRONMENTS {
+        Err(WorkError::Capacity)
+    } else {
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -35,12 +58,36 @@ pub struct RunnerEnvironment {
     #[serde(flatten)]
     pub environment: Environment,
     pub enabled: bool,
+    /// Current project assignment, including archived projects. Derived from
+    /// the assignment owner, not a separately persisted lifecycle flag.
+    #[serde(default)]
+    pub workspace_bound: bool,
 }
 
 impl SharedWork {
     pub fn runner_environments(&self, runner: &str) -> Result<Vec<RunnerEnvironment>> {
+        self.runner_environment_catalog(runner, false)
+    }
+
+    pub(super) fn current_runner_environments(
+        &self,
+        runner: &str,
+    ) -> Result<Vec<RunnerEnvironment>> {
+        self.runner_environment_catalog(runner, true)
+    }
+
+    fn runner_environment_catalog(
+        &self,
+        runner: &str,
+        current_only: bool,
+    ) -> Result<Vec<RunnerEnvironment>> {
         store::id(runner)?;
-        let mut statement=self.db.prepare("SELECT e.id,e.label,e.resource_id,r.capacity,e.enabled FROM shared_environments e JOIN shared_resources r ON r.id=e.resource_id WHERE e.runner_id=?1 ORDER BY e.id LIMIT ?2")?;
+        let filter = if current_only {
+            CURRENT_ENVIRONMENT
+        } else {
+            "1"
+        };
+        let mut statement=self.db.prepare(&format!("SELECT e.id,e.label,e.resource_id,r.capacity,e.enabled,EXISTS(SELECT 1 FROM shared_project_devices d JOIN shared_projects p ON p.id=d.project_id WHERE d.environment_id=e.id AND d.can_execute=1 AND p.deleted_at_ms IS NULL) FROM shared_environments e JOIN shared_resources r ON r.id=e.resource_id WHERE e.runner_id=?1 AND {filter} ORDER BY e.id LIMIT ?2"))?;
         let mut environments = statement
             .query_map(params![runner, MAX_RUNNER_ENVIRONMENTS + 1], |row| {
                 Ok(RunnerEnvironment {
@@ -53,6 +100,7 @@ impl SharedWork {
                         project_ids: vec![],
                     },
                     enabled: row.get(4)?,
+                    workspace_bound: row.get(5)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -136,7 +184,7 @@ impl SharedWork {
         Ok(())
     }
     pub fn pending_provision(&self, runner: &str) -> Result<Vec<ProvisionRequest>> {
-        let mut statement=self.db.prepare("SELECT p.environment_id,p.template_id,p.generation,p.state FROM shared_provisioning p JOIN shared_environments e ON e.id=p.environment_id WHERE p.runner_id=?1 AND e.runner_id=?1 AND (p.state='pending' OR (p.template_id IN ('local-folder','desktop-default') AND p.state='failed')) ORDER BY p.created_at_ms,p.environment_id LIMIT 128")?;
+        let mut statement=self.db.prepare(&format!("SELECT p.environment_id,p.template_id,p.generation,p.state FROM shared_provisioning p JOIN shared_environments e ON e.id=p.environment_id WHERE p.runner_id=?1 AND e.runner_id=?1 AND {CURRENT_ENVIRONMENT} AND (p.state='pending' OR (p.template_id IN ('local-folder','desktop-default') AND p.state='failed')) ORDER BY p.created_at_ms,p.environment_id LIMIT 128"))?;
         Ok(statement
             .query_map([runner], |r| {
                 Ok(ProvisionRequest {
@@ -233,7 +281,7 @@ impl SharedWork {
         identity::require_admin(&self.db, actor)?;
         let mut templates=self.db.prepare("SELECT runner_id,template_id,label FROM shared_runner_templates ORDER BY runner_id,template_id LIMIT 1000")?;
         let templates=templates.query_map([],|r|Ok(serde_json::json!({"runner_id":r.get::<_,String>(0)?,"id":r.get::<_,String>(1)?,"label":r.get::<_,String>(2)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
-        let mut receipts=self.db.prepare("SELECT environment_id,runner_id,template_id,state,error,generation FROM shared_provisioning ORDER BY updated_at_ms DESC,environment_id LIMIT 1000")?;
+        let mut receipts=self.db.prepare(&format!("SELECT s.environment_id,s.runner_id,s.template_id,s.state,s.error,s.generation FROM shared_provisioning s JOIN shared_environments e ON e.id=s.environment_id WHERE {CURRENT_ENVIRONMENT} ORDER BY s.updated_at_ms DESC,s.environment_id LIMIT 1000"))?;
         let receipts=receipts.query_map([],|r|Ok(serde_json::json!({"environment_id":r.get::<_,String>(0)?,"runner_id":r.get::<_,String>(1)?,"template_id":r.get::<_,String>(2)?,"state":r.get::<_,String>(3)?,"error":r.get::<_,Option<String>>(4)?,"generation":r.get::<_,u64>(5)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
         Ok(serde_json::json!({"templates":templates,"requests":receipts}))
     }
@@ -243,6 +291,9 @@ pub(super) fn enqueue(db: &Connection, request: &ProvisionRequest, now: u64) -> 
     store::id(&request.environment_id)?;
     store::id(&request.template_id)?;
     store::timestamp(now)?;
+    if !db.query_row(&format!("SELECT EXISTS(SELECT 1 FROM shared_environments e WHERE e.id=?1 AND {CURRENT_ENVIRONMENT})"), [&request.environment_id], |r| r.get::<_, bool>(0))? {
+        return Err(WorkError::NotFound);
+    }
     let runner: String = if request.template_id == super::project_setup::LOCAL_FOLDER_TEMPLATE {
         db.query_row("SELECT e.runner_id FROM shared_environments e JOIN shared_project_devices d ON d.environment_id=e.id JOIN shared_projects p ON p.id=d.project_id WHERE e.id=?1 AND d.can_execute=1 AND p.archived=0 AND p.deleted_at_ms IS NULL",[&request.environment_id],|r|r.get(0)).optional()?.ok_or(WorkError::NotFound)?
     } else {

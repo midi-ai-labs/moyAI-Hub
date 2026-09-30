@@ -263,6 +263,10 @@
               </div>
               <label class="checkbox"><input id="allow-tools" type="checkbox"/>ツール利用を許可（管理者確認）</label>
               <p class="footnote">ホストからツール対応の情報を取得できない場合に使います。このモデルでツールが動作することを管理者が確認してから選択してください。</p>
+                <label>システムプロンプト（任意）
+                  <textarea id="model-system-prompt" rows="4" spellcheck="false"></textarea>
+                </label>
+                <p class="footnote">このモデルを使う各リクエストに追加する指示です（最大16,384文字）。同じモデルの別ホストでも共有します。既存モデルにまとめる場合は登録済みの指示を使います。</p>
               <details class="registration-options">
                 <summary>
                   同じモデルの別ホスト・同時接続数を設定
@@ -353,7 +357,7 @@
             <span>
               <i class="dot gray">
               </i>
-              未確認 / 接続不可
+              未確認 / 再確認待ち / 接続・確認不可
             </span>
           </div>
           <p class="footnote">一覧にあるモデルへ要求を中継します。ロードや実行可否の判断は oMLX や LM Studio などのホスト側が行います。</p>
@@ -478,6 +482,10 @@
           表示名
           <input id="edit-label" required maxlength="160"/>
         </label>
+        <label>システムプロンプト（任意）
+          <textarea id="edit-system-prompt" rows="5" spellcheck="false"></textarea>
+        </label>
+        <p class="footnote">同じ論理モデルのすべての登録先に適用します（最大16,384文字）。空欄で保存すると削除します。DesktopとRunnerで更新後のモデル設定を確認すると、次の実行から反映されます。</p>
         <label>
           APIキー
           <input id="edit-api-key" type="password" spellcheck="false" autocomplete="off" aria-describedby="edit-api-key-status"/>

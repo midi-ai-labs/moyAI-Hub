@@ -8,6 +8,7 @@ fn fixture() -> (HubCore, Selection) {
             Catalog {
                 team_default_model_id: None,
                 models: vec![LogicalModel {
+                    system_prompt: String::new(),
                     id: "model".into(),
                     label: "Model".into(),
                     capabilities: BTreeSet::from(["tools".into()]),

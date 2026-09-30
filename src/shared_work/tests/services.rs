@@ -11,7 +11,7 @@ fn completed_turn_with_retained_service_cannot_be_revised_until_service_stops() 
         "retain-before-revise",
         ReportOutcome::RetainService {
             service_id: "preview-for-revise".into(),
-            expires_at_ms: 1000,
+            expires_at_ms: Some(1000),
         },
     );
     f.report(&attempt, "finish-before-revise", finished());
@@ -82,7 +82,7 @@ fn retained_service_keeps_capacity_and_rejoins_only_its_conversation() {
         "retained",
         ReportOutcome::RetainService {
             service_id: "server-1".into(),
-            expires_at_ms: 1000,
+            expires_at_ms: Some(1000),
         },
     );
     f.report(
@@ -242,7 +242,7 @@ fn cancellation_requests_stop_but_keeps_capacity_until_runner_confirms() {
         "retain",
         ReportOutcome::RetainService {
             service_id: "cancel-server".into(),
-            expires_at_ms: 1000,
+            expires_at_ms: Some(1000),
         },
     );
     let other = f.submit("solver", "next", 0);
@@ -292,7 +292,7 @@ fn successful_turn_can_leave_a_finite_service_for_the_next_turn() {
         "retained",
         ReportOutcome::RetainService {
             service_id: "preview-server".into(),
-            expires_at_ms: 1000,
+            expires_at_ms: Some(1000),
         },
     );
     f.report(
@@ -345,7 +345,7 @@ fn revoked_execution_authority_requests_service_stop_without_releasing_capacity(
         "retained",
         ReportOutcome::RetainService {
             service_id: "revoked-server".into(),
-            expires_at_ms: 1000,
+            expires_at_ms: Some(1000),
         },
     );
     identity::set_project_role(&f.work.db, &f.admin, "alpha", &f.alice.user_id, None, 21).unwrap();
@@ -390,7 +390,7 @@ fn conversation_stop_requests_every_owned_lease_atomically_and_waits_for_ack() {
         "first-retained",
         ReportOutcome::RetainService {
             service_id: "all-stop-first".into(),
-            expires_at_ms: 1000,
+            expires_at_ms: Some(1000),
         },
     );
     f.report(
@@ -411,7 +411,7 @@ fn conversation_stop_requests_every_owned_lease_atomically_and_waits_for_ack() {
         "child-retained",
         ReportOutcome::RetainService {
             service_id: "all-stop-child".into(),
-            expires_at_ms: 1000,
+            expires_at_ms: Some(1000),
         },
     );
     f.report(
@@ -536,7 +536,7 @@ fn conversation_stop_retry_does_not_stop_later_service_or_reuse_another_scope() 
         "first-retained",
         ReportOutcome::RetainService {
             service_id: "first-preview-service".into(),
-            expires_at_ms: 1000,
+            expires_at_ms: Some(1000),
         },
     );
     f.report(
@@ -588,7 +588,7 @@ fn conversation_stop_retry_does_not_stop_later_service_or_reuse_another_scope() 
         "second-retained",
         ReportOutcome::RetainService {
             service_id: "second-preview-service".into(),
-            expires_at_ms: 1000,
+            expires_at_ms: Some(1000),
         },
     );
     let other = f.submit("parent", "other-conversation", 0);
@@ -605,4 +605,83 @@ fn conversation_stop_retry_does_not_stop_later_service_or_reuse_another_scope() 
         store::resource_occupancy(&f.work.db, "wine-slot").unwrap(),
         1
     );
+}
+
+#[test]
+fn unbounded_preview_and_another_queued_conversation_survive_seventy_two_hours() {
+    let mut f = Fixture::new();
+    let root = f.submit("solver", "long-preview", 0);
+    let attempt = f.work.claim("WinE", 11).unwrap().unwrap();
+    f.report(&attempt, "start", ReportOutcome::Started);
+    f.report(
+        &attempt,
+        "retain",
+        ReportOutcome::RetainService {
+            service_id: "preview-unbounded".into(),
+            expires_at_ms: None,
+        },
+    );
+    f.report(&attempt, "done", finished());
+    let queued = f.submit("solver", "later-conversation", 0);
+    let later = 73 * 60 * 60 * 1000;
+    f.reopen();
+    f.work.expire_start_deadlines(later).unwrap();
+    let service = f.work.runner_services("WinE", later).unwrap().remove(0);
+    assert_eq!(service.expires_at_ms, None);
+    assert!(!service.stop_requested);
+    assert!(f.work.claim("WinE", later).unwrap().is_none());
+    assert_eq!(
+        f.work.job(&f.alice, &queued.id).unwrap().state,
+        JobState::Queued
+    );
+    assert_eq!(
+        f.work.job(&f.alice, &root.id).unwrap().state,
+        JobState::Succeeded
+    );
+    f.work
+        .request_service_stop(&f.alice, "preview-unbounded", later + 1)
+        .unwrap();
+    assert!(f.work.claim("WinE", later + 2).unwrap().is_none());
+    f.work
+        .report(
+            "WinE",
+            &Report {
+                event_id: "exact-stop".into(),
+                attempt_id: attempt.attempt_id,
+                generation: attempt.generation,
+                outcome: ReportOutcome::ServiceStopped {
+                    service_id: "preview-unbounded".into(),
+                },
+            },
+            later + 3,
+        )
+        .unwrap();
+    assert_eq!(
+        f.work.claim("WinE", later + 4).unwrap().unwrap().job.id,
+        queued.id
+    );
+}
+
+#[test]
+fn explicit_legacy_preview_deadline_survives_forward_migration_and_requires_stop_ack() {
+    let mut f = Fixture::new();
+    f.submit("solver", "finite-preview", 0);
+    let attempt = f.work.claim("WinE", 11).unwrap().unwrap();
+    f.report(&attempt, "start", ReportOutcome::Started);
+    f.report(
+        &attempt,
+        "retain",
+        ReportOutcome::RetainService {
+            service_id: "finite-preview".into(),
+            expires_at_ms: Some(1000),
+        },
+    );
+    f.report(&attempt, "done", finished());
+    f.work.db.execute_batch("PRAGMA user_version=25").unwrap();
+    f.reopen();
+    let service = f.work.runner_services("WinE", 1000).unwrap().remove(0);
+    assert_eq!(service.expires_at_ms, Some(1000));
+    assert!(service.stop_requested);
+    f.submit("solver", "blocked-until-stop", 0);
+    assert!(f.work.claim("WinE", 1001).unwrap().is_none());
 }

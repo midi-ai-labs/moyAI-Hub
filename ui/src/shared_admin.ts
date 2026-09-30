@@ -1,11 +1,24 @@
 import { invoke, invokeSharedAdmin, ManagementFailure, onAuthenticationChange } from "./management.ts";
 import type { NetworkSnapshot } from "./network_state.ts";
-import { adminRequest, adminTabs, environmentDefaults, operationLabels, projectPCSelection, roleLabel, type AdminDraft, type AdminOperation, type SharedAdminSnapshot, type SharedAdminTab } from "./shared_admin_state.ts";
+import { adminRequest, adminTabs, environmentDefaults, operationLabels, projectPCSelection, projectPreparationLabel, roleLabel, type AdminDraft, type AdminOperation, type SharedAdminSnapshot, type SharedAdminTab } from "./shared_admin_state.ts";
 import { compareAdminEdit, type AdminComparison } from "./admin_comparison.ts";
+import { reconcileStableRows } from "./stable_rows.ts";
 import "./shared_admin.css";
 
 const esc = (value: unknown) => String(value ?? "").replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]!);
 const action = (kind: AdminOperation, label = operationLabels[kind], id = "") => `<button type="button" class="secondary" data-sa-operation="${kind}" data-sa-id="${esc(id)}">${esc(label)}</button>`;
+function rowKey(node: Element): string | null {
+  if (node.classList.contains("shared-admin-row")) {
+    const action = node.querySelector(".shared-admin-actions > button");
+    const identity = action && rowKey(action);
+    return identity ? `row:${identity}` : null;
+  }
+  if (node.id) return `${node.tagName}:id:${node.id}`;
+  for (const attributes of [["data-sa-operation", "data-sa-id"], ["data-sa-template", "data-sa-runner"], ["data-sa-retry-project", "data-sa-device"]]) {
+    if (node.hasAttribute(attributes[0])) return `${node.tagName}:${JSON.stringify(attributes.map(name => node.getAttribute(name)))}`;
+  }
+  return null;
+}
 export interface SharedAdminDevice { device_id: string; label: string; revoked: boolean; admission?: string; windows_username?: string | null }
 interface Editor { kind: AdminOperation; draft: AdminDraft; revision: string; conflict: boolean; baseline: SharedAdminSnapshot; comparison: AdminComparison | null }
 interface Pending { request_id: string; expected_revision: string; request: Record<string, unknown> }
@@ -57,7 +70,7 @@ export function attachSharedAdmin(host: HTMLElement, onSnapshot?: (value: Shared
         case "groups": return action("create_group") + s.groups.map(row => card(row.label, `<p>${row.disabled ? "利用停止" : "有効"}</p><p>所属: ${s.group_memberships.filter(m => m.group_id === row.id).map(m => esc(user(m.user_id))).join("、") || "なし"}</p>`, action("update_group", "編集", row.id) + action("group_member", "所属を設定", row.id) + action("delete_group", "削除", row.id))).join("");
         case "projects": return action("save_project", "プロジェクトを追加") + s.projects.map(row => {
           const assignments=(s.project_devices ?? []).filter(d=>d.project_id===row.id);
-          const state=(value:string)=>({waiting_setup:"このPCの実行設定待ち",pending:"作業フォルダーを準備中",ready:"作業フォルダー作成済み（Desktopでサンプルを実行してください）",failed:"作業フォルダーを作成できません",not_selected:"実行しない"})[value] ?? value;
+          const state = projectPreparationLabel;
           const controls=row.legacy_devices_unrestricted ? "従来の設定（登録したPCから操作可）" : assignments.filter(d=>d.can_control).map(d=>runner(d.device_id)).join("、") || "未選択";
           const executors=assignments.filter(d=>d.can_execute).map(d=>{ const environment=s.environments.find(e=>e.id===d.environment_id); const names=environment?.capabilities?.map(c=>c.name) ?? []; return `<p>${esc(runner(d.device_id))}: ${esc(state(d.preparation_state))}${d.error ? ` — ${esc(d.error)}` : ""}${d.preparation_state==="failed" ? `<button type="button" class="secondary" data-sa-retry-project="${esc(row.id)}" data-sa-device="${esc(d.device_id)}">フォルダー作成を再試行</button>` : ""}</p>${environment ? `<p>このPCで使えるもの: ${names.length ? names.map(esc).join("、") : "未設定"} ${action("set_environment_capabilities", "設定", environment.id)}</p>` : ""}`; }).join("") || "<p>未選択</p>";
           return card(row.label, `<p>${row.archived ? "保管中" : "利用中"}</p><p>操作に使うPC: ${esc(controls)}</p><div>仕事を実行するPC${executors}</div>`, action("save_project","設定を編集",row.id)+action("delete_project","削除",row.id));
@@ -70,8 +83,8 @@ export function attachSharedAdmin(host: HTMLElement, onSnapshot?: (value: Shared
     })();
     if (tab === "maintenance") rows += `<p>対象: ${s.maintenance_total}件</p><div class="shared-admin-actions">${s.maintenance_next_before ? '<button type="button" id="shared-admin-maintenance-next" class="secondary">次の復旧対象</button>' : ""}${maintenanceBefore ? '<button type="button" id="shared-admin-maintenance-latest" class="secondary">先頭の復旧対象</button>' : ""}</div>`;
     const container = node("shared-admin-content");
-    // Preserve focused row controls until focus leaves the list.
-    if (!container.contains(document.activeElement)) container.innerHTML = rows;
+    // These rows contain server facts/actions; the separate editor owns drafts.
+    reconcileStableRows(container, rows, container, rowKey);
     for (const button of host.querySelectorAll<HTMLElement>("[data-sa-tab]")) button.setAttribute("aria-selected", String(button.dataset.saTab === tab));
   }
   function open(kind: AdminOperation, id: string, template?: { runner_id: string; id: string }) {
@@ -79,7 +92,7 @@ export function attachSharedAdmin(host: HTMLElement, onSnapshot?: (value: Shared
     let draft: AdminDraft = { id, user_id: id, capacity: "1", enabled: true, member: true, role: "contributor" };
     if (kind === "save_project") {
       const project=snapshot.projects.find(row=>row.id===id);
-      draft={ id:project?.id ?? `project-${crypto.randomUUID()}`, label:project?.label ?? "", archived:project?.archived ?? false,
+      draft={ id:project?.id ?? `project-${crypto.randomUUID()}`, label:project?.label ?? "", overview:project?.overview ?? "", archived:project?.archived ?? false,
         controller_device_ids:project?.legacy_devices_unrestricted ? devices.filter(d=>!d.revoked).map(d=>d.device_id) : (snapshot.project_devices ?? []).filter(d=>d.project_id===id&&d.can_control).map(d=>d.device_id),
         runner_device_ids:(snapshot.project_devices ?? []).filter(d=>d.project_id===id&&d.can_execute).map(d=>d.device_id) };
     }
@@ -136,7 +149,7 @@ export function attachSharedAdmin(host: HTMLElement, onSnapshot?: (value: Shared
         case "save_project": {
           const selected=(key:string,id:string)=>Array.isArray(d[key])&&(d[key] as string[]).includes(id);
           const pcRows=devices.filter(pc=>!pc.revoked || selected("controller_device_ids",pc.device_id)||selected("runner_device_ids",pc.device_id)).map(pc=>`<tr><th scope="row">${esc(pc.label)}${pc.revoked ? "（登録失効）" : ""}</th><td><input type="checkbox" name="controller_device_ids" value="${esc(pc.device_id)}" aria-label="${esc(pc.label)}を操作に使う" ${selected("controller_device_ids",pc.device_id)?"checked":""}></td><td><input type="checkbox" name="runner_device_ids" value="${esc(pc.device_id)}" aria-label="${esc(pc.label)}で仕事を実行する" ${selected("runner_device_ids",pc.device_id)?"checked":""}></td></tr>`).join("");
-          return field("label","プロジェクト名")+`<fieldset><legend>使うPC</legend><p>操作PCでは依頼・成果の確認ができます。同じPCを両方に選べます。実行PCでは初回だけAI・保存先・権限の確認が必要です。</p><table class="shared-admin-pc-table"><thead><tr><th>PC</th><th>操作に使う</th><th>仕事を実行する</th></tr></thead><tbody>${pcRows}</tbody></table>${!pcRows?'<p>「接続PC」でPCの参加申請を許可してください。</p>':""}</fieldset><p>保存すると選択したPCへ反映します。既存の利用者・グループの役割は保持します。</p>`+check("archived","プロジェクトを保管する（新しい仕事を受け付けない）");
+          return field("label","プロジェクト名")+`<label>プロジェクト概要<textarea name="overview" id="shared-admin-overview" rows="5" placeholder="目的、各PCの役割、接続関係、開発上の制約など">${esc(d.overview ?? "")}</textarea><small>例: WinBはAPサーバー、WinCはDB。AIが作業を計画する際に参照します。変更は次の依頼から反映します。</small></label><fieldset><legend>使うPC</legend><p>操作PCでは依頼・成果の確認ができます。同じPCを両方に選べます。実行PCでは初回だけAI・保存先・権限の確認が必要です。</p><table class="shared-admin-pc-table"><thead><tr><th>PC</th><th>操作に使う</th><th>仕事を実行する</th></tr></thead><tbody>${pcRows}</tbody></table>${!pcRows?'<p>「接続PC」でPCの参加申請を許可してください。</p>':""}</fieldset><p>保存すると選択したPCへ反映します。既存の利用者・グループの役割は保持します。</p>`+check("archived","プロジェクトを保管する（新しい仕事を受け付けない）");
         }
         case "retry_project_device": return `<p>${esc(runner(String(d.device_id)))} の実行準備をもう一度依頼します。保存先の問題は、そのPCで修正してください。</p>`;
 

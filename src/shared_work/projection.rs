@@ -30,14 +30,13 @@ pub struct JobSummary {
     pub wait_reason: Option<String>,
     pub uncertainty_reason: Option<String>,
     pub can_cancel: bool,
-    pub can_handover: bool,
     pub can_continue: bool,
     pub can_revise: bool,
     pub revises_job_id: Option<String>,
     pub revision: u64,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
-    pub start_before_ms: u64,
+    pub start_before_ms: Option<u64>,
     pub runner_contact: RunnerContact,
 }
 
@@ -362,7 +361,6 @@ impl SharedWork {
         let summary = self.summary(actor, role, &job, now)?;
         let mut value = serde_json::to_value(&job)?;
         value["can_cancel"] = Value::Bool(summary.can_cancel);
-        value["can_handover"] = Value::Bool(summary.can_handover);
         value["can_continue"] = Value::Bool(summary.can_continue);
         value["can_revise"] = Value::Bool(summary.can_revise);
         value["conversation_epoch"] = serde_json::to_value(summary.conversation_epoch)?;
@@ -558,8 +556,6 @@ impl SharedWork {
             } else {
                 "開始期限を過ぎました。実行状態が不明なため、停止が確認されるまで利用枠を保持します。".into()
             })
-        } else if super::handover::held(&self.db, &job.root_id)? {
-            Some("担当交代を予約しました。現在の担当者のもとで承認と処理を続け、安全な中断地点で交代します。仕事が先に完了した場合は交代せず終了します。".into())
         } else if uncertainty_reason.is_some() {
             Some("実行結果の照合待ちです。停止が確認されるまで利用枠を保持します。".into())
         } else if matches!(
@@ -618,13 +614,8 @@ impl SharedWork {
                 && !job.state.terminal()
                 && job.state != JobState::Cancelling
                 && role >= ProjectRole::Contributor
-                && (actor.user_id == job.assignee_id || role == ProjectRole::Manager),
-            can_handover: job.id == job.root_id
-                && !job.state.terminal()
-                && job.state != JobState::Cancelling
-                && role >= ProjectRole::Contributor
-                && (actor.user_id == job.assignee_id || role == ProjectRole::Manager),
-            can_revise: role >= ProjectRole::Contributor
+                && actor.user_id == job.requestor_id,
+            can_revise: actor.user_id == job.requestor_id && role >= ProjectRole::Contributor
                 && super::conversation_catalog::can_revise(&self.db,job)?,
             revises_job_id: job.revises_job_id.clone(),
             can_continue: job.state.terminal()
@@ -633,7 +624,7 @@ impl SharedWork {
                 && !super::conversation_catalog::deletion_requested(&self.db,&job.project_id,&job.conversation_id)?
                 && super::stop_scope::validate_continuation(&self.db,job).is_ok()
                 && role >= ProjectRole::Contributor
-                && (actor.user_id == job.assignee_id || role == ProjectRole::Manager)
+                && actor.user_id == job.requestor_id
                 && super::store::may_use(
                     &self.db,
                     &actor.user_id,

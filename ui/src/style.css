@@ -19,11 +19,11 @@ body {
   margin: 0;
 }
 
-button,input,select {
+button,input,select,textarea {
   font: inherit;
 }
 
-button,a,input,select,summary {
+button,a,input,select,textarea,summary {
   outline-offset: 4px;
 }
 
@@ -387,7 +387,7 @@ label {
   font-weight: 600;
 }
 
-input,select {
+input,select,textarea {
   display: block;
   width: 100%;
   margin-top: 7px;
@@ -405,7 +405,13 @@ input::placeholder {
   color: #66778a;
 }
 
-input:focus,select:focus {
+textarea {
+  height: auto;
+  resize: vertical;
+  min-height: 100px;
+}
+
+input:focus,select:focus,textarea:focus {
   outline: 2px solid #bbd0f8;
   border-color: #6a97e7;
 }

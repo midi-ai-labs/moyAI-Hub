@@ -16,6 +16,7 @@ fn project(work: &mut SharedWork, admin: &Principal, controllers: &[&str]) {
             .unwrap()
             .into(),
         request: ManagementRequest::SaveProject {
+            overview: None,
             id: "project".into(),
             label: "Project".into(),
             archived: false,

@@ -172,6 +172,97 @@ fn disk_contains(directory: &Path, needle: &str) -> bool {
 }
 
 #[tokio::test]
+async fn model_system_prompt_registration_edit_reload_and_legacy_omission_share_logical_owner() {
+    let provider = Provider::start(None).await;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("catalog.json");
+    let admin = Admin::open(path.clone()).unwrap();
+    let initial = snapshot(&admin).await;
+    let evidence = discover(&admin, &provider, None).await.unwrap();
+    let prompt = "日本語で回答してください。\n  固有名詞は原文を使います。";
+    let mut request = json!({"revision":initial["store"]["revision"],"evidence_id":evidence["id"],
+        "endpoint":provider.endpoint,"provider_profile":PROFILE,"model_id":"model-a","label":"モデル",
+        "logical_model_id":null,"capacity_pool_id":null,"capacity":1,"system_prompt":format!("  {prompt}\n")});
+    admin
+        .dispatch("hub_register", json!({"request":request}))
+        .await
+        .unwrap();
+    let saved = snapshot(&admin).await;
+    assert_eq!(
+        saved["store"]["catalog"]["models"][0]["system_prompt"],
+        prompt
+    );
+    let logical_id = saved["store"]["catalog"]["models"][0]["id"].clone();
+    request["revision"] = saved["store"]["revision"].clone();
+    request["logical_model_id"] = logical_id.clone();
+    request["model_id"] = json!("model-b");
+    request["system_prompt"] = Value::Null;
+    admin
+        .dispatch("hub_register", json!({"request":request}))
+        .await
+        .unwrap();
+    let shared = snapshot(&admin).await;
+    assert_eq!(
+        shared["store"]["catalog"]["models"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(shared["deployments"].as_array().unwrap().len(), 2);
+    let mut edit_request = json!({"revision":shared["store"]["revision"],
+        "deployment_id":shared["deployments"][0]["deployment"]["id"],"label":"モデル",
+        "capacity":1,"enabled":true,"remove":false,"system_prompt":"界".repeat(16_385)});
+    assert!(
+        admin
+            .dispatch("hub_edit", json!({"request":edit_request}))
+            .await
+            .is_err()
+    );
+    assert_eq!(snapshot(&admin).await["store"], shared["store"]);
+    edit_request["system_prompt"] = json!("日本語を基本とします。\n簡潔に回答してください。");
+    admin
+        .dispatch("hub_edit", json!({"request":edit_request}))
+        .await
+        .unwrap();
+    let updated = snapshot(&admin).await;
+    assert_eq!(
+        updated["store"]["changes"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()["changed_model_ids"],
+        json!([logical_id])
+    );
+    admin.shutdown().await.unwrap();
+    drop(admin);
+    let admin = Admin::open(path).unwrap();
+    let reopened = snapshot(&admin).await;
+    assert_eq!(reopened["store"]["catalog"], updated["store"]["catalog"]);
+    // Old management callers omitting the new field must preserve it.
+    edit(&admin, &reopened, Value::Null, false, "名前だけ変更")
+        .await
+        .unwrap();
+    let renamed = snapshot(&admin).await;
+    assert_eq!(
+        renamed["store"]["catalog"]["models"][0]["system_prompt"],
+        edit_request["system_prompt"]
+    );
+    edit_request["revision"] = renamed["store"]["revision"].clone();
+    edit_request["system_prompt"] = json!(" \r\n\t ");
+    admin
+        .dispatch("hub_edit", json!({"request":edit_request}))
+        .await
+        .unwrap();
+    assert!(
+        snapshot(&admin).await["store"]["catalog"]["models"][0]
+            .get("system_prompt")
+            .is_none()
+    );
+    admin.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn authenticated_model_lifecycle_preserves_updates_clears_and_removes_keys_without_projection()
  {
     let provider = Provider::start(Some(KEY_A)).await;

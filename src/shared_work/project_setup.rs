@@ -169,6 +169,7 @@ pub(super) fn save(
     actor: &Principal,
     id: &str,
     label: &str,
+    overview: Option<&str>,
     archived: bool,
     members: Option<&[ProjectMember]>,
     controllers: &[String],
@@ -177,6 +178,9 @@ pub(super) fn save(
 ) -> Result<()> {
     super::store::id(id)?;
     super::store::label(label)?;
+    let overview = overview
+        .map(super::project_context::normalize_overview)
+        .transpose()?;
     if members.is_some_and(|members| members.len() > 512) {
         return Err(WorkError::Capacity);
     }
@@ -214,6 +218,12 @@ pub(super) fn save(
         return Err(WorkError::Conflict);
     }
     db.execute("INSERT INTO shared_projects(id,label,archived,legacy_devices_unrestricted) VALUES(?1,?2,?3,0) ON CONFLICT(id) DO UPDATE SET label=excluded.label,archived=excluded.archived,legacy_devices_unrestricted=0",params![id,label,archived])?;
+    if let Some(overview) = overview {
+        db.execute(
+            "UPDATE shared_projects SET overview=?2 WHERE id=?1",
+            params![id, overview],
+        )?;
+    }
     if let Some(members) = members {
         // The legacy editor starts from explicit memberships. Saving that explicit list
         // removes hidden group inheritance for this project without changing other projects.
@@ -376,21 +386,13 @@ pub(super) fn synchronize(db: &Connection, runner: Option<&str>, now: u64) -> Re
         if capacity.is_some_and(|capacity| capacity != 1) {
             return Err(WorkError::Conflict);
         }
-        let count: u32 =
-            db.query_row("SELECT COUNT(*) FROM shared_environments", [], |r| r.get(0))?;
-        let pc_count: u32 = db.query_row(
-            "SELECT COUNT(*) FROM shared_environments WHERE runner_id=?1",
-            [&device],
-            |r| r.get(0),
-        )?;
-        if pc_count >= super::provisioning::MAX_RUNNER_ENVIRONMENTS || count >= 1000 {
-            let reason = if pc_count >= super::provisioning::MAX_RUNNER_ENVIRONMENTS {
-                "このPCの実行場所が上限に達しています。不要な既存設定を整理してから再試行してください。"
-            } else {
-                "Hubの実行場所が上限に達しています。不要な既存設定を整理してから再試行してください。"
-            };
-            db.execute("UPDATE shared_project_devices SET setup_error=?3 WHERE project_id=?1 AND device_id=?2",params![project,device,reason])?;
-            continue;
+        match super::provisioning::check_environment_capacity(db, &device, None) {
+            Ok(()) => {}
+            Err(WorkError::Capacity) => {
+                db.execute("UPDATE shared_project_devices SET setup_error=?3 WHERE project_id=?1 AND device_id=?2",params![project,device,"実行場所の登録上限に達しています（PCごと128件、Hub全体1000件）。使わないプロジェクトの実行PC指定を解除してから再試行してください。離脱済みの履歴は上限に含みません。"])?;
+                continue;
+            }
+            Err(error) => return Err(error),
         }
         db.execute(
             "INSERT OR IGNORE INTO shared_resources(id,capacity) VALUES(?1,1)",

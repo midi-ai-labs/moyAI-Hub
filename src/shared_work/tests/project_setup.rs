@@ -197,6 +197,7 @@ fn save(
             .unwrap()
             .into(),
         request: ManagementRequest::SaveProject {
+            overview: None,
             id: project.into(),
             label: "解析業務".into(),
             archived: false,
@@ -210,6 +211,279 @@ fn save(
     };
     f.work.manage(&f.admin, &command, 40).unwrap();
     command
+}
+
+#[test]
+fn retired_environment_history_does_not_consume_setup_or_runner_catalog_capacity() {
+    let mut f = Fixture::new();
+    // Real retained jobs keep their original environment foreign keys. Extra
+    // retired rows model a long-lived Hub without repeating expensive user setup.
+    let history = f.submit("solver", "retained-history", 0);
+    f.work.cancel(&f.alice, &history.id, 20).unwrap();
+    f.work.db.execute_batch("DELETE FROM shared_environment_projects WHERE environment_id='solver'; UPDATE shared_environments SET enabled=0 WHERE id='solver';
+        WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<1001)
+        INSERT INTO shared_environments(id,label,resource_id,runner_id,enabled)
+        SELECT 'retired-'||x,'Retired','wine-slot','WinE',0 FROM n;
+        INSERT INTO shared_provisioning(environment_id,runner_id,template_id,state,created_at_ms,updated_at_ms)
+        SELECT id,runner_id,'local-folder','ready',1,1 FROM shared_environments WHERE runner_id='WinE';").unwrap();
+    save(&mut f, "new-a", &["WinA"], &["WinE"]);
+    let pending = f.work.pending_provision("WinE").unwrap();
+    assert_eq!(
+        pending.len(),
+        1,
+        "historical work must not exhaust execution setup"
+    );
+    assert_eq!(f.work.current_runner_environments("WinE").unwrap().len(), 1);
+    assert_eq!(
+        f.work.job(&f.alice, &history.id).unwrap().environment_id,
+        "solver"
+    );
+    assert_eq!(
+        f.work.job(&f.alice, &history.id).unwrap().state,
+        JobState::Cancelled
+    );
+    f.reopen();
+    assert_eq!(f.work.current_runner_environments("WinE").unwrap().len(), 1);
+    capacity_manage(
+        &mut f,
+        ManagementRequest::CreateEnvironment {
+            id: "legacy-new".into(),
+            label: "Legacy".into(),
+            resource_id: "wine-slot".into(),
+            runner_id: "WinE".into(),
+            capacity: 1,
+            project_ids: vec!["beta".into()],
+            template_id: None,
+        },
+    )
+    .unwrap();
+    let visible = f.work.management_snapshot(&f.admin).unwrap();
+    assert_eq!(visible["environments"].as_array().unwrap().len(), 3);
+    assert_eq!(f.work.current_runner_environments("WinE").unwrap().len(), 2);
+    assert_eq!(
+        f.work
+            .db
+            .query_row("SELECT COUNT(*) FROM shared_environments", [], |r| r
+                .get::<_, u32>(0))
+            .unwrap(),
+        1005
+    );
+}
+
+#[test]
+fn environment_registration_cannot_exceed_runner_catalog_capacity() {
+    let mut f = Fixture::new();
+    f.work
+        .db
+        .execute_batch(
+            "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<128)
+        INSERT INTO shared_environments(id,label,resource_id,runner_id,enabled)
+        SELECT 'current-'||x,'Current','wine-slot','WinZ',1 FROM n;",
+        )
+        .unwrap();
+    assert!(matches!(
+        f.work.register_environment(
+            &f.admin,
+            &Environment {
+                id: "one-too-many".into(),
+                label: "Extra".into(),
+                resource_id: "wine-slot".into(),
+                runner_id: "WinZ".into(),
+                capacity: 1,
+                project_ids: vec!["alpha".into()],
+            }
+        ),
+        Err(WorkError::Capacity)
+    ));
+    assert_eq!(
+        f.work.current_runner_environments("WinZ").unwrap().len(),
+        128
+    );
+}
+
+fn capacity_manage(f: &mut Fixture, request: ManagementRequest) -> Result<Value> {
+    let command = ManagementCommand {
+        request_id: ulid::Ulid::new().to_string(),
+        expected_revision: f.work.management_snapshot(&f.admin).unwrap()["revision"]
+            .as_str()
+            .unwrap()
+            .into(),
+        request,
+    };
+    f.work.manage(&f.admin, &command, 70)
+}
+
+#[test]
+fn environment_capacity_covers_create_retarget_pending_and_global_reactivation() {
+    let mut f = Fixture::new();
+    f.work.db.execute_batch("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<128)
+        INSERT INTO shared_environments(id,label,resource_id,runner_id,enabled)
+        SELECT 'current-'||x,'Current','wine-slot','WinZ',0 FROM n;
+        INSERT INTO shared_environment_projects SELECT id,'alpha' FROM shared_environments WHERE runner_id='WinZ';").unwrap();
+    for request in [
+        ManagementRequest::CreateEnvironment {
+            id: "extra".into(),
+            label: "Extra".into(),
+            resource_id: "wine-slot".into(),
+            runner_id: "WinZ".into(),
+            capacity: 1,
+            project_ids: vec!["alpha".into()],
+            template_id: None,
+        },
+        ManagementRequest::UpdateEnvironment {
+            id: "solver".into(),
+            label: "Move".into(),
+            resource_id: "wine-slot".into(),
+            runner_id: "WinZ".into(),
+            enabled: true,
+            project_ids: vec!["alpha".into(), "beta".into()],
+        },
+    ] {
+        assert!(matches!(
+            capacity_manage(&mut f, request),
+            Err(WorkError::Capacity)
+        ));
+    }
+    assert_eq!(
+        f.work.current_runner_environments("WinE").unwrap()[0]
+            .environment
+            .id,
+        "solver"
+    );
+    // Paused but granted workspaces reserve their registration slot. The
+    // exact last workspace can be re-enabled without demanding an extra slot.
+    capacity_manage(
+        &mut f,
+        ManagementRequest::UpdateEnvironment {
+            id: "current-128".into(),
+            label: "Resume".into(),
+            resource_id: "wine-slot".into(),
+            runner_id: "WinZ".into(),
+            enabled: true,
+            project_ids: vec!["alpha".into()],
+        },
+    )
+    .unwrap();
+    f.work
+        .db
+        .execute_batch(
+            "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<869)
+        INSERT INTO shared_environments(id,label,resource_id,runner_id,enabled)
+        SELECT 'global-'||x,'Other','wine-slot','Other-'||(x % 8),1 FROM n;
+        INSERT INTO shared_environments VALUES('inactive','Inactive','wine-slot','WinN',0);",
+        )
+        .unwrap();
+    assert!(matches!(
+        f.work.register_environment(
+            &f.admin,
+            &Environment {
+                id: "global-extra".into(),
+                label: "Extra".into(),
+                resource_id: "wine-slot".into(),
+                runner_id: "WinN".into(),
+                capacity: 1,
+                project_ids: vec!["alpha".into()],
+            }
+        ),
+        Err(WorkError::Capacity)
+    ));
+    assert!(matches!(
+        capacity_manage(
+            &mut f,
+            ManagementRequest::CreateEnvironment {
+                id: "extra-global".into(),
+                label: "Extra".into(),
+                resource_id: "wine-slot".into(),
+                runner_id: "WinN".into(),
+                capacity: 1,
+                project_ids: vec!["alpha".into()],
+                template_id: None,
+            }
+        ),
+        Err(WorkError::Capacity)
+    ));
+    let reserved = f.work.current_runner_environments("WinN").unwrap();
+    assert_eq!(
+        reserved.len(),
+        1,
+        "disabled manual settings retain their reservation"
+    );
+    assert!(!reserved[0].enabled);
+    capacity_manage(
+        &mut f,
+        ManagementRequest::UpdateEnvironment {
+            id: "inactive".into(),
+            label: "Resume".into(),
+            resource_id: "wine-slot".into(),
+            runner_id: "WinN".into(),
+            enabled: true,
+            project_ids: vec!["alpha".into()],
+        },
+    )
+    .unwrap();
+    assert!(f.work.current_runner_environments("WinN").unwrap()[0].enabled);
+}
+
+#[test]
+fn retired_workspace_is_not_reprovisioned_or_reused_after_execution_purpose_returns() {
+    let mut f = Fixture::new();
+    save(&mut f, "new-a", &["WinA"], &["WinB"]);
+    let old = f.work.pending_provision("WinB").unwrap().remove(0);
+    save(&mut f, "new-a", &["WinA"], &[]);
+    assert!(f.work.pending_provision("WinB").unwrap().is_empty());
+    assert!(
+        f.work
+            .current_runner_environments("WinB")
+            .unwrap()
+            .is_empty()
+    );
+    assert!(matches!(
+        f.work.request_provision(&f.admin, &old, 60),
+        Err(WorkError::NotFound)
+    ));
+    let resource: String = f
+        .work
+        .db
+        .query_row(
+            "SELECT resource_id FROM shared_environments WHERE id=?1",
+            [&old.environment_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(matches!(
+        capacity_manage(
+            &mut f,
+            ManagementRequest::UpdateEnvironment {
+                id: old.environment_id.clone(),
+                label: "Reuse".into(),
+                resource_id: resource,
+                runner_id: "WinB".into(),
+                enabled: true,
+                project_ids: vec!["beta".into()],
+            }
+        ),
+        Err(WorkError::Conflict)
+    ));
+    save(&mut f, "new-a", &["WinA"], &["WinB"]);
+    let current = f.work.pending_provision("WinB").unwrap();
+    assert_eq!(current.len(), 1);
+    assert_ne!(current[0].environment_id, old.environment_id);
+    assert!(
+        f.work
+            .provision_receipt(
+                "WinB",
+                &ProvisionReceipt {
+                    environment_id: old.environment_id,
+                    template_id: old.template_id,
+                    generation: old.generation,
+                    success: true,
+                    error: None,
+                },
+                80
+            )
+            .is_err()
+    );
+    assert!(!f.work.current_runner_environments("WinB").unwrap()[0].enabled);
 }
 
 #[test]
@@ -320,15 +594,26 @@ fn leaving_and_rejoining_changes_participation_and_execution_workspace() {
             49,
         )
         .unwrap();
-    let retired = f
+    assert!(
+        f.work
+            .current_runner_environments("WinB")
+            .unwrap()
+            .iter()
+            .all(|row| row.environment.id != initial.environment_id)
+    );
+    let retired_enabled: bool = f
         .work
-        .runner_environments("WinB")
-        .unwrap()
-        .into_iter()
-        .find(|row| row.environment.id == initial.environment_id)
+        .db
+        .query_row(
+            "SELECT enabled FROM shared_environments WHERE id=?1",
+            [&initial.environment_id],
+            |r| r.get(0),
+        )
         .unwrap();
-    assert!(!retired.enabled);
-    assert!(retired.environment.project_ids.is_empty());
+    assert!(
+        !retired_enabled,
+        "history remains stored without restoring the old grant"
+    );
 }
 
 #[test]
@@ -379,7 +664,7 @@ fn missing_folder_requires_current_rebind(template: &str) {
     assert_eq!(pending.state.as_deref(), Some("failed"));
     assert_eq!(pending.template_id, template);
     assert_eq!(pending.generation, initial.generation + 1);
-    assert!(!f.work.runner_environments("WinB").unwrap()[0].enabled);
+    assert!(!f.work.current_runner_environments("WinB").unwrap()[0].enabled);
     f.reopen();
     // Repeating an unacknowledged failure must neither bump again nor restore authority.
     f.work
@@ -407,7 +692,7 @@ fn missing_folder_requires_current_rebind(template: &str) {
         ..ready
     };
     f.work.provision_receipt("WinB", &rebound, 44).unwrap();
-    assert!(f.work.runner_environments("WinB").unwrap()[0].enabled);
+    assert!(f.work.current_runner_environments("WinB").unwrap()[0].enabled);
     f.work
         .db
         .execute(
@@ -416,9 +701,9 @@ fn missing_folder_requires_current_rebind(template: &str) {
         )
         .unwrap();
     f.work.provision_receipt("WinB", &rebound, 45).unwrap();
-    assert!(!f.work.runner_environments("WinB").unwrap()[0].enabled);
+    assert!(!f.work.current_runner_environments("WinB").unwrap()[0].enabled);
     save(&mut f, "new-a", &["WinA"], &["WinB"]);
-    assert!(!f.work.runner_environments("WinB").unwrap()[0].enabled);
+    assert!(!f.work.current_runner_environments("WinB").unwrap()[0].enabled);
     save(&mut f, "new-a", &["WinA"], &[]);
     assert!(
         f.work
@@ -576,7 +861,7 @@ fn project_setup_waits_for_pc_and_reuses_one_physical_resource_across_projects()
             .preparation_state,
         "waiting_local_folder"
     );
-    assert!(!f.work.runner_environments("WinZ").unwrap()[0].enabled);
+    assert!(!f.work.current_runner_environments("WinZ").unwrap()[0].enabled);
     f.work
         .provision_receipt(
             "WinZ",
@@ -590,7 +875,7 @@ fn project_setup_waits_for_pc_and_reuses_one_physical_resource_across_projects()
             60,
         )
         .unwrap();
-    assert!(f.work.runner_environments("WinZ").unwrap()[0].enabled);
+    assert!(f.work.current_runner_environments("WinZ").unwrap()[0].enabled);
     assert_eq!(
         f.work
             .status_for_device(&f.alice, "new-a", None, 10, None, Some("WinA"))
@@ -601,12 +886,12 @@ fn project_setup_waits_for_pc_and_reuses_one_physical_resource_across_projects()
     );
     f.work.manage(&f.admin, &command, 61).unwrap();
     assert_eq!(
-        f.work.runner_environments("WinZ").unwrap().len(),
+        f.work.current_runner_environments("WinZ").unwrap().len(),
         1,
         "exact retry cannot create another environment"
     );
     save(&mut f, "new-b", &["WinB"], &["WinZ"]);
-    let environments = f.work.runner_environments("WinZ").unwrap();
+    let environments = f.work.current_runner_environments("WinZ").unwrap();
     assert_eq!(environments.len(), 2);
     assert_eq!(
         environments[0].environment.resource_id,
@@ -627,7 +912,7 @@ fn project_setup_waits_for_pc_and_reuses_one_physical_resource_across_projects()
         "legacy project authorization is preserved until saved"
     );
     f.reopen();
-    assert_eq!(f.work.runner_environments("WinZ").unwrap().len(), 2);
+    assert_eq!(f.work.current_runner_environments("WinZ").unwrap().len(), 2);
     assert!(f.work.require_project_controller("new-a", "WinB").is_err());
 }
 
@@ -679,7 +964,7 @@ fn project_setup_revoke_keeps_history_binding_and_stale_ready_does_not_reenable_
         f.work.provision_receipt(
             "WinZ",
             &ProvisionReceipt {
-                environment_id: request.environment_id,
+                environment_id: request.environment_id.clone(),
                 template_id: request.template_id,
                 generation: request.generation,
                 success: true,
@@ -689,10 +974,32 @@ fn project_setup_revoke_keeps_history_binding_and_stale_ready_does_not_reenable_
         ),
         Err(WorkError::Forbidden)
     ));
-    let environments = f.work.runner_environments("WinZ").unwrap();
-    assert_eq!(environments.len(), 1);
-    assert!(!environments[0].enabled);
-    assert!(environments[0].environment.project_ids.is_empty());
+    assert!(
+        f.work
+            .current_runner_environments("WinZ")
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !f.work
+            .db
+            .query_row(
+                "SELECT enabled FROM shared_environments WHERE id=?1",
+                [&request.environment_id],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap()
+    );
+    assert!(
+        !f.work
+            .db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM shared_environment_projects WHERE environment_id=?1)",
+                [&request.environment_id],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap()
+    );
     assert!(f.work.require_project_controller("new-a", "WinA").is_err());
     assert!(f.work.require_project_controller("new-a", "WinB").is_ok());
 }
@@ -707,6 +1014,7 @@ fn project_setup_invalid_people_roll_back_the_entire_project_edit() {
             .unwrap()
             .into(),
         request: ManagementRequest::SaveProject {
+            overview: None,
             id: "invalid-new".into(),
             label: "新規".into(),
             archived: false,
@@ -758,7 +1066,7 @@ fn project_setup_pc_limit_is_visible_without_breaking_existing_runner_catalog() 
         )
         .unwrap();
     assert_eq!(
-        f.work.runner_environments("WinZ").unwrap().len(),
+        f.work.current_runner_environments("WinZ").unwrap().len(),
         128,
         "publishing settings must not make the existing Runner catalog unreadable"
     );
@@ -846,6 +1154,7 @@ fn project_setup_archive_preserves_selected_pc_history_and_cancellation_but_bloc
             .unwrap()
             .into(),
         request: ManagementRequest::SaveProject {
+            overview: None,
             id: "alpha".into(),
             label: "保管した仕事".into(),
             archived: true,
@@ -858,6 +1167,17 @@ fn project_setup_archive_preserves_selected_pc_history_and_cancellation_but_bloc
         },
     };
     f.work.manage(&f.admin, &command, 40).unwrap();
+    let archived_binding = f
+        .work
+        .current_runner_environments("WinE")
+        .unwrap()
+        .into_iter()
+        .find(|row| row.environment.id == "solver")
+        .unwrap();
+    assert!(
+        archived_binding.workspace_bound,
+        "archiving keeps the current assignment reserved"
+    );
     assert!(f.work.require_project_controller("alpha", "WinA").is_ok());
     assert!(
         f.work
@@ -918,12 +1238,17 @@ fn project_setup_adopted_environment_cannot_be_retargeted_by_the_legacy_editor()
         Err(WorkError::Conflict)
     ));
     assert_eq!(
-        f.work.runner_environments("WinE").unwrap()[0]
+        f.work.current_runner_environments("WinE").unwrap()[0]
             .environment
             .id,
         "solver"
     );
-    assert!(f.work.runner_environments("WinB").unwrap().is_empty());
+    assert!(
+        f.work
+            .current_runner_environments("WinB")
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -985,12 +1310,17 @@ fn project_setup_legacy_environment_edits_cannot_override_managed_pc_purposes() 
         Err(WorkError::Conflict)
     ));
     assert_eq!(
-        f.work.runner_environments("WinE").unwrap()[0]
+        f.work.current_runner_environments("WinE").unwrap()[0]
             .environment
             .project_ids,
         vec!["alpha", "beta"]
     );
-    assert!(f.work.runner_environments("WinB").unwrap().is_empty());
+    assert!(
+        f.work
+            .current_runner_environments("WinB")
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -1068,6 +1398,7 @@ fn project_setup_converts_only_the_saved_projects_effective_people() {
             .unwrap()
             .into(),
         request: ManagementRequest::SaveProject {
+            overview: None,
             id: "alpha".into(),
             label: "Alpha".into(),
             archived: false,
@@ -1116,6 +1447,6 @@ fn project_setup_converts_only_the_saved_projects_effective_people() {
             .unwrap(),
         1
     );
-    assert_eq!(f.work.runner_environments("WinE").unwrap().len(), 1);
+    assert_eq!(f.work.current_runner_environments("WinE").unwrap().len(), 1);
     assert!(f.work.require_project_controller("alpha", "WinB").is_err());
 }

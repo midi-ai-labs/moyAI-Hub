@@ -19,6 +19,24 @@ test("primary model status uses fresh listing presence independent of provider l
     assert.equal(deploymentStatus({ availability: "offline", model_present: false }), availability.offline);
     assert.equal(deploymentStatus({ availability: "model_missing", model_present: false }), availability.model_missing);
 });
+test("previously checked models await recheck without being described as never checked", () => {
+    for (const hint of ["unknown", "ready", "jit_pending"] as const) {
+        for (const observed of [0, 1_000]) {
+            const row = { availability: hint, model_present: false, last_observed_ms: observed };
+            const status = deploymentStatus(row);
+            assert.equal(status.label, "再確認待ち");
+            assert.match(status.reason, /確認結果が古い/);
+            assert.match(status.reason, /直近の確認に失敗/);
+            assert.match(status.reason, /実行前に再確認/);
+            assert.doesNotMatch(status.reason, /まだ確認できていません/);
+            assert.equal(deploymentStatus({ ...row, model_present: true }), availability.ready);
+        }
+        assert.equal(deploymentStatus({ availability: hint, model_present: false, last_observed_ms: null }), availability.unknown);
+    }
+    for (const hint of ["offline", "model_missing", "maintenance"] as const) {
+        assert.equal(deploymentStatus({ availability: hint, model_present: false, last_observed_ms: 1_000 }), availability[hint]);
+    }
+});
 test("revision summary carries model removal and capacity review reasons", () => {
     assert.equal(changeSummary({
         revision: "9007199254740993",

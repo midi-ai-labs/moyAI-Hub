@@ -34,6 +34,8 @@ pub enum ManagementRequest {
     SaveProject {
         id: String,
         label: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        overview: Option<String>,
         archived: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         members: Option<Vec<ProjectMember>>,
@@ -224,10 +226,10 @@ fn snapshot(db: &Connection, actor: &Principal) -> Result<Value> {
     )?;
     let projects = rows(
         db,
-        "SELECT id,label,archived,legacy_devices_unrestricted FROM shared_projects WHERE deleted_at_ms IS NULL ORDER BY id",
+        "SELECT id,label,archived,legacy_devices_unrestricted,overview FROM shared_projects WHERE deleted_at_ms IS NULL ORDER BY id",
         |r| {
             Ok(
-                json!({"id":r.get::<_,String>(0)?,"label":r.get::<_,String>(1)?,"archived":r.get::<_,bool>(2)?,"legacy_devices_unrestricted":r.get::<_,bool>(3)?}),
+                json!({"id":r.get::<_,String>(0)?,"label":r.get::<_,String>(1)?,"archived":r.get::<_,bool>(2)?,"legacy_devices_unrestricted":r.get::<_,bool>(3)?,"overview":r.get::<_,String>(4)?}),
             )
         },
     )?;
@@ -256,7 +258,10 @@ fn snapshot(db: &Connection, actor: &Principal) -> Result<Value> {
     )?;
     let mut environments = rows(
         db,
-        "SELECT e.id,e.label,e.resource_id,e.runner_id,e.enabled,(SELECT json_group_array(project_id) FROM (SELECT project_id FROM shared_environment_projects WHERE environment_id=e.id ORDER BY project_id)) FROM shared_environments e ORDER BY e.id",
+        &format!(
+            "SELECT e.id,e.label,e.resource_id,e.runner_id,e.enabled,(SELECT json_group_array(project_id) FROM (SELECT project_id FROM shared_environment_projects WHERE environment_id=e.id ORDER BY project_id)) FROM shared_environments e WHERE {} ORDER BY e.id",
+            super::provisioning::CURRENT_ENVIRONMENT
+        ),
         |r| {
             Ok(
                 json!({"id":r.get::<_,String>(0)?,"label":r.get::<_,String>(1)?,"resource_id":r.get::<_,String>(2)?,"runner_id":r.get::<_,String>(3)?,"enabled":r.get::<_,bool>(4)?,"project_ids":super::store::decode::<Value>(r.get(5)?,5)?}),
@@ -280,7 +285,10 @@ fn snapshot(db: &Connection, actor: &Principal) -> Result<Value> {
     )?;
     let provisioning = rows(
         db,
-        "SELECT environment_id,runner_id,template_id,state,error,generation FROM shared_provisioning ORDER BY environment_id LIMIT 1000",
+        &format!(
+            "SELECT s.environment_id,s.runner_id,s.template_id,s.state,s.error,s.generation FROM shared_provisioning s JOIN shared_environments e ON e.id=s.environment_id WHERE {} ORDER BY s.environment_id LIMIT 1000",
+            super::provisioning::CURRENT_ENVIRONMENT
+        ),
         |r| {
             Ok(
                 json!({"environment_id":r.get::<_,String>(0)?,"runner_id":r.get::<_,String>(1)?,"template_id":r.get::<_,String>(2)?,"state":r.get::<_,String>(3)?,"error":r.get::<_,Option<String>>(4)?,"generation":r.get::<_,u64>(5)?}),
@@ -482,6 +490,7 @@ impl SharedWork {
             SaveProject {
                 id,
                 label,
+                overview,
                 archived,
                 members,
                 controller_device_ids,
@@ -503,6 +512,7 @@ impl SharedWork {
                     actor,
                     id,
                     label,
+                    overview.as_deref(),
                     *archived,
                     members.as_deref(),
                     controller_device_ids,
@@ -754,7 +764,7 @@ impl SharedWork {
                 if !(1..=128).contains(slots) {
                     return Err(WorkError::Invalid);
                 }
-                capacity(&tx, "shared_environments", 1000)?;
+                super::provisioning::check_environment_capacity(&tx, runner_id, None)?;
                 let old: Option<u32> = tx
                     .query_row(
                         "SELECT capacity FROM shared_resources WHERE id=?1",
@@ -804,6 +814,11 @@ impl SharedWork {
                     )
                     .optional()?
                     .ok_or(WorkError::NotFound)?;
+                // A retired Desktop folder belongs to its old participation;
+                // changing this row must not restore that local permission.
+                if tx.query_row(&format!("SELECT EXISTS(SELECT 1 FROM shared_environments e JOIN shared_provisioning s ON s.environment_id=e.id WHERE e.id=?1 AND s.template_id IN ('local-folder','desktop-default') AND NOT {})", super::provisioning::CURRENT_ENVIRONMENT), [id], |r| r.get::<_, bool>(0))? {
+                    return Err(WorkError::Conflict);
+                }
                 if old_resource != *resource_id || old_runner != *runner_id {
                     // A queued checkpoint and any active process retain their original environment binding.
                     no_reference(
@@ -812,6 +827,7 @@ impl SharedWork {
                         id,
                     )?;
                 }
+                super::provisioning::check_environment_capacity(&tx, runner_id, Some(id))?;
                 changed(tx.execute("UPDATE shared_environments SET label=?2,resource_id=?3,runner_id=?4,enabled=?5 WHERE id=?1",params![id,label,resource_id,runner_id,enabled])?)?;
                 environment_projects(&tx, id, project_ids)?;
             }

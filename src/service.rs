@@ -605,6 +605,7 @@ mod tests {
         catalog.models = vec!["first", "standard"]
             .into_iter()
             .map(|id| LogicalModel {
+                system_prompt: String::new(),
                 id: id.into(),
                 label: id.into(),
                 capabilities: ["tools".into()].into(),

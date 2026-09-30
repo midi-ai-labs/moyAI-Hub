@@ -1,4 +1,4 @@
-//! Notifications derive from canonical jobs/approvals/handovers; only read receipts are stored.
+//! Notifications derive from canonical jobs/approvals; only read receipts are stored.
 use super::*;
 use crate::identity::{self, Principal};
 use rusqlite::{OptionalExtension, params};
@@ -10,7 +10,6 @@ WITH events AS (
  j.assignee_id recipient,j.requestor_id requestor,NULL third,p.id approval_id
  FROM shared_approvals p JOIN shared_attempts a ON a.id=p.attempt_id JOIN shared_jobs j ON j.id=a.job_id
  UNION ALL SELECT printf('%020d',j.updated_at_ms)||':job:'||j.id,j.id,j.project_id,'finished',j.title,j.updated_at_ms,j.assignee_id,j.requestor_id,NULL,NULL FROM shared_jobs j WHERE j.state IN ('succeeded','failed','cancelled') AND (j.origin_session_ref IS NULL OR j.requestor_id<>?1)
- UNION ALL SELECT printf('%020d',h.requested_at_ms)||':handover:'||h.id,j.id,j.project_id,'handover',j.title,h.requested_at_ms,h.new_assignee_id,h.requested_by,h.old_assignee_id,NULL FROM shared_handovers h JOIN shared_jobs j ON j.id=h.root_id
 ), visible AS (
  SELECT e.*,r.read_at_ms FROM events e JOIN identity_effective_project_memberships m ON m.project_id=e.project_id AND m.user_id=?1 LEFT JOIN shared_inbox_reads r ON r.user_id=?1 AND r.item_id=e.id
  WHERE (e.recipient=?1 OR e.requestor=?1 OR e.third=?1 OR (e.kind='approval' AND m.role='manager'))
@@ -56,10 +55,11 @@ impl SharedWork {
             if let Some(id) = item["approval_id"].as_str() {
                 // The notification and approval card must use the same authority
                 // checks. Inability to act alone does not mean it was decided.
-                let approval = super::approvals::view_by_id(&self.db, actor, id, now)?;
+                let approval = super::approvals::view_by_id(&self.db, actor, id, now, device)?;
                 item["can_act"] = json!(approval.status == "pending" && approval.can_decide);
                 item["approval_status"] = json!(approval.status);
                 item["approval_decision"] = json!(approval.decision);
+                item["approval_context"] = json!(approval.context);
             }
         }
         let next = if more {

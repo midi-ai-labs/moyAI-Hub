@@ -29,6 +29,7 @@ fn restricted() -> Fixture {
                 .unwrap()
                 .into(),
             request: ManagementRequest::SaveProject {
+                overview: None,
                 id: project.into(),
                 label: project.into(),
                 archived: false,

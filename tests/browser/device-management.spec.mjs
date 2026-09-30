@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { test, expect } from "./fixture.mjs";
 import { createDeviceParticipant } from "./device-fixture.mjs";
 
@@ -37,6 +38,162 @@ async function capture(page, testInfo, name) {
     const path = testInfo.outputPath(`${name}.png`);
     await page.screenshot({ path });
     await testInfo.attach(name, { path, contentType: "image/png" });
+}
+
+async function createProject(page, label) {
+    await page.locator("#onboarding-new-project").click();
+    await page.locator("#shared-admin-label").fill(label);
+    const sent = page.waitForRequest(request => request.url().endsWith("/admin/command")
+        && request.postDataJSON()?.command === "hub_shared_command");
+    await page.locator("#shared-admin-save").click();
+    const id = (await sent).postDataJSON().args.request.id;
+    await expect(page.locator("#shared-admin-form")).toHaveCount(0);
+    return id;
+}
+
+async function externalSharedCommand(page, hub, operation) {
+    // An authenticated external writer changes the real persisted project. The
+    // observed page receives no manual refresh, focus change, or UI mutation.
+    const session = await (await page.request.get(new URL("/admin/session", hub.url).href)).json();
+    const command = async (name, args = {}) => {
+        const response = await page.request.post(new URL("/admin/command", hub.url).href, {
+            headers: { Origin: new URL(hub.url).origin, "X-Moyai-Csrf": session.csrf,
+                "X-Moyai-Session": session.authentication.session_id },
+            data: { command: name, args },
+        });
+        expect(response.ok(), await response.text()).toBe(true);
+        return (await response.json()).result;
+    };
+    const snapshot = await command("hub_shared_snapshot");
+    return command("hub_shared_command", { request_id: randomUUID(), expected_revision: snapshot.revision,
+        request: operation });
+}
+
+for (const selection of ["direct", "pointer-popup", "keyboard-popup"]) {
+const keyboard = selection !== "direct";
+test(selection === "keyboard-popup" ? "Automatic refresh continues after keyboard opening of the native project selector"
+    : keyboard ? "Automatic refresh continues after native keyboard project selection"
+    : "Automatic refresh updates approved PC names, purposes, presence and the next request without manual refresh", async ({ page, hub }, testInfo) => {
+    const keyEvents = [];
+    if (keyboard) {
+        await page.exposeFunction("recordTestKeyboardEvent", value => { if (keyEvents.length < 100) keyEvents.push(value); });
+        await page.addInitScript(() => {
+            for (const type of ["keydown", "keyup"]) document.addEventListener(type, event => {
+                void window.recordTestKeyboardEvent({ type, key: event.key, code: event.code,
+                    tag: event.target?.tagName, id: event.target?.id });
+            }, true);
+        });
+    }
+    try {
+    await startNetwork(page, hub);
+    const projectId = await createProject(page, "自動更新の仕事");
+    const first = await createDeviceParticipant(await hub.observeNetwork(), "DESKTOP-automatic");
+    const pending = page.locator(`[data-id="request:${first.requestId}"]`);
+    await expect(pending).toContainText("承認待ち");
+    await pending.getByRole("button", { name: "DESKTOP-automaticの許可", exact: true }).click();
+    await page.locator("#join-project-label").fill("自動更新 WinA");
+    if (keyboard) {
+        if (selection === "keyboard-popup") {
+            // Tab is pressed on the input and released on the select. Its
+            // tracked key must still be cleared across that focus transition.
+            await page.locator("#join-project-label").press("Tab");
+            await expect(page.locator("#join-project-project")).toBeFocused();
+            await page.keyboard.press("Alt+ArrowDown");
+        } else await page.locator("#join-project-project").click();
+        await page.keyboard.press("ArrowDown");
+        await page.keyboard.press("Enter");
+        await expect(page.locator("#join-project-project")).toHaveValue(projectId);
+    } else await page.locator("#join-project-project").selectOption(projectId);
+    await page.locator("#join-project-control").check();
+    await page.locator("#join-project-execute").check();
+    await page.locator("#join-project-save").click();
+    await expect(page.locator("#join-project-dialog")).not.toBeVisible();
+    // No observed-page interaction follows approval: all changes below must
+    // arrive through the ordinary automatic refresh owner.
+    const approval = await first.collectApproval();
+    expect(approval.status).toBe("approved");
+    await first.presence();
+    await expect(pending).toHaveCount(0);
+    await expect(page.locator(`[data-id="device:${approval.deviceId}"]`)).toContainText("自動更新 WinA");
+    await expect(page.locator("#network-clients-summary")).toHaveText("承認待ち 0 台 · 登録済み 1 台 · オンライン 1 台");
+    await expect(page.locator("#shared-admin-content")).toContainText("操作に使うPC: 自動更新 WinA");
+    await expect(page.locator("#shared-admin-content")).not.toContainText(approval.deviceId);
+    await expect(page.locator("#onboarding-steps")).toContainText("操作PC 1 台・実行PC 1 台");
+    const second = await createDeviceParticipant(await hub.observeNetwork(), "自動更新 WinB");
+    await expect(page.locator(`[data-id="request:${second.requestId}"]`)).toContainText("自動更新 WinB");
+    await expect(page.locator("#network-clients-summary")).toHaveText("承認待ち 1 台 · 登録済み 1 台 · オンライン 1 台");
+    await expect(page.locator("#onboarding-steps")).toContainText("承認待ち 1 台");
+    await capture(page, testInfo, "automatic-approval-and-next-request");
+    } finally {
+        if (keyboard) await testInfo.attach("native-project-selection-events", {
+            contentType: "application/json", body: Buffer.from(JSON.stringify(keyEvents, null, 2)),
+        });
+    }
+});
+}
+
+for (const region of ["project list", "onboarding steps", "next guidance"]) {
+    test(`Automatic refresh updates focused ${region} facts without changing an action target`, async ({ page, hub }, testInfo) => {
+        await startNetwork(page, hub);
+        const initial = "更新前の仕事", updated = "更新後の仕事";
+        const projectId = region === "next guidance" ? `project-${randomUUID()}` : await createProject(page, initial);
+        const target = region === "project list"
+            ? page.locator(`#shared-admin-content [data-sa-operation="save_project"][data-sa-id="${projectId}"]`)
+            : page.locator(region === "onboarding steps" ? "#onboarding-steps [data-onboarding-edit]" : "#onboarding-next [data-onboarding-edit]");
+        await target.focus();
+        await expect(target).toBeFocused();
+        const focused = await target.elementHandle();
+        await externalSharedCommand(page, hub, { kind: "save_project", id: projectId, label: updated,
+            archived: false, controller_device_ids: [], runner_device_ids: [] });
+        const regionNode = page.locator(region === "project list" ? "#shared-admin-content"
+            : region === "onboarding steps" ? "#onboarding-steps" : "#onboarding-next");
+        await expect(regionNode).toContainText(region === "next guidance" ? "仕事を依頼するPCを指定してください" : updated);
+        if (region === "next guidance") {
+            // The old action creates a project; the new one edits an existing
+            // project. Do not retarget a still-focused action silently.
+            expect(await focused.evaluate(node => node.isConnected)).toBe(false);
+            await expect(regionNode).toBeFocused();
+        } else {
+            expect(await focused.evaluate(node => node.isConnected && node === document.activeElement)).toBe(true);
+        }
+        await capture(page, testInfo, `automatic-focused-${region.replaceAll(" ", "-")}`);
+    });
+}
+
+test("Automatic refresh retires a removed focused project action without reusing its target", async ({ page, hub }) => {
+    await startNetwork(page, hub);
+    const removedId = await createProject(page, "離脱する仕事");
+    const retainedId = await createProject(page, "残す仕事");
+    const removed = page.locator(`#shared-admin-content [data-sa-operation="save_project"][data-sa-id="${removedId}"]`);
+    await removed.focus();
+    const original = await removed.elementHandle();
+    await externalSharedCommand(page, hub, { kind: "delete_project", id: removedId });
+    await expect(removed).toHaveCount(0);
+    expect(await original.evaluate(node => node.isConnected)).toBe(false);
+    await expect(page.locator("#shared-admin-content")).toBeFocused();
+    await expect(page.locator("#shared-admin-form")).toHaveCount(0);
+    const retained = page.locator(`#shared-admin-content [data-sa-operation="save_project"][data-sa-id="${retainedId}"]`);
+    await retained.click();
+    await expect(page.locator("#shared-admin-label")).toHaveValue("残す仕事");
+});
+
+for (const region of ["onboarding-next", "onboarding-steps"]) {
+    test(`Automatic refresh retires ${region} action when the selected project disappears`, async ({ page, hub }) => {
+        await startNetwork(page, hub);
+        const removedId = await createProject(page, "元の案内対象");
+        const retainedId = await createProject(page, "次の案内対象");
+        await page.locator("#onboarding-project").selectOption(removedId);
+        const action = page.locator(`#${region} [data-onboarding-edit]`);
+        await action.focus();
+        const original = await action.elementHandle();
+        await externalSharedCommand(page, hub, { kind: "delete_project", id: removedId });
+        await expect(page.locator("#onboarding-project")).toHaveValue(retainedId);
+        expect(await original.evaluate(node => node.isConnected)).toBe(false);
+        await expect(page.locator(`#${region}`)).toBeFocused();
+        await expect(page.locator("#shared-admin-form")).toHaveCount(0);
+        await action.click();
+        await expect(page.locator("#shared-admin-label")).toHaveValue("次の案内対象");
+    });
 }
 
 test("Device admission, duplicate-name validation, retained legacy memberships, stop and deletion target the selected participant", { tag: "@smoke" }, async ({ page, hub }, testInfo) => {

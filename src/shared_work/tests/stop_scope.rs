@@ -76,7 +76,7 @@ fn scoped_stop_fences_late_admission_but_a_new_local_turn_can_use_the_same_sessi
         "preview-retain",
         ReportOutcome::RetainService {
             service_id: "preview-service".into(),
-            expires_at_ms: 1000,
+            expires_at_ms: Some(1000),
         },
     );
     f.report(&assignment, "finish", finished());
@@ -247,7 +247,7 @@ fn active_turn_stop_blocks_late_retention_and_child_creation_until_runner_cleanu
             "late-retain",
             ReportOutcome::RetainService {
                 service_id: "late".into(),
-                expires_at_ms: 1000,
+                expires_at_ms: Some(1000),
             },
         ),
         (
@@ -316,7 +316,7 @@ fn origin_stop_is_owned_by_the_original_person_and_exact_controller_device() {
             .admit_origin_turn(&f.alice, "WinA", "private", "turn-1", "admit", true, 1, 10)
             .unwrap(),
     );
-    let root = f
+    let _root = f
         .work
         .submit_for_device(
             &f.alice,
@@ -325,19 +325,8 @@ fn origin_stop_is_owned_by_the_original_person_and_exact_controller_device() {
             Some("WinA"),
         )
         .unwrap();
-    f.work
-        .handover(
-            &f.alice,
-            &root.id,
-            &HandoverRequest {
-                expected_revision: root.revision,
-                new_assignee_id: f.bob.user_id.clone(),
-            },
-            11,
-        )
-        .unwrap();
     let assignment = f.work.claim("WinE", 12).unwrap().unwrap();
-    assert_eq!(assignment.job.assignee_id, f.bob.user_id);
+    assert_eq!(assignment.job.assignee_id, f.alice.user_id);
     f.report(&assignment, "start", ReportOutcome::Started);
     // The opaque session/turn strings alone are not authority.
     f.work
@@ -426,7 +415,7 @@ fn project_conversation_stop_fences_continuation_and_history_is_stable_and_autho
         "retained",
         ReportOutcome::RetainService {
             service_id: "project-preview".into(),
-            expires_at_ms: 1000,
+            expires_at_ms: Some(1000),
         },
     );
     f.report(&first, "done", finished());
@@ -610,7 +599,7 @@ fn v20_forward_migration_preserves_existing_origin_work_without_inventing_a_turn
     f.work
         .db
         .execute_batch(
-            "DROP TABLE shared_conversation_details;
+            "DROP TABLE shared_attempt_progress; DROP TABLE shared_conversation_details;
          DROP INDEX shared_jobs_controller_participation;
          ALTER TABLE shared_jobs DROP COLUMN controller_device_id;
          ALTER TABLE shared_jobs DROP COLUMN controller_participation_generation; ALTER TABLE shared_jobs DROP COLUMN revises_job_id;
@@ -625,6 +614,8 @@ fn v20_forward_migration_preserves_existing_origin_work_without_inventing_a_turn
          ALTER TABLE shared_jobs DROP COLUMN origin_turn_revision;
          ALTER TABLE shared_jobs DROP COLUMN origin_turn_epoch;
          ALTER TABLE shared_jobs DROP COLUMN origin_turn_ref;
+         ALTER TABLE shared_projects DROP COLUMN overview;
+         ALTER TABLE shared_jobs DROP COLUMN project_context_json;
          PRAGMA user_version=20;",
         )
         .unwrap();
@@ -634,7 +625,7 @@ fn v20_forward_migration_preserves_existing_origin_work_without_inventing_a_turn
         .db
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 22);
+    assert_eq!(version, 26);
     assert_eq!(
         f.work
             .job(&f.alice, &root.id)
@@ -716,7 +707,7 @@ fn empty_scope_stop_fences_unbound_legacy_only_and_allows_first_new_revision() {
 }
 
 #[test]
-fn project_stop_needs_every_live_assignee_or_manager_and_denial_is_atomic() {
+fn administrative_stop_of_legacy_assignee_scope_requires_manager_and_denial_is_atomic() {
     let mut f = Fixture::new();
     identity::set_project_role(
         &f.work.db,
@@ -728,15 +719,12 @@ fn project_stop_needs_every_live_assignee_or_manager_and_denial_is_atomic() {
     )
     .unwrap();
     let root = f.submit("solver", "assigned-to-bob", 0);
+    // Saved legacy ownership remains available to the explicit management path.
     f.work
-        .handover(
-            &f.alice,
-            &root.id,
-            &HandoverRequest {
-                expected_revision: root.revision,
-                new_assignee_id: f.bob.user_id.clone(),
-            },
-            11,
+        .db
+        .execute(
+            "UPDATE shared_jobs SET assignee_id=?2 WHERE id=?1",
+            rusqlite::params![root.id, f.bob.user_id],
         )
         .unwrap();
     assert!(matches!(

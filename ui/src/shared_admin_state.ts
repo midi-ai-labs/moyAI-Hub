@@ -1,4 +1,15 @@
 export type ProjectRole = "reader" | "contributor" | "manager";
+/** Shared project preparation copy, including persisted pre-folder-selection states. */
+export function projectPreparationLabel(value: string): string {
+  return ({
+    waiting_setup: "このPCの実行設定待ち",
+    waiting_local_folder: "このPCでプロジェクトの作業フォルダーを選んでください",
+    pending: "作業フォルダーを準備中",
+    ready: "作業フォルダーの準備完了（Desktopでサンプルを実行してください）",
+    failed: "作業フォルダーを利用できません。実行PCの設定を確認してください",
+    not_selected: "実行しない",
+  } as Record<string, string>)[value] ?? "準備状態を確認できません。最新情報を取得してください";
+}
 export interface SharedAdminUser { user_id: string; username: string; display_name: string; administrator: boolean; disabled: boolean; setup_pending?: boolean }
 export interface SharedAdminSnapshot {
   revision: string;
@@ -6,7 +17,7 @@ export interface SharedAdminSnapshot {
   device_principals?: { device_id: string; user_id: string; display_name: string }[];
   groups: { id: string; label: string; disabled: boolean }[];
   group_memberships: { group_id: string; user_id: string }[];
-  projects: { id: string; label: string; archived: boolean; legacy_devices_unrestricted?: boolean }[];
+  projects: { id: string; label: string; overview?: string; archived: boolean; legacy_devices_unrestricted?: boolean }[];
   project_devices?: { project_id: string; device_id: string; can_control: boolean; can_execute: boolean; environment_id: string | null; preparation_state: string; error: string | null }[];
   project_memberships: { project_id: string; user_id: string; role: ProjectRole }[];
   group_project_roles: { project_id: string; group_id: string; role: ProjectRole }[];
@@ -74,8 +85,10 @@ export function adminRequest(kind: AdminOperation, draft: AdminDraft): Record<st
     case "bind_device_principal": return { kind, device_id: required(draft, "device_id"), user_id: text(draft, "user_id") || null, ...(text(draft, "display_name") ? { display_name: text(draft, "display_name") } : {}) };
     case "save_project": {
       const selected = (key:string) => Array.isArray(draft[key]) ? [...new Set(draft[key] as string[])] : [];
+      const overview = text(draft, "overview");
+      if (new TextEncoder().encode(overview).length > 8 * 1024) throw "プロジェクト概要はUTF-8で8 KiB以内にしてください。";
       // This editor owns PC purposes, not the preserved individual/group roles.
-      return { kind,id:id(),label:required(draft,"label"),archived:flag(draft,"archived"),controller_device_ids:selected("controller_device_ids"),runner_device_ids:selected("runner_device_ids") };
+      return { kind,id:id(),label:required(draft,"label"),overview,archived:flag(draft,"archived"),controller_device_ids:selected("controller_device_ids"),runner_device_ids:selected("runner_device_ids") };
     }
     case "retry_project_device": return {kind,project_id:required(draft,"project_id"),device_id:required(draft,"device_id")};
     case "update_user": return { kind, user_id: user_id(), display_name: required(draft, "display_name"), administrator: flag(draft, "administrator"), disabled: flag(draft, "disabled") };

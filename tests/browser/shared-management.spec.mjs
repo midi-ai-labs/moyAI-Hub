@@ -33,7 +33,7 @@ async function enroll(page,hub,label) {
   return {participant,deviceId};
 }
 
-test("one project form assigns both PC purposes without creating a user and automatically prepares a shared execution PC", async ({page,hub},info)=>{
+test("one project form assigns both PC purposes and waits for the execution PC to choose its local folder", async ({page,hub},info)=>{
   test.setTimeout(120_000);
   await open(page,hub);
   await expect(page.locator('[data-sa-tab="groups"], [data-sa-tab="environments"], [data-sa-tab="resources"]')).toHaveCount(0);
@@ -56,19 +56,20 @@ test("one project form assigns both PC purposes without creating a user and auto
   expect(sent).toHaveLength(1); const projectId=sent[0].request.id;
   expect(sent[0].request).not.toHaveProperty("members");
   expect(sent[0].request).toMatchObject({kind:"save_project",label:"設計プロジェクト A",controller_device_ids:[first.deviceId,second.deviceId],runner_device_ids:[second.deviceId]});
-  await expect(page.locator("#shared-admin-content")).toContainText("このPCの実行設定待ち");
+  await expect(page.locator("#shared-admin-content")).toContainText("このPCでプロジェクトの作業フォルダーを選んでください");
+  await expect(page.locator("#shared-admin-content")).not.toContainText("waiting_local_folder");
+  await info.attach("project-local-folder-selection",{body:await page.locator("#shared-administration").screenshot(),contentType:"image/png"});
   const selected=await second.participant.sharedDeviceProjects();
-  expect(selected.projects.find(row=>row.id===projectId)).toMatchObject({can_control:true,can_execute:true,preparation_state:"waiting_setup",environment_id:null});
-  // This authenticated fixture acknowledges provisioning; actual filesystem
-  // creation and embedded Runner execution are covered by the Desktop scenario.
-  await second.participant.sharedTemplates([{id:"desktop-default",label:"このPCの実行設定"}]);
+  expect(selected.projects.find(row=>row.id===projectId)).toMatchObject({can_control:true,can_execute:true,preparation_state:"waiting_local_folder",environment_id:expect.any(String)});
+  // This authenticated fixture acknowledges local-folder selection; actual folder
+  // access and embedded Runner execution are covered by the Desktop scenario.
   const [request]=await second.participant.sharedProvisioning();
-  expect(request.template_id).toBe("desktop-default");
+  expect(request.template_id).toBe("local-folder");
   const preparing=await sharedSnapshot(page,hub);
   expect(preparing.environments.find(row=>row.id===request.environment_id).enabled).toBe(false);
-  await page.locator("#shared-admin-refresh").click(); await expect(page.locator("#shared-admin-content")).toContainText("作業フォルダーを準備中");
-  await second.participant.sharedProvisionReceipt({...request,success:true,error:null});
-  await page.locator("#shared-admin-refresh").click(); await expect(page.locator("#shared-admin-content")).toContainText("作業フォルダー作成済み");
+  await page.locator("#shared-admin-refresh").click(); await expect(page.locator("#shared-admin-content")).toContainText("作業フォルダーを選んでください");
+  await second.participant.sharedProvisionReceipt({environment_id:request.environment_id,template_id:request.template_id,generation:request.generation,success:true,error:null});
+  await page.locator("#shared-admin-refresh").click(); await expect(page.locator("#shared-admin-content")).toContainText("作業フォルダーの準備完了");
   await operation(page,"set_environment_capabilities",request.environment_id);
   await expect(page.locator("#shared-admin-editor")).toContainText("実際に動くことの確認にはなりません");
   await page.locator("#shared-admin-names").fill("Flask\nGurobi"); await save(page);
@@ -79,15 +80,25 @@ test("one project form assigns both PC purposes without creating a user and auto
   await operation(page,"save_project"); await page.locator("#shared-admin-label").fill("設計プロジェクト B");
   await page.getByLabel("操作用 PCを操作に使う",{exact:true}).check(); await page.getByLabel("解析用 PCで仕事を実行する",{exact:true}).check(); await save(page);
   const requests=await second.participant.sharedProvisioning(); expect(requests).toHaveLength(1);
-  await second.participant.sharedProvisionReceipt({...requests[0],success:true,error:null});
+  await second.participant.sharedProvisionReceipt({environment_id:requests[0].environment_id,template_id:requests[0].template_id,generation:requests[0].generation,success:true,error:null});
   const shared=await sharedSnapshot(page,hub); expect(shared.environments).toHaveLength(2);
   expect(shared.environments[0].resource_id).toBe(shared.environments[1].resource_id); expect(shared.resources).toHaveLength(1); expect(shared.resources[0].capacity).toBe(1);
   await page.locator("#shared-admin-refresh").click();
-  await expect(page.locator("#shared-admin-content").getByText(/解析用 PC: 作業フォルダー作成済み/)).toHaveCount(2);
+  await expect(page.locator("#shared-admin-content").getByText(/解析用 PC: 作業フォルダーの準備完了/)).toHaveCount(2);
   await operation(page,"save_project",projectId); await page.getByLabel("解析用 PCで仕事を実行する",{exact:true}).uncheck(); await save(page);
   const removed=await sharedSnapshot(page,hub);
-  expect(removed.environments.find(row=>row.id===request.environment_id).enabled).toBe(false);
+  // Retired project bindings remain historical records, but the management DTO
+  // lists only current environments and provisioning requests.
+  expect(removed.environments.some(row=>row.id===request.environment_id)).toBe(false);
+  expect(removed.provisioning.some(row=>row.environment_id===request.environment_id)).toBe(false);
+  expect(removed.project_devices.find(row=>row.project_id===projectId&&row.device_id===second.deviceId))
+    .toMatchObject({can_control:true,can_execute:false,environment_id:null,preparation_state:"not_selected"});
   expect(removed.environments.find(row=>row.id===requests[0].environment_id).enabled).toBe(true);
+  expect(removed.resources).toHaveLength(1);
+  expect(removed.resources[0].capacity).toBe(1);
+  expect(await second.participant.sharedProvisioning()).toEqual([]);
+  const retiredProject=page.locator(".shared-admin-row").filter({has:page.getByRole("heading",{name:"設計プロジェクト A",exact:true})});
+  await expect(retiredProject).toContainText("仕事を実行するPC未選択");
   await page.locator('[data-sa-tab="storage"]').click(); await operation(page,"prune_shared_data");
   await page.locator("#shared-admin-cutoff").fill("2020-01-01"); await page.locator("#shared-admin-preview").click();
   await expect(page.locator("#shared-admin-preview-result")).toContainText("0件 / 0 bytes");

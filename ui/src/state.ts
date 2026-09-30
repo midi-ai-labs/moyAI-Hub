@@ -14,6 +14,7 @@ export interface LogicalModel {
     id: string;
     label: string;
     capabilities: string[];
+    system_prompt?: string;
 }
 export interface Pool {
     id: string;
@@ -146,12 +147,20 @@ export const availability: Record<Availability, {
     },
 };
 
-export function deploymentStatus(row: Pick<DeploymentRow, "availability" | "model_present">): typeof availability[Availability] {
+export function deploymentStatus(row: Pick<DeploymentRow, "availability" | "model_present"> & Partial<Pick<DeploymentRow, "last_observed_ms">>): typeof availability[Availability] {
     if (row.availability === "maintenance") return availability.maintenance;
     if (row.model_present) return availability.ready;
     // Fresh model-list presence is the source for membership, not the legacy load hint.
-    return row.availability === "ready" || row.availability === "jit_pending"
-        ? availability.unknown : availability[row.availability];
+    const status = row.availability === "ready" || row.availability === "jit_pending"
+        ? "unknown" : row.availability;
+    if (status === "unknown" && row.last_observed_ms != null) {
+        return {
+            label: "再確認待ち",
+            color: "gray",
+            reason: "モデル一覧の確認結果が古いか、直近の確認に失敗しました。実行前に再確認します。"
+        };
+    }
+    return availability[status];
 }
 // Each identity edit invalidates candidate ownership immediately, including during IME.
 export class DiscoveryOwner {

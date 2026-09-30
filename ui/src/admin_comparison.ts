@@ -48,6 +48,7 @@ export function compareAdminEdit(kind: AdminOperation, draft: AdminDraft, origin
     if (original.projects.some(p => p.id === value("id")) && !saved) return block("このプロジェクトは削除されました。同じ入力から作り直さず、対象を開き直してください。");
     if (!original.projects.some(p => p.id === value("id")) && saved) return block("この識別名のプロジェクトが別の操作で登録されました。対象を開き直してください。");
     row("プロジェクト名", saved?.label, draft.label);
+    row("プロジェクト概要", saved?.overview ?? "", draft.overview ?? "");
     row("保管する", saved?.archived, draft.archived === true);
     const assigned = (latest.project_devices ?? []).filter(p => p.project_id === value("id"));
     for (const [key, flag, label] of [["controller_device_ids", "can_control", "操作に使うPC"], ["runner_device_ids", "can_execute", "仕事を実行するPC"]] as const) {

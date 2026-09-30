@@ -71,7 +71,7 @@ fn origin_projection_requires_exact_device_requestor_and_current_project_grant()
         "preview",
         ReportOutcome::RetainService {
             service_id: "service-alpha".into(),
-            expires_at_ms: 1000,
+            expires_at_ms: Some(1000),
         },
     );
     f.report(&assigned, "done", finished());
@@ -250,7 +250,7 @@ fn hidden_origin_presence_requires_live_work_and_the_original_device_and_owner()
         "retain",
         ReportOutcome::RetainService {
             service_id: "hidden-preview".into(),
-            expires_at_ms: 1000,
+            expires_at_ms: Some(1000),
         },
     );
     f.report(&attempt, "done", finished());
@@ -338,14 +338,14 @@ fn origin_projection_pages_jobs_and_v18_rows_remain_unattributed_after_migration
             Some("WinA"),
         )
         .unwrap();
-    f.work.db.execute_batch("DROP TABLE shared_conversation_details; DROP INDEX shared_jobs_controller_participation; ALTER TABLE shared_jobs DROP COLUMN controller_device_id; ALTER TABLE shared_jobs DROP COLUMN controller_participation_generation; ALTER TABLE shared_jobs DROP COLUMN revises_job_id; ALTER TABLE shared_projects DROP COLUMN deleted_at_ms; ALTER TABLE shared_project_devices DROP COLUMN participation_generation; DROP INDEX shared_jobs_origin_turn; DROP INDEX shared_jobs_conversation_history; DROP TABLE shared_project_stop_receipts; DROP TABLE shared_conversation_stop_fences; DROP TABLE shared_origin_turns; DROP TABLE shared_origin_scopes; ALTER TABLE shared_jobs DROP COLUMN origin_turn_revision; ALTER TABLE shared_jobs DROP COLUMN origin_turn_epoch; ALTER TABLE shared_jobs DROP COLUMN origin_turn_ref; DROP INDEX shared_jobs_origin_device; ALTER TABLE shared_jobs DROP COLUMN required_capability; ALTER TABLE shared_jobs DROP COLUMN origin_device_id; PRAGMA user_version=18;").unwrap();
+    f.work.db.execute_batch("ALTER TABLE shared_projects DROP COLUMN overview; ALTER TABLE shared_jobs DROP COLUMN project_context_json; DROP TABLE shared_attempt_progress; DROP TABLE shared_conversation_details; DROP INDEX shared_jobs_controller_participation; ALTER TABLE shared_jobs DROP COLUMN controller_device_id; ALTER TABLE shared_jobs DROP COLUMN controller_participation_generation; ALTER TABLE shared_jobs DROP COLUMN revises_job_id; ALTER TABLE shared_projects DROP COLUMN deleted_at_ms; ALTER TABLE shared_project_devices DROP COLUMN participation_generation; DROP INDEX shared_jobs_origin_turn; DROP INDEX shared_jobs_conversation_history; DROP TABLE shared_project_stop_receipts; DROP TABLE shared_conversation_stop_fences; DROP TABLE shared_origin_turns; DROP TABLE shared_origin_scopes; ALTER TABLE shared_jobs DROP COLUMN origin_turn_revision; ALTER TABLE shared_jobs DROP COLUMN origin_turn_epoch; ALTER TABLE shared_jobs DROP COLUMN origin_turn_ref; DROP INDEX shared_jobs_origin_device; ALTER TABLE shared_jobs DROP COLUMN required_capability; ALTER TABLE shared_jobs DROP COLUMN origin_device_id; PRAGMA user_version=18;").unwrap();
     f.reopen();
     let migrated_version: u32 = f
         .work
         .db
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(migrated_version, 22);
+    assert_eq!(migrated_version, 26);
     let old_origin_device: Option<String> = f
         .work
         .db
@@ -456,7 +456,7 @@ fn origin_device_binding_survives_child_work() {
 }
 
 #[test]
-fn origin_projection_follows_original_owner_through_another_users_continuation() {
+fn origin_projection_preserves_origin_continuation_beside_independent_users_work() {
     let mut f = Fixture::new();
     identity::set_project_role(
         &f.work.db,
@@ -476,26 +476,15 @@ fn origin_projection_follows_original_owner_through_another_users_continuation()
             Some("WinA"),
         )
         .unwrap();
-    f.work
-        .handover(
-            &f.alice,
-            &root.id,
-            &HandoverRequest {
-                expected_revision: root.revision,
-                new_assignee_id: f.bob.user_id.clone(),
-            },
-            11,
-        )
-        .unwrap();
     let first = f.work.claim("WinE", 12).unwrap().unwrap();
-    assert_eq!(first.job.assignee_id, f.bob.user_id);
+    assert_eq!(first.job.assignee_id, f.alice.user_id);
     f.report(&first, "start", ReportOutcome::Started);
     let archive = json!({
         "version":1,
         "job_id":root.id,
         "project_id":"alpha",
         "environment_id":"solver",
-        "transcript":[{"kind":"message","payload":{"text":"handover result"}}]
+        "transcript":[{"kind":"message","payload":{"text":"original result"}}]
     });
     let archive_bytes = serde_json::to_vec(&archive).unwrap();
     f.work
@@ -520,8 +509,9 @@ fn origin_projection_follows_original_owner_through_another_users_continuation()
     let terminal = f.work.job(&f.bob, &root.id).unwrap();
     let continued = f
         .work
-        .continue_job(
-            &f.bob,
+        .continue_job_for_device(
+            &f.alice,
+            Some("WinA"),
             &root.id,
             &ContinueJob {
                 request_id: "bob-continues".into(),
@@ -536,7 +526,7 @@ fn origin_projection_follows_original_owner_through_another_users_continuation()
         )
         .unwrap();
     assert_eq!(continued.conversation_id, root.id);
-    assert_eq!(continued.requestor_id, f.bob.user_id);
+    assert_eq!(continued.requestor_id, f.alice.user_id);
     let second = f.work.claim("WinE", 22).unwrap().unwrap();
     assert_eq!(second.job.id, continued.id);
     f.report(&second, "continue-start", ReportOutcome::Started);
@@ -564,7 +554,7 @@ fn origin_projection_follows_original_owner_through_another_users_continuation()
         "continue-preview",
         ReportOutcome::RetainService {
             service_id: "continued-preview".into(),
-            expires_at_ms: 1000,
+            expires_at_ms: Some(1000),
         },
     );
     f.report(&second, "continue-done", finished());
@@ -596,10 +586,10 @@ fn origin_projection_follows_original_owner_through_another_users_continuation()
         alice.retained_services[0].service.service_id,
         "continued-preview"
     );
-    assert!(!alice.retained_services[0].service.can_stop);
+    assert!(alice.retained_services[0].service.can_stop);
     assert!(matches!(
         f.work
-            .request_conversation_services_stop(&f.alice, "alpha", &root.id, "alice-stop", 25),
+            .request_conversation_services_stop(&f.bob, "alpha", &root.id, "alice-stop", 25),
         Err(WorkError::Forbidden)
     ));
     let bob = f

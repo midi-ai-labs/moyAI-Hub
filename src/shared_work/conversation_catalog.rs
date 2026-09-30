@@ -15,7 +15,7 @@ fn anchor_exists(db: &Connection, project: &str, conversation: &str) -> Result<b
     )?)
 }
 
-fn deletion_pending(db: &Connection, project: &str, conversation: &str) -> Result<bool> {
+pub(super) fn deletion_pending(db: &Connection, project: &str, conversation: &str) -> Result<bool> {
     Ok(db.query_row(
         "SELECT EXISTS(SELECT 1 FROM shared_jobs j WHERE j.project_id=?1 AND j.conversation_id=?2
                  AND j.state NOT IN ('succeeded','failed','cancelled'))
@@ -76,10 +76,6 @@ pub(super) fn can_revise(db: &Connection, job: &Job) -> Result<bool> {
     if job.id != job.root_id
         || job.parent_id.is_some()
         || !job.state.terminal()
-        || job
-            .input
-            .get("input_refs")
-            .is_some_and(|refs| !refs.as_array().is_some_and(Vec::is_empty))
         || !anchor_exists(db, &job.project_id, &job.conversation_id)?
         || deletion_pending(db, &job.project_id, &job.conversation_id)?
     {
@@ -175,7 +171,11 @@ impl SharedWork {
                     .as_deref()
                     .map(|latest| store::load(&self.db, latest))
                     .transpose()?
-                    .map(|latest| can_revise(&self.db, &latest))
+                    .map(|latest| {
+                        Ok::<bool, WorkError>(
+                            latest.requestor_id == actor.user_id && can_revise(&self.db, &latest)?,
+                        )
+                    })
                     .transpose()?
                     .unwrap_or(false)
             } else {

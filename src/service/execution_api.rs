@@ -99,6 +99,8 @@ pub(super) struct Prepare {
     purpose: crate::protocol::RequestPurpose,
     #[serde(default)]
     delegated_selection: Option<ReviewSelection>,
+    #[serde(default)]
+    supports_model_system_prompt: bool,
 }
 impl Prepare {
     fn route_context(&self, core: &mut HubCore) -> Result<String, (StatusCode, Json<Value>)> {
@@ -106,7 +108,7 @@ impl Prepare {
         if !crate::catalog::valid_token(&self.request_id, 128) {
             return Err(invalid_request());
         }
-        match (&self.delegated_selection, self.purpose) {
+        let context = match (&self.delegated_selection, self.purpose) {
             (Some(selection), crate::protocol::RequestPurpose::Delegated) => {
                 let revision = core.catalog_store().revision;
                 core.ensure_delegated_context(
@@ -124,7 +126,27 @@ impl Prepare {
                 | crate::protocol::RequestPurpose::Preparation,
             ) => Ok(self.context.id().into()),
             _ => Err(invalid_request()),
+        }?;
+        if !self.supports_model_system_prompt {
+            let deployments = core
+                .routing_deployments(&self.id, &context, now_ms())
+                .map_err(|error| core_failure(error, core.catalog_store().revision))?;
+            if core.catalog_store().catalog.models.iter().any(|model| {
+                !model.system_prompt.is_empty()
+                    && deployments
+                        .iter()
+                        .any(|deployment| deployment.logical_model_id == model.id)
+            }) {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "error":"model_system_prompt_unsupported",
+                        "current_revision":core.catalog_store().revision.to_string()
+                    })),
+                ));
+            }
         }
+        Ok(context)
     }
 }
 fn check_revision(core: &HubCore, request: &Prepare) -> Result<(), (StatusCode, Json<Value>)> {

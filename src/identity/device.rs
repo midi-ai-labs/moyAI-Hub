@@ -15,6 +15,24 @@ pub fn list(conn: &Connection) -> Result<Vec<DevicePrincipal>> {
         .collect::<std::result::Result<_,_>>()?)
 }
 
+/// Called only by the authenticated registry command owner before it stops or
+/// revokes a device. Existing approvals capture this principal generation; a
+/// registry write failure may conservatively invalidate them, never preserve a
+/// stale human authorization after a successful device revocation.
+pub(crate) fn invalidate_approvals(conn: &Connection, device: &str) -> Result<()> {
+    write(conn, || {
+        if !identifier_ok(device) {
+            return Err(IdentityError::Invalid("device"));
+        }
+        conn.execute(
+            "UPDATE identity_users SET authorization_generation=authorization_generation+1
+             WHERE id IN (SELECT user_id FROM identity_device_principals WHERE device_id=?1)",
+            [device],
+        )?;
+        Ok(())
+    })
+}
+
 /// Complete the already-reviewed network approval. Replaying approval never
 /// replaces an administrator's later explicit association with an existing actor.
 pub(crate) fn enroll(

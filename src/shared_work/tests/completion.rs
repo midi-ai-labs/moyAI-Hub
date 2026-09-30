@@ -85,18 +85,10 @@ fn completion_scope_regression_environment_binding_cannot_widen_an_existing_root
 fn completion_scope_regression_reader_requestor_notification_is_not_actionable() {
     let mut f = Fixture::new();
     add_bob(&mut f);
-    let root = f.submit("solver", "reader-notification", 0);
-    f.work
-        .handover(
-            &f.alice,
-            &root.id,
-            &HandoverRequest {
-                expected_revision: root.revision,
-                new_assignee_id: f.bob.user_id.clone(),
-            },
-            30,
-        )
-        .unwrap();
+    f.submit("solver", "reader-notification", 0);
+    let attempt = f.work.claim("WinE", 32).unwrap().unwrap();
+    f.report(&attempt, "start", ReportOutcome::Started);
+    request_approval(&mut f, &attempt, "new-assignee-approval");
     identity::set_project_role(
         &f.work.db,
         &f.admin,
@@ -106,9 +98,6 @@ fn completion_scope_regression_reader_requestor_notification_is_not_actionable()
         31,
     )
     .unwrap();
-    let attempt = f.work.claim("WinE", 32).unwrap().unwrap();
-    f.report(&attempt, "start", ReportOutcome::Started);
-    request_approval(&mut f, &attempt, "new-assignee-approval");
     let inbox = f.work.inbox(&f.alice, None, 20, 33).unwrap();
     let approval = inbox["items"]
         .as_array()
@@ -314,125 +303,80 @@ fn management_cas_and_exact_replay_preserve_metadata_and_referenced_entities() {
 }
 
 #[test]
-fn handover_fences_unstarted_assignment_and_preserves_requestor_quota_and_ceiling() {
-    let mut f = Fixture::new();
-    add_bob(&mut f);
-    let root = f.submit("parent", "handover", 1);
-    let old = f.work.claim("WinC", 40).unwrap().unwrap();
-    // A later administrative grant is not added to this root's initial ceiling.
-    f.work
-        .register_environment(
-            &f.admin,
-            &Environment {
-                id: "later".into(),
-                label: "Later".into(),
-                resource_id: "later-resource".into(),
-                runner_id: "WinF".into(),
-                capacity: 1,
-                project_ids: vec!["alpha".into()],
-            },
-        )
-        .unwrap();
-    let current = f.work.job(&f.alice, &root.id).unwrap();
-    let changed = f
-        .work
-        .handover(
-            &f.alice,
-            &root.id,
-            &HandoverRequest {
-                expected_revision: current.revision,
-                new_assignee_id: f.bob.user_id.clone(),
-            },
-            41,
-        )
-        .unwrap();
-    assert_eq!(changed.assignee_id, f.bob.user_id);
-    assert_eq!(changed.requestor_id, f.alice.user_id);
-    assert_eq!(changed.quota_owner_id, f.alice.user_id);
-    assert_eq!(changed.authority_generation, 2);
-    assert!(
-        f.work
-            .report(
-                "WinC",
-                &Report {
-                    event_id: "stale-start".into(),
-                    attempt_id: old.attempt_id,
-                    generation: old.generation,
-                    outcome: ReportOutcome::Started
-                },
-                42
-            )
-            .is_err()
-    );
-    let next = f.work.claim("WinC", 43).unwrap().unwrap();
-    assert_eq!(next.authority_generation, 2);
-    assert_eq!(next.generation, 2);
-    assert!(!next.allowed_child_environments.contains(&"later".into()));
-    f.report(&next, "started", ReportOutcome::Started);
-    assert!(
-        f.work
-            .authorize_effect("WinC", &next.attempt_id, next.generation, 1, None, 44)
-            .is_err()
-    );
-    assert!(
-        f.work
-            .authorize_effect("WinC", &next.attempt_id, next.generation, 2, None, 44)
-            .is_ok()
-    );
-}
-
-#[test]
-fn running_handover_waits_for_real_yield_and_cancel_wins_without_capacity_release() {
-    for cancel in [false, true] {
+fn retired_handover_has_no_effect_on_assignment_or_running_approval() {
+    for running in [false, true] {
         let mut f = Fixture::new();
         add_bob(&mut f);
-        let root = f.submit("parent", "running-handover", 1);
-        let parent = f.work.claim("WinC", 40).unwrap().unwrap();
-        f.report(&parent, "start", ReportOutcome::Started);
-        let current = f.work.job(&f.alice, &root.id).unwrap();
-        let pending = f
-            .work
-            .handover(
+        let root = f.submit("solver", "retired-handover", 0);
+        let attempt = f.work.claim("WinE", 11).unwrap().unwrap();
+        if running {
+            f.report(&attempt, "start", ReportOutcome::Started);
+            request_approval(&mut f, &attempt, "pending-approval");
+        }
+        let before = f.work.job(&f.alice, &root.id).unwrap();
+        assert!(matches!(
+            f.work.handover(
                 &f.alice,
                 &root.id,
                 &HandoverRequest {
-                    expected_revision: current.revision,
-                    new_assignee_id: f.bob.user_id.clone(),
+                    expected_revision: before.revision,
+                    new_assignee_id: f.bob.user_id.clone()
                 },
-                41,
-            )
-            .unwrap();
-        assert_eq!(pending.assignee_id, f.alice.user_id);
-        assert!(
-            f.work
-                .handover_view(&f.alice, &root.id)
-                .unwrap()
-                .pending
-                .is_some()
+                21
+            ),
+            Err(WorkError::Retired)
+        ));
+        let after = f.work.job(&f.alice, &root.id).unwrap();
+        assert_eq!(
+            serde_json::to_value(&before).unwrap(),
+            serde_json::to_value(&after).unwrap()
         );
-        assert_eq!(f.work.assignments("WinC").unwrap().len(), 1);
-        f.reopen();
-        if cancel {
-            f.work.cancel(&f.alice, &root.id, 42).unwrap();
-            assert_eq!(f.work.assignments("WinC").unwrap().len(), 1);
-            f.report(&parent, "stopped", finished());
-            let job = f.work.job(&f.alice, &root.id).unwrap();
-            assert_eq!(job.state, JobState::Cancelled);
-            assert_eq!(job.assignee_id, f.alice.user_id);
-        } else {
-            f.report(&parent, "yield", child());
-            let job = f.work.job(&f.bob, &root.id).unwrap();
-            assert_eq!(job.assignee_id, f.bob.user_id);
-            assert_eq!(job.state, JobState::WaitingChild);
-            let child = f.work.claim("WinE", 42).unwrap().unwrap();
-            assert_eq!(child.job.assignee_id, f.bob.user_id);
-            assert_eq!(child.authority_generation, 2);
+        assert_eq!(
+            f.work.attempt("WinE", &attempt.attempt_id).unwrap().state,
+            if running { "running" } else { "assigned" }
+        );
+        if running {
+            assert!(
+                f.work
+                    .approval(&f.alice, &root.id, 22)
+                    .unwrap()
+                    .unwrap()
+                    .can_decide
+            );
         }
     }
 }
 
 #[test]
-fn delivered_approval_is_revalidated_at_effect_after_handover_or_credential_change() {
+fn retired_handover_does_not_block_child_delegation_or_parent_reentry() {
+    let mut f = Fixture::new();
+    add_bob(&mut f);
+    let root = f.submit("parent", "retired-delegation", 1);
+    let parent = f.work.claim("WinC", 11).unwrap().unwrap();
+    f.report(&parent, "start", ReportOutcome::Started);
+    assert!(matches!(
+        f.work.handover(
+            &f.alice,
+            &root.id,
+            &HandoverRequest {
+                expected_revision: root.revision,
+                new_assignee_id: f.bob.user_id.clone()
+            },
+            21
+        ),
+        Err(WorkError::Retired)
+    ));
+    f.report(&parent, "yield", child());
+    let child = f.work.claim("WinE", 22).unwrap().unwrap();
+    assert_eq!(child.job.requestor_id, f.alice.user_id);
+    assert_eq!(child.job.assignee_id, f.alice.user_id);
+    f.report(&child, "child-start", ReportOutcome::Started);
+    f.report(&child, "child-done", finished());
+    assert_eq!(f.work.claim("WinC", 23).unwrap().unwrap().job.id, root.id);
+}
+
+#[test]
+fn delivered_approval_is_revalidated_at_effect_after_invalidation_or_credential_change() {
     for change_credentials in [false, true] {
         let mut f = Fixture::new();
         add_bob(&mut f);
@@ -481,16 +425,11 @@ fn delivered_approval_is_revalidated_at_effect_after_handover_or_credential_chan
             )
             .unwrap();
         } else {
-            let current = f.work.job(&f.alice, &root.id).unwrap();
             f.work
-                .handover(
-                    &f.alice,
-                    &root.id,
-                    &HandoverRequest {
-                        expected_revision: current.revision,
-                        new_assignee_id: f.bob.user_id.clone(),
-                    },
-                    44,
+                .db
+                .execute(
+                    "UPDATE shared_approvals SET invalidated_at_ms=44 WHERE id='exact-approval'",
+                    [],
                 )
                 .unwrap();
         }

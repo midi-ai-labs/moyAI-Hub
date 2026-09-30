@@ -1,6 +1,6 @@
-//! A handover changes continuation authority only at a proven execution boundary.
+//! Continuation and explicit administrative stop settlement.
 use super::*;
-use crate::identity::{self, Principal, ProjectRole};
+use crate::identity::Principal;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -8,12 +8,6 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 pub struct HandoverRequest {
     pub expected_revision: u64,
     pub new_assignee_id: String,
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct HandoverView {
-    pub candidates: Vec<WorkPerson>,
-    pub pending: Option<Value>,
-    pub can_handover: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -31,74 +25,11 @@ pub struct ContinueJob {
     pub start_before_ms: Option<u64>,
 }
 
-pub(super) fn held(db: &Connection, root: &str) -> Result<bool> {
-    Ok(db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM shared_handovers WHERE root_id=?1 AND state='pending')",
-        [root],
-        |r| r.get(0),
-    )?)
-}
 pub(super) fn may_continue(db: &Connection, job: &Job, environment: &str) -> Result<()> {
     super::store::may_use(db, &job.assignee_id, &job.project_id, environment)?;
     if !db.query_row("SELECT EXISTS(SELECT 1 FROM shared_job_environment_ceiling WHERE root_id=?1 AND environment_id=?2)",params![job.root_id,environment],|r|r.get::<_,bool>(0))? {return Err(WorkError::Forbidden)}
     Ok(())
 }
-fn may_handover(db: &Connection, actor: &Principal, job: &Job) -> Result<()> {
-    let role = identity::require_project_role(
-        db,
-        &actor.user_id,
-        &job.project_id,
-        ProjectRole::Contributor,
-    )?;
-    if actor.user_id != job.assignee_id && role != ProjectRole::Manager {
-        return Err(WorkError::Forbidden);
-    }
-    Ok(())
-}
-pub(super) fn settle(db: &Connection, root_id: &str, now: u64) -> Result<()> {
-    let pending: Option<(String, String)> = db
-        .query_row(
-            "SELECT id,new_assignee_id FROM shared_handovers WHERE root_id=?1 AND state='pending'",
-            [root_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    let Some((id, target)) = pending else {
-        return Ok(());
-    };
-    let root = super::store::load(db, root_id)?;
-    if root.state.terminal() || root.state == JobState::Cancelling {
-        db.execute(
-            "UPDATE shared_handovers SET state='cancelled',completed_at_ms=?2 WHERE id=?1",
-            params![id, now],
-        )?;
-        return Ok(());
-    }
-    let active:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM shared_attempts a JOIN shared_jobs j ON j.id=a.job_id WHERE j.root_id=?1 AND a.state IN ('assigned','running','stop_requested'))",[root_id],|r|r.get(0))?;
-    if active {
-        return Ok(());
-    }
-    if identity::require_project_role(db, &target, &root.project_id, ProjectRole::Contributor)
-        .is_err()
-    {
-        db.execute(
-            "UPDATE shared_handovers SET state='rejected',completed_at_ms=?2 WHERE id=?1",
-            params![id, now],
-        )?;
-        return Ok(());
-    }
-    // Retain only the existing ceiling intersected with the new principal's current
-    // project/environment grant. Future configuration changes cannot widen this root.
-    db.execute("DELETE FROM shared_job_environment_ceiling WHERE root_id=?1 AND environment_id NOT IN (SELECT e.id FROM shared_environments e JOIN shared_environment_projects ep ON ep.environment_id=e.id JOIN shared_projects p ON p.id=ep.project_id WHERE ep.project_id=?2 AND e.enabled=1 AND p.archived=0)",params![root_id,root.project_id])?;
-    db.execute("UPDATE shared_jobs SET assignee_id=?2,authority_generation=authority_generation+1,revision=revision+1,updated_at_ms=?3 WHERE root_id=?1 AND state NOT IN ('succeeded','failed','cancelled')",params![root_id,target,now])?;
-    db.execute("UPDATE shared_approvals SET invalidated_at_ms=COALESCE(invalidated_at_ms,?2) WHERE attempt_id IN (SELECT a.id FROM shared_attempts a JOIN shared_jobs j ON j.id=a.job_id WHERE j.root_id=?1)",params![root_id,now])?;
-    db.execute(
-        "UPDATE shared_handovers SET state='completed',completed_at_ms=?2 WHERE id=?1",
-        params![id, now],
-    )?;
-    Ok(())
-}
-
 /// Explicit operator attestation is the only administrative capacity-release path.
 /// It never retries an attempt or pretends a missing process succeeded.
 pub(super) fn settle_stopped(
@@ -137,7 +68,7 @@ pub(super) fn settle_stopped(
         db.execute("UPDATE shared_jobs SET state='queued',revision=revision+1,updated_at_ms=?3 WHERE id=?1 AND awaiting_child_id=?2 AND state='waiting_child'",params![parent,job.id,now])?;
         super::deadlines::expire_job(db, parent, now)?;
     }
-    settle(db, &job.root_id, now)
+    Ok(())
 }
 
 impl SharedWork {
@@ -174,7 +105,7 @@ impl SharedWork {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let previous = super::store::load(&tx, id)?;
-        may_handover(&tx, actor, &previous)?;
+        super::origin_control::require_origin(&tx, &actor.user_id, &previous, controller_device)?;
         if !super::conversation_catalog::visible(
             &tx,
             &previous.project_id,
@@ -182,7 +113,7 @@ impl SharedWork {
         )? {
             return Err(WorkError::NotFound);
         }
-        if let Some(device) = controller_device {
+        let controller_participation_generation = if let Some(device) = controller_device {
             let generation:Option<u64>=tx.query_row(
                 "SELECT d.participation_generation FROM shared_project_devices d JOIN shared_projects p ON p.id=d.project_id WHERE d.project_id=?1 AND d.device_id=?2 AND d.can_control=1 AND p.archived=0 AND p.deleted_at_ms IS NULL",
                 params![previous.project_id,device],|row|row.get(0),
@@ -195,7 +126,10 @@ impl SharedWork {
             if request.project_participation.unwrap_or(1) != generation {
                 return Err(WorkError::Conflict);
             }
-        }
+            Some(generation)
+        } else {
+            None
+        };
         super::store::may_use(
             &tx,
             &actor.user_id,
@@ -261,14 +195,14 @@ impl SharedWork {
         )?;
         super::store::root_capacity(&tx, budget)?;
         let next = ulid::Ulid::new().to_string();
-        tx.execute("INSERT INTO shared_jobs(id,root_id,conversation_id,origin_session_ref,origin_device_id,origin_turn_revision,required_capability,project_id,environment_id,requestor_id,assignee_id,request_id,request_json,title,input_json,state,descendant_budget,revision,created_at_ms,updated_at_ms,quota_owner_id) VALUES(?1,?1,?2,?3,(SELECT origin_device_id FROM shared_jobs WHERE id=?14),(SELECT origin_turn_revision FROM shared_jobs WHERE id=?14),(SELECT required_capability FROM shared_jobs WHERE id=?14),?4,?5,?6,?6,?7,?8,?9,?10,'queued',?11,1,?12,?12,?13)",params![next,previous.conversation_id,previous.origin_session_ref,previous.project_id,previous.environment_id,actor.user_id,request.request_id,payload,previous.title,encoded,budget,now,previous.quota_owner_id,previous.id])?;
+        tx.execute("INSERT INTO shared_jobs(id,root_id,conversation_id,origin_session_ref,origin_device_id,origin_turn_revision,required_capability,project_id,environment_id,requestor_id,assignee_id,request_id,request_json,title,input_json,state,descendant_budget,revision,created_at_ms,updated_at_ms,quota_owner_id) VALUES(?1,?1,?2,?3,(SELECT origin_device_id FROM shared_jobs WHERE id=?14),(SELECT origin_turn_revision FROM shared_jobs WHERE id=?14),'multi_device_session_v2',?4,?5,?6,?6,?7,?8,?9,?10,'queued',?11,1,?12,?12,?13)",params![next,previous.conversation_id,previous.origin_session_ref,previous.project_id,previous.environment_id,actor.user_id,request.request_id,payload,previous.title,encoded,budget,now,previous.quota_owner_id,previous.id])?;
         super::conversation_catalog::appended_root(
             &tx,
             &previous.project_id,
             &previous.conversation_id,
             now,
         )?;
-        tx.execute("UPDATE shared_jobs SET controller_device_id=?2,controller_participation_generation=?3 WHERE id=?1",params![next,controller_device,request.project_participation])?;
+        tx.execute("UPDATE shared_jobs SET controller_device_id=?2,controller_participation_generation=?3 WHERE id=?1",params![next,controller_device,controller_participation_generation])?;
         tx.execute(
             "UPDATE shared_jobs SET start_before_ms=?2 WHERE id=?1",
             params![next, start_before_ms],
@@ -279,79 +213,25 @@ impl SharedWork {
             params![next, id],
         )?;
         let result = super::store::load(&tx, &next)?;
+        super::project_context::capture(
+            &tx,
+            &next,
+            &previous.project_id,
+            result.input["prompt"].as_str().unwrap_or(&result.title),
+            controller_device,
+        )?;
         super::data::bind_inputs(&tx, &result)?;
         tx.commit()?;
         Ok(result)
     }
-    pub fn handover_view(&self, actor: &Principal, id: &str) -> Result<HandoverView> {
-        let job = self.job(actor, id)?;
-        let can_handover = job.id == job.root_id
-            && !job.state.terminal()
-            && job.state != JobState::Cancelling
-            && may_handover(&self.db, actor, &job).is_ok();
-        let candidates = if can_handover {
-            self.db.prepare("SELECT u.id,u.display_name FROM identity_users u JOIN identity_effective_project_memberships m ON m.user_id=u.id WHERE m.project_id=?1 AND m.role IN ('contributor','manager') AND u.id<>?2 ORDER BY u.display_name,u.id LIMIT 4096")?.query_map(params![job.project_id,job.assignee_id],|r|Ok(WorkPerson{user_id:r.get(0)?,display_name:r.get(1)?}))?.collect::<std::result::Result<Vec<_>,_>>()?
-        } else {
-            Vec::new()
-        };
-        let pending=self.db.query_row("SELECT new_assignee_id,requested_by,requested_at_ms FROM shared_handovers WHERE root_id=?1 AND state='pending'",[&job.root_id],|r|Ok(serde_json::json!({"new_assignee_id":r.get::<_,String>(0)?,"requested_by":r.get::<_,String>(1)?,"requested_at_ms":r.get::<_,u64>(2)?}))).optional()?;
-        Ok(HandoverView {
-            candidates,
-            pending,
-            can_handover,
-        })
-    }
+    /// Compatibility entry point: transfer requests are inert after retirement.
     pub fn handover(
         &mut self,
-        actor: &Principal,
-        id: &str,
-        request: &HandoverRequest,
-        now: u64,
+        _actor: &Principal,
+        _id: &str,
+        _request: &HandoverRequest,
+        _now: u64,
     ) -> Result<Job> {
-        super::store::timestamp(now)?;
-        let tx = self
-            .db
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let job = super::store::load(&tx, id)?;
-        may_handover(&tx, actor, &job)?;
-        if job.id != job.root_id || job.state.terminal() || job.state == JobState::Cancelling {
-            return Err(WorkError::Conflict);
-        }
-        if job.revision != request.expected_revision
-            || job.assignee_id == request.new_assignee_id
-            || held(&tx, &job.root_id)?
-        {
-            return Err(WorkError::Conflict);
-        }
-        identity::require_project_role(
-            &tx,
-            &request.new_assignee_id,
-            &job.project_id,
-            ProjectRole::Contributor,
-        )?;
-        tx.execute(
-            "INSERT INTO shared_handovers VALUES(?1,?2,?3,?4,?5,'pending',?6,NULL)",
-            params![
-                ulid::Ulid::new().to_string(),
-                job.id,
-                job.assignee_id,
-                request.new_assignee_id,
-                actor.user_id,
-                now
-            ],
-        )?;
-        // The database serializes Started with this fence. Assigned has no issued
-        // execution authorization; running/uncertain work is never freed here.
-        tx.execute("UPDATE shared_jobs SET state='queued',revision=revision+1,updated_at_ms=?2 WHERE root_id=?1 AND id IN (SELECT job_id FROM shared_attempts WHERE state='assigned' AND uncertainty_reason IS NULL)",params![job.id,now])?;
-        tx.execute("UPDATE shared_attempts SET state=CASE WHEN uncertainty_reason IS NULL THEN 'cancelled' ELSE 'stop_requested' END,updated_at_ms=?2 WHERE job_id IN (SELECT id FROM shared_jobs WHERE root_id=?1) AND state='assigned'",params![job.id,now])?;
-        tx.execute("UPDATE shared_approvals SET invalidated_at_ms=COALESCE(invalidated_at_ms,?2) WHERE attempt_id IN (SELECT a.id FROM shared_attempts a JOIN shared_jobs j ON j.id=a.job_id WHERE j.root_id=?1)",params![job.id,now])?;
-        tx.execute(
-            "UPDATE shared_jobs SET revision=revision+1,updated_at_ms=?2 WHERE id=?1",
-            params![job.id, now],
-        )?;
-        settle(&tx, &job.root_id, now)?;
-        let result = super::store::load(&tx, id)?;
-        tx.commit()?;
-        Ok(result)
+        Err(WorkError::Retired)
     }
 }

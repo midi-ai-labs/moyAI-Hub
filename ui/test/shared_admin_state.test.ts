@@ -6,16 +6,25 @@ test("project form with no PC checkboxes clears both previous purposes before co
   const draft={id:"project",label:"PCの再登録待ち",controller_device_ids:["deleted-pc"],runner_device_ids:["deleted-pc"]};
   const form=new FormData();
   Object.assign(draft,projectPCSelection(form));
-  assert.deepEqual(adminRequest("save_project",draft),{kind:"save_project",id:"project",label:"PCの再登録待ち",archived:false,controller_device_ids:[],runner_device_ids:[]});
+  assert.deepEqual(adminRequest("save_project",draft),{kind:"save_project",id:"project",label:"PCの再登録待ち",overview:"",archived:false,controller_device_ids:[],runner_device_ids:[]});
   form.append("controller_device_ids","WinA"); form.append("runner_device_ids","WinB");
   assert.deepEqual(projectPCSelection(form),{controller_device_ids:["WinA"],runner_device_ids:["WinB"]});
 });
 
 test("a project saves PC purposes without changing existing people and group roles", () => {
   const request=adminRequest("save_project",{id:"project-one",label:"  解析  ","participant:alice":"contributor","participant:bob":"",controller_device_ids:["WinA","WinB","WinA"],runner_device_ids:["WinB","WinC"],template_id:"ignored",capacity:128});
-  assert.deepEqual(request,{kind:"save_project",id:"project-one",label:"解析",archived:false,controller_device_ids:["WinA","WinB"],runner_device_ids:["WinB","WinC"]});
+  assert.deepEqual(request,{kind:"save_project",id:"project-one",label:"解析",overview:"",archived:false,controller_device_ids:["WinA","WinB"],runner_device_ids:["WinB","WinC"]});
   assert.equal("members" in request, false);
   assert.deepEqual(adminTabs.map(([id])=>id),["projects","maintenance","storage"]);
+});
+
+test("project overview preserves interior lines and rejects UTF-8 byte overflow", () => {
+  const draft={id:"project",label:"解析",controller_device_ids:[],runner_device_ids:[]};
+  assert.equal(adminRequest("save_project",{...draft,overview:"  WinB: Worker\n  WinC: DB  \n"}).overview,"WinB: Worker\n  WinC: DB");
+  const boundary="あ".repeat(2730)+"ab";
+  assert.equal(new TextEncoder().encode(boundary).length,8192);
+  assert.equal(adminRequest("save_project",{...draft,overview:boundary}).overview,boundary);
+  assert.throws(()=>adminRequest("save_project",{...draft,overview:boundary+"x"}));
 });
 
 test("an environment reuses the selected Runner's one existing pool and exact capacity without granting projects", () => {

@@ -8,6 +8,7 @@ fn fixture() -> HubCore {
         models: ["a", "b"]
             .into_iter()
             .map(|id| LogicalModel {
+                system_prompt: String::new(),
                 id: id.into(),
                 label: id.into(),
                 capabilities: BTreeSet::from(["tools".into()]),

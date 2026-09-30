@@ -40,12 +40,23 @@ async fn pending(
     )
     .await
 }
+#[derive(Default, Deserialize)]
+struct EnvironmentQuery {
+    #[serde(default)]
+    current_only: bool,
+}
+
 async fn environments(
     State(state): State<ApiState>,
     Extension(device): Extension<DeviceIdentity>,
+    Query(query): Query<EnvironmentQuery>,
 ) -> ApiResult<Vec<super::super::provisioning::RunnerEnvironment>> {
     operation(state, device.clone(), DeviceAccess::Current, move |store| {
-        store.runner_environments(&device.device_id)
+        if query.current_only {
+            store.current_runner_environments(&device.device_id)
+        } else {
+            store.runner_environments(&device.device_id)
+        }
     })
     .await
 }

@@ -9,7 +9,7 @@ const MAX_RESERVED_DESCENDANTS: u64 = 32_000;
 const MAX_ROOTS: u64 = 1_000;
 const MAX_RUNNER_ATTEMPTS: u32 = 128;
 const JOB_COLUMNS: &str = "id,root_id,parent_id,project_id,environment_id,requestor_id,assignee_id,title,input_json,checkpoint_json,result_json,state,awaiting_child_id,revision,created_at_ms,updated_at_ms,COALESCE(quota_owner_id,requestor_id),authority_generation,(SELECT previous_job_id FROM shared_continuations WHERE job_id=shared_jobs.id),start_before_ms,conversation_id,origin_session_ref,origin_turn_ref,origin_turn_epoch,revises_job_id";
-pub(super) const MULTI_DEVICE_SESSION_CAPABILITY: &str = "multi_device_session_v1";
+pub(super) const MULTI_DEVICE_SESSION_CAPABILITY: &str = "multi_device_session_v2";
 
 pub(super) fn id(value: &str) -> Result<()> {
     if value.is_empty()
@@ -166,7 +166,6 @@ pub(super) fn cancel_root_in_transaction(db: &Connection, root_id: &str, now: u6
     db.execute("UPDATE shared_attempts SET state='stop_requested',updated_at_ms=?2 WHERE job_id IN (SELECT id FROM shared_jobs WHERE root_id=?1) AND state IN ('assigned','running')", params![root_id,now])?;
     set_state(db, root_id, "cancelling", now)?;
     settle_cancel(db, root_id, now)?;
-    super::handover::settle(db, root_id, now)?;
     Ok(())
 }
 pub(super) fn root_capacity(db: &Connection, budget: u32) -> Result<()> {
@@ -245,7 +244,7 @@ pub(super) fn submit_in_transaction(
     super::data::validate_inputs(&db, &request.project_id, &request.input)?;
     let existing: Option<(String, String, Option<String>)> = db
         .query_row(
-            "SELECT id,request_json,origin_device_id FROM shared_jobs WHERE requestor_id=?1 AND request_id=?2",
+            "SELECT id,request_json,COALESCE(controller_device_id,origin_device_id) FROM shared_jobs WHERE requestor_id=?1 AND request_id=?2",
             params![actor.user_id, request.request_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
@@ -254,10 +253,7 @@ pub(super) fn submit_in_transaction(
         if old != request_json {
             return Err(WorkError::Conflict);
         }
-        if request.origin_session_ref.is_some()
-            && controller_device.is_some()
-            && origin_device_id.as_deref() != controller_device
-        {
+        if origin_device_id.as_deref() != controller_device {
             return Err(WorkError::Forbidden);
         }
         let prior = load(&db, &job_id)?;
@@ -273,6 +269,20 @@ pub(super) fn submit_in_transaction(
         if let (Some(conversation), Some(target), Some(revision)) = revision_fields {
             let prior = load(db, target)?;
             if prior.project_id != request.project_id || prior.conversation_id != conversation {
+                return Err(WorkError::Conflict);
+            }
+            super::origin_control::require_origin(db, &actor.user_id, &prior, controller_device)?;
+            // Editing changes the text, not the immutable inputs of the selected turn.
+            // Legacy turns without input_refs are equivalent to an empty input list.
+            let prior_inputs = prior.input["input_refs"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let revised_inputs = request.input["input_refs"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            if prior_inputs != revised_inputs {
                 return Err(WorkError::Conflict);
             }
             Some(super::conversation_catalog::revision_predecessor(
@@ -317,7 +327,7 @@ pub(super) fn submit_in_transaction(
     let start_before_ms = super::deadlines::resolve(request.start_before_ms, now)?;
     let job_id = ulid::Ulid::new().to_string();
     let conversation_id = request.conversation_id.as_deref().unwrap_or(&job_id);
-    db.execute("INSERT INTO shared_jobs(id,root_id,conversation_id,revises_job_id,origin_session_ref,origin_device_id,origin_turn_ref,origin_turn_epoch,required_capability,project_id,environment_id,requestor_id,assignee_id,request_id,request_json,title,input_json,state,descendant_budget,revision,created_at_ms,updated_at_ms) VALUES(?1,?1,?16,?17,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12,?13,'queued',?14,1,?15,?15)", params![job_id,request.origin_session_ref,controller_device.filter(|_|request.origin_session_ref.is_some()),request.origin_turn_ref,request.origin_turn_epoch,request.origin_session_ref.as_ref().map(|_| "multi_device_session_v1"),request.project_id,environment_id,actor.user_id,request.request_id,request_json,request.title,input,request.descendant_budget,now,conversation_id,request.revises_job_id])?;
+    db.execute("INSERT INTO shared_jobs(id,root_id,conversation_id,revises_job_id,origin_session_ref,origin_device_id,origin_turn_ref,origin_turn_epoch,required_capability,project_id,environment_id,requestor_id,assignee_id,request_id,request_json,title,input_json,state,descendant_budget,revision,created_at_ms,updated_at_ms) VALUES(?1,?1,?16,?17,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12,?13,'queued',?14,1,?15,?15)", params![job_id,request.origin_session_ref,controller_device.filter(|_|request.origin_session_ref.is_some()),request.origin_turn_ref,request.origin_turn_epoch,Some(MULTI_DEVICE_SESSION_CAPABILITY),request.project_id,environment_id,actor.user_id,request.request_id,request_json,request.title,input,request.descendant_budget,now,conversation_id,request.revises_job_id])?;
     if request.conversation_id.is_some() {
         super::conversation_catalog::appended_root(db, &request.project_id, conversation_id, now)?;
     }
@@ -341,6 +351,13 @@ pub(super) fn submit_in_transaction(
     )?;
     db.execute("INSERT INTO shared_job_environment_ceiling SELECT ?1,e.id FROM shared_environments e JOIN shared_environment_projects ep ON ep.environment_id=e.id WHERE ep.project_id=?2 AND e.enabled=1",params![job_id,request.project_id])?;
     let job = load(&db, &job_id)?;
+    super::project_context::capture(
+        db,
+        &job_id,
+        &request.project_id,
+        request.input["prompt"].as_str().unwrap_or(&request.title),
+        controller_device,
+    )?;
     super::data::bind_inputs(&db, &job)?;
 
     Ok(job)
@@ -354,13 +371,10 @@ pub(super) fn reserve_job(
 ) -> Result<Assignment> {
     id(runner)?;
     timestamp(now)?;
-    if now >= job.start_before_ms {
+    if job.start_before_ms.is_some_and(|deadline| now >= deadline) {
         return Err(WorkError::StartDeadline);
     }
-    if job.state != JobState::Queued
-        || open_root(db, &job.root_id).is_err()
-        || super::handover::held(db, &job.root_id)?
-    {
+    if job.state != JobState::Queued || open_root(db, &job.root_id).is_err() {
         return Err(WorkError::Conflict);
     }
     super::handover::may_continue(db, job, &job.environment_id)?;
@@ -397,7 +411,7 @@ impl SharedWork {
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.pragma_update(None, "synchronous", "FULL")?;
         let version: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 22 {
+        if version > 26 {
             return Err(WorkError::Conflict);
         }
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -496,7 +510,28 @@ impl SharedWork {
                 "../../migrations/V22__project_participation_and_conversation_lifecycle.sql"
             ))?;
         }
-        tx.pragma_update(None, "user_version", 22)?;
+        if version < 23 {
+            tx.execute_batch(include_str!(
+                "../../migrations/V23__shared_attempt_progress.sql"
+            ))?;
+        }
+        if version < 24 {
+            tx.execute_batch(include_str!(
+                "../../migrations/V24__shared_project_context.sql"
+            ))?;
+        }
+        if version < 25 {
+            super::origin_control::retirement_preflight(&tx)?;
+            tx.execute_batch(include_str!(
+                "../../migrations/V25__retire_shared_handover.sql"
+            ))?;
+        }
+        if version < 26 {
+            tx.execute_batch(include_str!(
+                "../../migrations/V26__optional_shared_lifetimes.sql"
+            ))?;
+        }
+        tx.pragma_update(None, "user_version", 26)?;
         tx.commit()?;
         let check: String = db.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
         if check != "ok" {
@@ -582,6 +617,7 @@ impl SharedWork {
                 return Err(WorkError::Conflict);
             }
         }
+        super::provisioning::check_environment_capacity(&tx, &env.runner_id, None)?;
         tx.execute(
             "INSERT OR IGNORE INTO shared_resources(id,capacity) VALUES(?1,?2)",
             params![env.resource_id, env.capacity],
@@ -707,7 +743,7 @@ impl SharedWork {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         super::deadlines::expire_due(&tx, now)?;
-        let existing: Option<String> = tx.query_row("SELECT a.id FROM shared_attempts a JOIN shared_jobs j ON j.id=a.job_id WHERE a.runner_id=?1 AND a.state IN ('assigned','stop_requested') AND NOT EXISTS(SELECT 1 FROM shared_external_attempts x WHERE x.attempt_id=a.id) AND (?2 IS NULL OR j.environment_id IN (SELECT value FROM json_each(?2))) AND (j.required_capability IS NULL OR j.required_capability=?3) ORDER BY a.created_at_ms,a.id LIMIT 1", params![runner, filter, capability], |r|r.get(0)).optional()?;
+        let existing: Option<String> = tx.query_row("SELECT a.id FROM shared_attempts a JOIN shared_jobs j ON j.id=a.job_id WHERE a.runner_id=?1 AND a.state IN ('assigned','stop_requested') AND NOT EXISTS(SELECT 1 FROM shared_external_attempts x WHERE x.attempt_id=a.id) AND (?2 IS NULL OR j.environment_id IN (SELECT value FROM json_each(?2))) AND (j.required_capability IS NULL OR j.required_capability=?3 OR (?3='multi_device_session_v2' AND j.required_capability='multi_device_session_v1')) ORDER BY a.created_at_ms,a.id LIMIT 1", params![runner, filter, capability], |r|r.get(0)).optional()?;
         if let Some(attempt) = existing {
             let prior = assignment(&tx, &attempt)?;
             super::deadlines::expire_job(&tx, &prior.job.id, now)?;
@@ -724,17 +760,17 @@ impl SharedWork {
         }
         // Oldest-served person first; a blocked resource never blocks another resource.
         let candidates: Vec<String> = {
-            let mut stmt = tx.prepare("SELECT j.id FROM shared_jobs j JOIN shared_environments e ON e.id=j.environment_id WHERE j.state='queued' AND e.runner_id=?1 AND e.enabled=1 AND NOT EXISTS(SELECT 1 FROM shared_external_attempts x JOIN shared_attempts external ON external.id=x.attempt_id WHERE external.job_id=j.id) AND (?2 IS NULL OR e.id IN (SELECT value FROM json_each(?2))) AND (j.required_capability IS NULL OR j.required_capability=?3) ORDER BY COALESCE((SELECT MAX(a.created_at_ms) FROM shared_attempts a JOIN shared_jobs served ON served.id=a.job_id WHERE COALESCE(served.quota_owner_id,served.requestor_id)=COALESCE(j.quota_owner_id,j.requestor_id)),0),j.created_at_ms,j.id LIMIT 1000")?;
+            let mut stmt = tx.prepare("SELECT j.id FROM shared_jobs j JOIN shared_environments e ON e.id=j.environment_id WHERE j.state='queued' AND e.runner_id=?1 AND e.enabled=1 AND NOT EXISTS(SELECT 1 FROM shared_external_attempts x JOIN shared_attempts external ON external.id=x.attempt_id WHERE external.job_id=j.id) AND (?2 IS NULL OR e.id IN (SELECT value FROM json_each(?2))) AND (j.required_capability IS NULL OR j.required_capability=?3 OR (?3='multi_device_session_v2' AND j.required_capability='multi_device_session_v1')) ORDER BY COALESCE((SELECT MAX(a.created_at_ms) FROM shared_attempts a JOIN shared_jobs served ON served.id=a.job_id WHERE COALESCE(served.quota_owner_id,served.requestor_id)=COALESCE(j.quota_owner_id,j.requestor_id)),0),j.created_at_ms,j.id LIMIT 1000")?;
             stmt.query_map(params![runner, filter, capability], |r| r.get(0))?
                 .collect::<std::result::Result<_, _>>()?
         };
         for job_id in candidates {
             let job = load(&tx, &job_id)?;
-            if now >= job.start_before_ms {
+            if job.start_before_ms.is_some_and(|deadline| now >= deadline) {
                 super::deadlines::expire_job(&tx, &job.id, now)?;
                 continue;
             }
-            if open_root(&tx, &job.root_id).is_err() || super::handover::held(&tx, &job.root_id)? {
+            if open_root(&tx, &job.root_id).is_err() {
                 continue;
             }
             match super::handover::may_continue(&tx, &job, &job.environment_id) {
@@ -764,7 +800,7 @@ impl SharedWork {
         capability: Option<&str>,
     ) -> Result<Vec<Assignment>> {
         id(runner)?;
-        let mut stmt=self.db.prepare("SELECT a.id FROM shared_attempts a JOIN shared_jobs j ON j.id=a.job_id WHERE a.runner_id=?1 AND a.state IN ('assigned','running','stop_requested') AND (j.required_capability IS NULL OR j.required_capability=?3) ORDER BY a.created_at_ms,a.id LIMIT ?2")?;
+        let mut stmt=self.db.prepare("SELECT a.id FROM shared_attempts a JOIN shared_jobs j ON j.id=a.job_id WHERE a.runner_id=?1 AND a.state IN ('assigned','running','stop_requested') AND (j.required_capability IS NULL OR j.required_capability=?3 OR (?3='multi_device_session_v2' AND j.required_capability='multi_device_session_v1')) ORDER BY a.created_at_ms,a.id LIMIT ?2")?;
         let ids = stmt
             .query_map(params![runner, MAX_RUNNER_ATTEMPTS, capability], |r| {
                 r.get::<_, String>(0)
@@ -819,6 +855,12 @@ impl SharedWork {
         if generation != report.generation {
             return Err(WorkError::Conflict);
         }
+        if matches!(report.outcome, ReportOutcome::Progress { .. }) {
+            // A display projection is not a lifecycle event, heartbeat, or deadline sweep.
+            let job = super::data::record_progress(&tx, runner, report, &payload, now)?;
+            tx.commit()?;
+            return Ok(job);
+        }
         let previous: Option<String> = tx
             .query_row(
                 "SELECT payload_json FROM shared_reports WHERE attempt_id=?1 AND event_id=?2",
@@ -839,7 +881,7 @@ impl SharedWork {
         if matches!(report.outcome, ReportOutcome::Started)
             && state == "assigned"
             && !cancelling
-            && now >= job.start_before_ms
+            && job.start_before_ms.is_some_and(|deadline| now >= deadline)
         {
             super::deadlines::expire_job(&tx, &job.id, now)?;
             tx.commit()?;
@@ -854,6 +896,7 @@ impl SharedWork {
             return Err(WorkError::Conflict);
         }
         match &report.outcome {
+            ReportOutcome::Progress { .. } => unreachable!("handled before lifecycle reports"),
             ReportOutcome::RetainService {
                 service_id,
                 expires_at_ms,
@@ -862,8 +905,8 @@ impl SharedWork {
                 if cancelling
                     || state != "running"
                     || uncertainty.is_some()
-                    || *expires_at_ms <= now
-                    || *expires_at_ms > now.saturating_add(24 * 60 * 60 * 1000)
+                    || expires_at_ms
+                        .is_some_and(|deadline| deadline <= now || deadline > i64::MAX as u64)
                 {
                     return Err(WorkError::Conflict);
                 }
@@ -886,7 +929,7 @@ impl SharedWork {
                 // A retained process changes the contract for later turns of
                 // this conversation. Older Runners cannot safely rejoin it.
                 tx.execute(
-                    "UPDATE shared_jobs SET required_capability=?2 WHERE conversation_id=?1 AND required_capability IS NULL",
+                    "UPDATE shared_jobs SET required_capability=?2 WHERE conversation_id=?1",
                     params![job.conversation_id, MULTI_DEVICE_SESSION_CAPABILITY],
                 )?;
                 tx.execute("INSERT INTO shared_service_leases(service_id,attempt_id,generation,expires_at_ms,state,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,'active',?5,?5)",params![service_id,report.attempt_id,report.generation,expires_at_ms,now])?;
@@ -932,11 +975,7 @@ impl SharedWork {
                 )?;
             }
             ReportOutcome::Started => {
-                if cancelling
-                    || state != "assigned"
-                    || uncertainty.is_some()
-                    || super::handover::held(&tx, &job.root_id)?
-                {
+                if cancelling || state != "assigned" || uncertainty.is_some() {
                     return Err(WorkError::Conflict);
                 }
                 super::handover::may_continue(&tx, &job, &job.environment_id)?;
@@ -945,6 +984,11 @@ impl SharedWork {
                     params![report.attempt_id, now],
                 )?;
                 set_state(&tx, &job_id, "running", now)?;
+                // A requested queue deadline never limits a started workflow or its resume.
+                tx.execute(
+                    "UPDATE shared_jobs SET start_before_ms=NULL WHERE id=?1",
+                    [&job_id],
+                )?;
             }
             ReportOutcome::Uncertain { reason } => {
                 label(reason)?;
@@ -982,11 +1026,11 @@ impl SharedWork {
                 }
                 let child = ulid::Ulid::new().to_string();
                 let request_id = format!("child:{}", child);
-                tx.execute("INSERT INTO shared_jobs(id,root_id,conversation_id,origin_session_ref,origin_device_id,origin_turn_ref,origin_turn_epoch,origin_turn_revision,required_capability,parent_id,project_id,environment_id,requestor_id,assignee_id,request_id,request_json,title,input_json,state,descendant_budget,revision,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,(SELECT origin_device_id FROM shared_jobs WHERE id=?5),?15,?16,(SELECT origin_turn_revision FROM shared_jobs WHERE id=?5),(SELECT required_capability FROM shared_jobs WHERE id=?5),?5,?6,?7,?8,?9,?10,?11,?12,?13,'queued',0,1,?14,?14)", params![child,job.root_id,job.conversation_id,job.origin_session_ref,job.id,job.project_id,child_environment_id,job.requestor_id,job.assignee_id,request_id,payload,child_title,input,now,job.origin_turn_ref,job.origin_turn_epoch])?;
+                tx.execute("INSERT INTO shared_jobs(id,root_id,conversation_id,origin_session_ref,origin_device_id,origin_turn_ref,origin_turn_epoch,origin_turn_revision,required_capability,parent_id,project_id,environment_id,requestor_id,assignee_id,request_id,request_json,title,input_json,state,descendant_budget,revision,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,(SELECT origin_device_id FROM shared_jobs WHERE id=?5),?15,?16,(SELECT origin_turn_revision FROM shared_jobs WHERE id=?5),'multi_device_session_v2',?5,?6,?7,?8,?9,?10,?11,?12,?13,'queued',0,1,?14,?14)", params![child,job.root_id,job.conversation_id,job.origin_session_ref,job.id,job.project_id,child_environment_id,job.requestor_id,job.assignee_id,request_id,payload,child_title,input,now,job.origin_turn_ref,job.origin_turn_epoch])?;
                 tx.execute("UPDATE shared_jobs SET controller_device_id=(SELECT controller_device_id FROM shared_jobs WHERE id=?2),controller_participation_generation=(SELECT controller_participation_generation FROM shared_jobs WHERE id=?2) WHERE id=?1",params![child,job.id])?;
                 tx.execute(
-                    "UPDATE shared_jobs SET quota_owner_id=?2,authority_generation=?3,start_before_ms=?4 WHERE id=?1",
-                    params![child, job.quota_owner_id, job.authority_generation,job.start_before_ms],
+                    "UPDATE shared_jobs SET quota_owner_id=?2,authority_generation=?3,start_before_ms=NULL WHERE id=?1",
+                    params![child, job.quota_owner_id, job.authority_generation],
                 )?;
                 super::data::bind_inputs(&tx, &load(&tx, &child)?)?;
                 tx.execute(
@@ -1061,7 +1105,6 @@ impl SharedWork {
             super::deadlines::expire_job(&tx, parent, now)?;
         }
         super::deadlines::expire_due(&tx, now)?;
-        super::handover::settle(&tx, &job.root_id, now)?;
         let updated = load(&tx, &job.id)?;
         tx.commit()?;
         Ok(updated)
@@ -1158,6 +1201,7 @@ pub(super) fn assignment(db: &Connection, attempt: &str) -> Result<Assignment> {
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?
     };
+    let project_context = super::project_context::for_job(db, &job)?;
     Ok(Assignment {
         attempt_id: attempt.into(),
         generation,
@@ -1165,10 +1209,12 @@ pub(super) fn assignment(db: &Connection, attempt: &str) -> Result<Assignment> {
         runner_id,
         stop_requested: state == "stop_requested",
         job,
+        project_context,
         child_result,
         allowed_child_environments,
         allowed_child_candidates,
         retained_services,
         required_runner_capabilities: required_capability.into_iter().collect(),
+        supports_progress_reports: true,
     })
 }

@@ -8,24 +8,32 @@ mod deadlines;
 mod handover;
 mod inbox;
 mod local_admission;
+mod origin_control;
 mod provisioning;
 pub use local_admission::LocalAdmission;
 pub use provisioning::{ProvisionReceipt, ProvisionRequest, RunnerTemplate};
 mod management;
+mod project_context;
 pub(crate) mod project_setup;
 pub use project_setup::ProjectMember;
 mod projection;
 mod runner_contact;
 mod services;
 mod stop_scope;
-pub use data::{Asset, AssetDownload, AssetUpload, RunnerAssetUpload, TranscriptPage};
+pub use data::{
+    Asset, AssetDownload, AssetUpload, RunnerAssetUpload, TranscriptActivity, TranscriptItem,
+    TranscriptPage,
+};
+#[cfg(test)]
 pub use deadlines::DEFAULT_START_WINDOW_MS;
-pub use handover::{ContinueJob, HandoverRequest, HandoverView};
+pub use handover::{ContinueJob, HandoverRequest};
 pub use management::{ManagementCommand, ManagementRequest};
 pub use runner_contact::{RUNNER_CONTACT_STALE_MS, RunnerContact, RunnerContactState};
 pub use services::ServiceLeaseView;
 
-pub use approvals::{ApprovalAnswer, ApprovalConsumeResult, ApprovalDecision, ApprovalView};
+pub use approvals::{
+    ApprovalAnswer, ApprovalConsumeResult, ApprovalContext, ApprovalDecision, ApprovalView,
+};
 mod store;
 
 pub use projection::{
@@ -44,6 +52,8 @@ pub type Result<T> = std::result::Result<T, WorkError>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkError {
+    #[error("担当交代は廃止されました。依頼元PCで続けるか、自分の新しい会話を開始してください。")]
+    Retired,
     #[error("要求の内容を確認してください。")]
     Invalid,
     #[error("{0}")]
@@ -118,7 +128,7 @@ pub struct Job {
     pub revision: u64,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
-    pub start_before_ms: u64,
+    pub start_before_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -171,6 +181,9 @@ pub struct Assignment {
     pub runner_id: String,
     pub stop_requested: bool,
     pub job: Job,
+    /// Immutable descriptive facts accepted with the root request, never permissions.
+    #[serde(default)]
+    pub project_context: Option<ProjectContext>,
     /// Results to consume while resuming the saved parent checkpoint.
     pub child_result: Option<Box<Job>>,
     /// Current project/environment allowlist; Runner-local policy can only narrow it.
@@ -184,6 +197,19 @@ pub struct Assignment {
     /// Empty for legacy shared jobs that any supported Runner can execute.
     #[serde(default)]
     pub required_runner_capabilities: Vec<String>,
+    /// Optional display-only progress. Old Hubs omit this capability.
+    #[serde(default)]
+    pub supports_progress_reports: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectContext {
+    pub project_id: String,
+    pub label: String,
+    pub overview: String,
+    pub revision: String,
+    pub root_prompt: String,
+    pub origin_device_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -202,7 +228,7 @@ pub struct RetainedService {
     pub generation: u64,
     pub conversation_id: String,
     pub environment_id: String,
-    pub expires_at_ms: u64,
+    pub expires_at_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -225,9 +251,14 @@ pub struct Report {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReportOutcome {
     Started,
+    Progress {
+        revision: u64,
+        items: Vec<TranscriptItem>,
+        truncated: bool,
+    },
     RetainService {
         service_id: String,
-        expires_at_ms: u64,
+        expires_at_ms: Option<u64>,
     },
     ServiceStopped {
         service_id: String,

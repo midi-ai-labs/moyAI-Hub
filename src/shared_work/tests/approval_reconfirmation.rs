@@ -1,6 +1,6 @@
 use super::*;
 
-fn pending_handover() -> (Fixture, Assignment) {
+fn expired_approval() -> (Fixture, Assignment) {
     let mut f = Fixture::new();
     identity::set_project_role(
         &f.work.db,
@@ -11,44 +11,165 @@ fn pending_handover() -> (Fixture, Assignment) {
         30,
     )
     .unwrap();
-    let root = f.submit("parent", "approval-handover", 1);
+    f.submit("parent", "approval-expiry", 1);
     let attempt = f.work.claim("WinC", 40).unwrap().unwrap();
     f.report(&attempt, "started", ReportOutcome::Started);
     request_approval(&mut f, &attempt, "old-approval");
-    let pending = f
-        .work
-        .consume_approval(
-            "WinC",
-            "old-approval",
-            &attempt.attempt_id,
-            attempt.generation,
-            40,
-        )
-        .unwrap();
-    assert!(pending.is_none());
-    assert_eq!(serde_json::to_value(pending).unwrap(), Value::Null);
-    let current = f.work.job(&f.alice, &root.id).unwrap();
-    f.work
-        .handover(
-            &f.alice,
-            &root.id,
-            &HandoverRequest {
-                expected_revision: current.revision,
-                new_assignee_id: f.bob.user_id.clone(),
-            },
-            41,
-        )
-        .unwrap();
     (f, attempt)
 }
 
 #[test]
-fn invalidated_approval_reconfirms_without_settling_handover_or_releasing_capacity() {
-    let (mut f, attempt) = pending_handover();
+fn expired_approval_parks_exact_operation_without_refusal_or_periodic_reissue() {
+    let (mut f, attempt) = expired_approval();
     let queued = f.submit("parent", "second-user-work", 0);
     let before = f.work.job(&f.alice, &attempt.job.id).unwrap();
     f.reopen();
-    for now in [42, 43] {
+    for now in [1000, 2000, 73 * 60 * 60 * 1000] {
+        assert!(
+            f.work
+                .consume_approval(
+                    "WinC",
+                    "old-approval",
+                    &attempt.attempt_id,
+                    attempt.generation,
+                    now
+                )
+                .unwrap()
+                .is_none()
+        );
+        let approval = f
+            .work
+            .approval(&f.alice, &attempt.job.id, now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(approval.id, "old-approval");
+        assert_eq!(approval.status, "expired");
+        assert!(!approval.can_decide);
+        assert!(approval.can_reconfirm);
+        assert!(
+            f.work
+                .decide_approval(
+                    &f.alice,
+                    &attempt.job.id,
+                    "old-approval",
+                    ApprovalDecision::Approve,
+                    now
+                )
+                .is_err()
+        );
+        assert!(
+            f.work
+                .authorize_effect(
+                    "WinC",
+                    &attempt.attempt_id,
+                    attempt.generation,
+                    attempt.authority_generation,
+                    Some("old-approval"),
+                    now
+                )
+                .is_err()
+        );
+    }
+    assert!(
+        f.work
+            .report(
+                "WinC",
+                &Report {
+                    event_id: "automatic-reissue".into(),
+                    attempt_id: attempt.attempt_id.clone(),
+                    generation: attempt.generation,
+                    outcome: ReportOutcome::ApprovalRequested {
+                        approval_id: "unsolicited-new-id".into(),
+                        request: json!({}),
+                        expires_at_ms: 73 * 60 * 60 * 1000 + 1000
+                    },
+                },
+                73 * 60 * 60 * 1000
+            )
+            .is_err(),
+        "expiry alone must not authorize a new approval ID"
+    );
+    let current = f.work.job(&f.alice, &attempt.job.id).unwrap();
+    assert_eq!(current.state, JobState::Running);
+    assert_eq!(current.revision, before.revision);
+    assert_eq!(current.assignee_id, f.alice.user_id);
+    assert!(!f.work.assignments("WinC").unwrap()[0].stop_requested);
+    assert!(f.work.claim("WinC", 73 * 60 * 60 * 1000).unwrap().is_none());
+    assert_eq!(
+        f.work.job(&f.alice, &queued.id).unwrap().state,
+        JobState::Queued
+    );
+    assert_eq!(
+        f.work
+            .db
+            .query_row("SELECT COUNT(*) FROM shared_approvals", [], |r| r
+                .get::<_, u64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn origin_revisit_reissues_once_and_only_fresh_exact_choice_authorizes_effect() {
+    for approved_but_not_consumed in [false, true] {
+        let (mut f, attempt) = expired_approval();
+        if approved_but_not_consumed {
+            f.work
+                .decide_approval(
+                    &f.alice,
+                    &attempt.job.id,
+                    "old-approval",
+                    ApprovalDecision::Approve,
+                    999,
+                )
+                .unwrap();
+        }
+        assert!(
+            f.work
+                .consume_approval(
+                    "WinC",
+                    "old-approval",
+                    &attempt.attempt_id,
+                    attempt.generation,
+                    1000
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            f.work
+                .reconfirm_expired_approval_for_device(
+                    &f.bob,
+                    &attempt.job.id,
+                    "old-approval",
+                    1000,
+                    None
+                )
+                .is_err()
+        );
+        assert!(
+            f.work
+                .reconfirm_expired_approval_for_device(
+                    &f.alice,
+                    &attempt.job.id,
+                    "old-approval",
+                    999,
+                    None
+                )
+                .is_err()
+        );
+        for now in [1000, 1001] {
+            f.work
+                .reconfirm_expired_approval_for_device(
+                    &f.alice,
+                    &attempt.job.id,
+                    "old-approval",
+                    now,
+                    None,
+                )
+                .unwrap();
+        }
+        f.reopen();
         let reply = f
             .work
             .consume_approval(
@@ -56,7 +177,7 @@ fn invalidated_approval_reconfirms_without_settling_handover_or_releasing_capaci
                 "old-approval",
                 &attempt.attempt_id,
                 attempt.generation,
-                now,
+                1002,
             )
             .unwrap()
             .unwrap();
@@ -64,166 +185,51 @@ fn invalidated_approval_reconfirms_without_settling_handover_or_releasing_capaci
             serde_json::to_value(reply).unwrap(),
             json!({"approval_id":"old-approval","reconfirmation_required":true})
         );
-    }
-    let current = f.work.job(&f.alice, &attempt.job.id).unwrap();
-    assert_eq!(current.state, JobState::Running);
-    assert_eq!(current.assignee_id, f.alice.user_id);
-    assert_eq!(current.authority_generation, attempt.authority_generation);
-    assert_eq!(current.revision, before.revision);
-    assert!(
-        f.work
-            .handover_view(&f.alice, &current.id)
+        let old = f
+            .work
+            .approval(&f.alice, &attempt.job.id, 1002)
             .unwrap()
-            .pending
-            .is_some()
-    );
-    assert!(f.work.claim("WinC", 43).unwrap().is_none());
-    assert_eq!(
-        f.work.job(&f.alice, &queued.id).unwrap().state,
-        JobState::Queued
-    );
-    let old = f.work.approval(&f.alice, &current.id, 43).unwrap().unwrap();
-    assert_eq!(old.status, "cancelled");
-    assert!(!old.can_decide);
-    assert!(
+            .unwrap();
+        f.work
+            .report(
+                "WinC",
+                &Report {
+                    event_id: "replacement".into(),
+                    attempt_id: attempt.attempt_id.clone(),
+                    generation: attempt.generation,
+                    outcome: ReportOutcome::ApprovalRequested {
+                        approval_id: "new-approval".into(),
+                        request: old.request,
+                        expires_at_ms: 2000,
+                    },
+                },
+                1003,
+            )
+            .unwrap();
         f.work
             .decide_approval(
                 &f.alice,
-                &current.id,
-                "old-approval",
-                ApprovalDecision::Approve,
-                43
-            )
-            .is_err()
-    );
-    assert!(
-        f.work
-            .authorize_effect(
-                "WinC",
-                &attempt.attempt_id,
-                attempt.generation,
-                attempt.authority_generation,
-                Some("old-approval"),
-                43
-            )
-            .is_err()
-    );
-
-    f.work
-        .report(
-            "WinC",
-            &Report {
-                event_id: "new-request".into(),
-                attempt_id: attempt.attempt_id.clone(),
-                generation: attempt.generation,
-                outcome: ReportOutcome::ApprovalRequested {
-                    approval_id: "new-approval".into(),
-                    request: old.request,
-                    expires_at_ms: 1000,
-                },
-            },
-            44,
-        )
-        .unwrap();
-    assert!(
-        f.work
-            .decide_approval(
-                &f.bob,
-                &current.id,
+                &attempt.job.id,
                 "new-approval",
                 ApprovalDecision::Approve,
-                45
+                1004,
             )
-            .is_err()
-    );
-    f.work
-        .decide_approval(
-            &f.alice,
-            &current.id,
-            "new-approval",
-            ApprovalDecision::Approve,
-            45,
-        )
-        .unwrap();
-    let answer = f
-        .work
-        .consume_approval(
-            "WinC",
-            "new-approval",
-            &attempt.attempt_id,
-            attempt.generation,
-            46,
-        )
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        serde_json::to_value(answer).unwrap(),
-        json!({"approval_id":"new-approval","decision":"approve"})
-    );
-    f.work
-        .authorize_effect(
-            "WinC",
-            &attempt.attempt_id,
-            attempt.generation,
-            attempt.authority_generation,
-            Some("new-approval"),
-            46,
-        )
-        .unwrap();
-    assert!(
-        f.work
-            .authorize_effect(
-                "WinC",
-                &attempt.attempt_id,
-                attempt.generation,
-                attempt.authority_generation,
-                Some("old-approval"),
-                46
-            )
-            .is_err()
-    );
-
-    f.work
-        .report(
-            "WinC",
-            &Report {
-                event_id: "safe-yield".into(),
-                attempt_id: attempt.attempt_id.clone(),
-                generation: attempt.generation,
-                outcome: child(),
-            },
-            47,
-        )
-        .unwrap();
-    let transferred = f.work.job(&f.bob, &current.id).unwrap();
-    assert_eq!(transferred.assignee_id, f.bob.user_id);
-    assert_eq!(
-        transferred.authority_generation,
-        attempt.authority_generation + 1
-    );
-    assert_eq!(transferred.state, JobState::WaitingChild);
-    assert!(
-        f.work
-            .handover_view(&f.bob, &current.id)
-            .unwrap()
-            .pending
-            .is_none()
-    );
-    let child = f.work.claim("WinE", 48).unwrap().unwrap();
-    assert_eq!(child.job.assignee_id, f.bob.user_id);
-    assert_eq!(child.authority_generation, transferred.authority_generation);
-    assert!(
-        f.work
+            .unwrap();
+        let reply = f
+            .work
             .consume_approval(
                 "WinC",
-                "old-approval",
+                "new-approval",
                 &attempt.attempt_id,
                 attempt.generation,
-                48
+                1005,
             )
-            .is_err()
-    );
-    assert!(
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(reply).unwrap(),
+            json!({"approval_id":"new-approval","decision":"approve"})
+        );
         f.work
             .authorize_effect(
                 "WinC",
@@ -231,55 +237,60 @@ fn invalidated_approval_reconfirms_without_settling_handover_or_releasing_capaci
                 attempt.generation,
                 attempt.authority_generation,
                 Some("new-approval"),
-                48
+                1005,
             )
-            .is_err()
-    );
+            .unwrap();
+        assert!(
+            f.work
+                .authorize_effect(
+                    "WinC",
+                    &attempt.attempt_id,
+                    attempt.generation,
+                    attempt.authority_generation,
+                    Some("old-approval"),
+                    1005
+                )
+                .is_err()
+        );
+        assert_eq!(
+            f.work.job(&f.alice, &attempt.job.id).unwrap().state,
+            JobState::Running
+        );
+    }
 }
 
 #[test]
-fn reconfirmation_requires_exact_request_attempt_runner_generation_and_live_deadline() {
-    let (mut f, attempt) = pending_handover();
-    for (runner, approval, attempt_id, generation, now) in [
+fn parked_approval_still_requires_exact_request_attempt_runner_and_generation() {
+    let (mut f, attempt) = expired_approval();
+    for (runner, approval, attempt_id, generation) in [
         (
             "WinE",
             "old-approval",
             attempt.attempt_id.as_str(),
             attempt.generation,
-            42,
         ),
         (
             "WinC",
             "missing-approval",
             attempt.attempt_id.as_str(),
             attempt.generation,
-            42,
         ),
         (
             "WinC",
             "old-approval",
             "another-attempt",
             attempt.generation,
-            42,
         ),
         (
             "WinC",
             "old-approval",
             attempt.attempt_id.as_str(),
             attempt.generation + 1,
-            42,
-        ),
-        (
-            "WinC",
-            "old-approval",
-            attempt.attempt_id.as_str(),
-            attempt.generation,
-            1000,
         ),
     ] {
         assert!(
             f.work
-                .consume_approval(runner, approval, attempt_id, generation, now)
+                .consume_approval(runner, approval, attempt_id, generation, 1000)
                 .is_err()
         );
     }
@@ -287,7 +298,6 @@ fn reconfirmation_requires_exact_request_attempt_runner_generation_and_live_dead
         f.work.attempt("WinC", &attempt.attempt_id).unwrap().state,
         "running"
     );
-    assert!(f.work.claim("WinC", 1000).unwrap().is_none());
 }
 
 #[test]
@@ -300,10 +310,19 @@ fn reconfirmation_rejects_cancellation_uncertainty_terminal_and_revoked_authorit
         "archive",
         "environment",
     ] {
-        let (mut f, attempt) = pending_handover();
+        let (mut f, attempt) = expired_approval();
+        f.work
+            .reconfirm_expired_approval_for_device(
+                &f.alice,
+                &attempt.job.id,
+                "old-approval",
+                1000,
+                None,
+            )
+            .unwrap();
         match change {
             "cancel" => {
-                f.work.cancel(&f.alice, &attempt.job.id, 42).unwrap();
+                f.work.cancel(&f.alice, &attempt.job.id, 1001).unwrap();
             }
             "uncertain" => {
                 f.work
@@ -317,7 +336,7 @@ fn reconfirmation_rejects_cancellation_uncertainty_terminal_and_revoked_authorit
                                 reason: "Worker state unavailable".into(),
                             },
                         },
-                        42,
+                        1001,
                     )
                     .unwrap();
             }
@@ -331,7 +350,7 @@ fn reconfirmation_rejects_cancellation_uncertainty_terminal_and_revoked_authorit
                             generation: attempt.generation,
                             outcome: finished(),
                         },
-                        42,
+                        1001,
                     )
                     .unwrap();
             }
@@ -342,7 +361,7 @@ fn reconfirmation_rejects_cancellation_uncertainty_terminal_and_revoked_authorit
                     "alpha",
                     &f.alice.user_id,
                     Some(ProjectRole::Reader),
-                    42,
+                    1001,
                 )
                 .unwrap();
             }
@@ -371,7 +390,7 @@ fn reconfirmation_rejects_cancellation_uncertainty_terminal_and_revoked_authorit
                         .into(),
                     request,
                 };
-                f.work.manage(&f.admin, &command, 42).unwrap();
+                f.work.manage(&f.admin, &command, 1001).unwrap();
             }
             _ => unreachable!(),
         }
@@ -382,7 +401,7 @@ fn reconfirmation_rejects_cancellation_uncertainty_terminal_and_revoked_authorit
                     "old-approval",
                     &attempt.attempt_id,
                     attempt.generation,
-                    43
+                    1002
                 )
                 .is_err(),
             "{change} must not reissue approval"
@@ -395,10 +414,45 @@ fn reconfirmation_rejects_cancellation_uncertainty_terminal_and_revoked_authorit
                     attempt.generation,
                     attempt.authority_generation,
                     Some("old-approval"),
-                    43
+                    1002
                 )
                 .is_err(),
             "{change} must not authorize the old approval"
         );
     }
+}
+#[test]
+fn expired_unconsumed_child_permission_remains_visible_from_parent_for_reconfirmation() {
+    let mut f = Fixture::new();
+    let root = f.submit("parent", "parent", 1);
+    let parent = f.work.claim("WinC", 11).unwrap().unwrap();
+    f.report(&parent, "start", ReportOutcome::Started);
+    f.report(&parent, "yield", child());
+    let child = f.work.claim("WinE", 21).unwrap().unwrap();
+    f.report(&child, "start", ReportOutcome::Started);
+    request_approval(&mut f, &child, "child-approval");
+    f.work
+        .decide_approval(
+            &f.alice,
+            &child.job.id,
+            "child-approval",
+            ApprovalDecision::Approve,
+            999,
+        )
+        .unwrap();
+    assert!(
+        f.work
+            .approval_exact_for_device(&f.alice, &root.id, 1000, None)
+            .unwrap()
+            .is_none()
+    );
+    let view = f
+        .work
+        .approval_for_device(&f.alice, &root.id, 1000, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(view.id, "child-approval");
+    assert_eq!(view.context.job_id, child.job.id);
+    assert!(view.can_reconfirm);
+    assert!(!view.can_decide);
 }

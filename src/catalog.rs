@@ -2,9 +2,10 @@ use crate::protocol::{Availability, HubError};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 pub const MAX_CATALOG_ENTRIES: usize = 1024;
 pub const MAX_LOGICAL_MODELS: usize = 128;
+pub const MAX_MODEL_SYSTEM_PROMPT_CHARS: usize = 16_384;
 const MAX_CHANGES: usize = 64;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -13,6 +14,9 @@ pub struct LogicalModel {
     pub id: String,
     pub label: String,
     pub capabilities: BTreeSet<String>,
+    /// Reviewed model-level instructions, composed by supported clients on every request.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub system_prompt: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -126,9 +130,17 @@ impl CatalogStore {
             .deployments
             .iter()
             .all(|deployment| deployment.upstream_credential_id.is_none());
-        let legacy = no_credentials
-            && (self.schema_version == 2
-                || (self.schema_version == 1 && self.catalog.team_default_model_id.is_none()));
+        let no_model_prompts = self
+            .catalog
+            .models
+            .iter()
+            .all(|model| model.system_prompt.is_empty());
+        let legacy = no_model_prompts
+            && (self.schema_version == 3
+                || (no_credentials
+                    && (self.schema_version == 2
+                        || (self.schema_version == 1
+                            && self.catalog.team_default_model_id.is_none()))));
         if (!legacy && self.schema_version != SCHEMA_VERSION) || self.revision == 0 {
             return Err(invalid("unsupported schema or invalid revision"));
         }
@@ -260,6 +272,11 @@ impl Catalog {
         unique_ids(self.deployments.iter().map(|value| value.id.as_str()))?;
         for model in &self.models {
             valid_text(&model.label, 256)?;
+            if normalize_model_system_prompt(&model.system_prompt)? != model.system_prompt {
+                return Err(invalid(
+                    "model system prompt must not have surrounding whitespace",
+                ));
+            }
             if model.capabilities.len() > 32 {
                 return Err(invalid("too many capabilities"));
             }
@@ -319,6 +336,14 @@ impl Catalog {
         }
         Ok(())
     }
+}
+
+pub fn normalize_model_system_prompt(value: &str) -> Result<String, HubError> {
+    let value = value.trim();
+    if value.chars().count() > MAX_MODEL_SYSTEM_PROMPT_CHARS {
+        return Err(invalid("model system prompt exceeds 16384 characters"));
+    }
+    Ok(value.to_owned())
 }
 
 fn unique_ids<'a>(values: impl Iterator<Item = &'a str>) -> Result<BTreeSet<&'a str>, HubError> {

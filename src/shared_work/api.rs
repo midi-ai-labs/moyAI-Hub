@@ -90,6 +90,10 @@ pub(crate) fn router_with_web_access(
         )
         .route("/v1/shared/jobs/{id}/approval", get(approval))
         .route(
+            "/v1/shared/jobs/{job_id}/approvals/{approval_id}/reconfirm",
+            post(reconfirm_approval),
+        )
+        .route(
             "/v1/shared/jobs/{job_id}/approvals/{approval_id}/decision",
             post(decide_approval),
         )
@@ -191,6 +195,12 @@ async fn retired_authentication() -> (StatusCode, Json<Value>) {
 enum DeviceAccess {
     Current,
     NewUsage,
+    Effect {
+        attempt_id: String,
+    },
+    Progress {
+        attempt_id: String,
+    },
     Settlement,
     Environment(String),
     ForwardedActor(String),
@@ -238,7 +248,9 @@ impl DeviceAccess {
                 .map_err(|_| WorkError::Forbidden)?;
         }
         let target = match self {
-            Self::NewUsage => Some(device.device_id.as_str()),
+            Self::NewUsage | Self::Effect { .. } | Self::Progress { .. } => {
+                Some(device.device_id.as_str())
+            }
             Self::Controller {
                 new_usage: true, ..
             } => Some(device.device_id.as_str()),
@@ -271,6 +283,7 @@ pub(crate) fn error(e: WorkError) -> (StatusCode, Json<Value>) {
         {
             StatusCode::CONFLICT
         }
+        WorkError::Retired => StatusCode::GONE,
         WorkError::NotFound => StatusCode::NOT_FOUND,
         WorkError::Capacity | WorkError::Identity(IdentityError::Limit) => {
             StatusCode::TOO_MANY_REQUESTS
@@ -336,6 +349,21 @@ async fn operation_with_network<T: Serialize + Send + 'static>(
             .lock()
             .map_err(|_| IdentityError::Unavailable)?;
         access.verify(&network, &device)?;
+        if let DeviceAccess::Effect { attempt_id } | DeviceAccess::Progress { attempt_id } = &access {
+            let attempt = store.attempt(&device.device_id, attempt_id)?;
+            let controller: Option<String> = store.db.query_row(
+                "SELECT COALESCE(controller_device_id,origin_device_id) FROM shared_jobs WHERE id=?1",
+                [&attempt.assignment.job.id], |row| row.get(0),
+            )?;
+            if let Some(controller) = controller {
+                // Network revocation is owned by the device registry, not the
+                // person's project role. Check it while the same network lock
+                // also protects delivery/admission. Mere offline presence is
+                // deliberately not a revocation signal.
+                network.admission_revision(&controller, crate::service::now_ms())
+                    .map_err(|_| WorkError::Forbidden)?;
+            }
+        }
         if let DeviceAccess::Controller { target, .. } = &access {
             use rusqlite::OptionalExtension;
             let project = match target {
@@ -366,7 +394,9 @@ async fn operation_with_network<T: Serialize + Send + 'static>(
             };
             store.require_project_controller(&project, &device.device_id)?;
         }
-        store.expire_start_deadlines(crate::service::now_ms())?;
+        if !matches!(access, DeviceAccess::Progress { .. }) {
+            store.expire_start_deadlines(crate::service::now_ms())?;
+        }
         let result = execute(&mut store, &network);
         drop(network);
         result
@@ -546,6 +576,7 @@ async fn project_conversations(
     Extension(device): Extension<DeviceIdentity>,
     Path(project): Path<String>,
 ) -> ApiResult<Value> {
+    let caller = device.device_id.clone();
     authenticated(
         state,
         headers,
@@ -554,7 +585,11 @@ async fn project_conversations(
             target: ControllerTarget::Project(project.clone()),
             new_usage: false,
         },
-        move |store, actor| store.list_project_conversations(&actor, &project),
+        move |store, actor| {
+            let mut listing = store.list_project_conversations(&actor, &project)?;
+            store.restrict_conversations_to_origin(&actor, &project, &caller, &mut listing)?;
+            Ok(listing)
+        },
     )
     .await
 }
@@ -609,6 +644,7 @@ async fn delete_conversation(
     Path(conversation): Path<String>,
     Json(input): Json<DeleteConversation>,
 ) -> ApiResult<Value> {
+    let caller = device.device_id.clone();
     authenticated(
         state,
         headers,
@@ -619,6 +655,18 @@ async fn delete_conversation(
         },
         move |store, actor| {
             store::id(&input.request_id)?;
+            if super::conversation_catalog::deletion_pending(
+                &store.db,
+                &input.project_id,
+                &conversation,
+            )? {
+                store.require_conversation_origin(
+                    &actor,
+                    &input.project_id,
+                    &conversation,
+                    &caller,
+                )?;
+            }
             store.delete_project_conversation(
                 &actor,
                 &input.project_id,
@@ -721,6 +769,7 @@ async fn status(
                     .map(str::to_owned);
             }
             for job in &mut status.jobs {
+                store.restrict_summary_to_origin(&actor, &caller, job)?;
                 let runner: String = store.db.query_row(
                     "SELECT runner_id FROM shared_environments WHERE id=?1",
                     [&job.environment_id],
@@ -764,6 +813,7 @@ async fn detail(
     Extension(device): Extension<DeviceIdentity>,
     Path(id): Path<String>,
 ) -> ApiResult<Value> {
+    let caller = device.device_id.clone();
     authenticated(
         state,
         headers,
@@ -772,7 +822,11 @@ async fn detail(
             target: ControllerTarget::Job(id.clone()),
             new_usage: false,
         },
-        move |store, actor| store.job_detail(&actor, &id),
+        move |store, actor| {
+            let mut detail = store.job_detail(&actor, &id)?;
+            store.restrict_detail_to_origin(&actor, &caller, &mut detail)?;
+            Ok(detail)
+        },
     )
     .await
 }
@@ -937,6 +991,7 @@ async fn conversation_history(
     Path(conversation): Path<String>,
     Query(input): Query<ConversationHistoryQuery>,
 ) -> ApiResult<ConversationHistoryPage> {
+    let caller = device.device_id.clone();
     authenticated_with_network(
         state,
         headers,
@@ -956,6 +1011,7 @@ async fn conversation_history(
                 crate::service::now_ms(),
             )?;
             for turn in &mut page.jobs {
+                store.restrict_summary_to_origin(&actor, &caller, &mut turn.job)?;
                 let runner: String = store.db.query_row(
                     "SELECT runner_id FROM shared_environments WHERE id=?1",
                     [&turn.job.environment_id],
@@ -1000,6 +1056,7 @@ async fn cancel(
     Extension(device): Extension<DeviceIdentity>,
     Path(id): Path<String>,
 ) -> ApiResult<Job> {
+    let caller = device.device_id.clone();
     authenticated(
         state,
         headers,
@@ -1008,18 +1065,29 @@ async fn cancel(
             target: ControllerTarget::Job(id.clone()),
             new_usage: false,
         },
-        move |store, actor| store.cancel(&actor, &id, crate::service::now_ms()),
+        move |store, actor| {
+            store.require_job_origin(&actor, &id, &caller)?;
+            store.cancel(&actor, &id, crate::service::now_ms())
+        },
     )
     .await
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovalQuery {
+    #[serde(default)]
+    include_descendants: bool,
+}
 async fn approval(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Extension(device): Extension<DeviceIdentity>,
     Path(id): Path<String>,
+    Query(query): Query<ApprovalQuery>,
 ) -> ApiResult<Option<ApprovalView>> {
-    authenticated(
+    let caller = device.device_id.clone();
+    authenticated_with_network(
         state,
         headers,
         device,
@@ -1027,10 +1095,55 @@ async fn approval(
             target: ControllerTarget::Job(id.clone()),
             new_usage: false,
         },
-        move |store, actor| store.approval(&actor, &id, crate::service::now_ms()),
+        move |store, actor, network| {
+            let mut view = if query.include_descendants {
+                store.approval_for_device(&actor, &id, crate::service::now_ms(), Some(&caller))?
+            } else {
+                store.approval_exact_for_device(
+                    &actor,
+                    &id,
+                    crate::service::now_ms(),
+                    Some(&caller),
+                )?
+            };
+            if let Some(approval) = &mut view {
+                approval.context.label_devices(network);
+            }
+            Ok(view)
+        },
     )
     .await
 }
+async fn reconfirm_approval(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Extension(device): Extension<DeviceIdentity>,
+    Path((job_id, approval_id)): Path<(String, String)>,
+) -> ApiResult<ApprovalView> {
+    let caller = device.device_id.clone();
+    authenticated_with_network(
+        state,
+        headers,
+        device,
+        DeviceAccess::Controller {
+            target: ControllerTarget::Job(job_id.clone()),
+            new_usage: true,
+        },
+        move |store, actor, network| {
+            let mut approval = store.reconfirm_expired_approval_for_device(
+                &actor,
+                &job_id,
+                &approval_id,
+                crate::service::now_ms(),
+                Some(&caller),
+            )?;
+            approval.context.label_devices(network);
+            Ok(approval)
+        },
+    )
+    .await
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DecideApproval {
@@ -1043,7 +1156,8 @@ async fn decide_approval(
     Path((job_id, approval_id)): Path<(String, String)>,
     Json(input): Json<DecideApproval>,
 ) -> ApiResult<ApprovalView> {
-    authenticated(
+    let caller = device.device_id.clone();
+    authenticated_with_network(
         state,
         headers,
         device,
@@ -1051,14 +1165,17 @@ async fn decide_approval(
             target: ControllerTarget::Job(job_id.clone()),
             new_usage: true,
         },
-        move |store, actor| {
-            store.decide_approval(
+        move |store, actor, network| {
+            let mut approval = store.decide_approval_for_device(
                 &actor,
                 &job_id,
                 &approval_id,
                 input.decision,
                 crate::service::now_ms(),
-            )
+                Some(&caller),
+            )?;
+            approval.context.label_devices(network);
+            Ok(approval)
         },
     )
     .await
@@ -1078,7 +1195,9 @@ async fn consume_approval(
     operation(
         state,
         device.clone(),
-        DeviceAccess::NewUsage,
+        DeviceAccess::Effect {
+            attempt_id: input.attempt_id.clone(),
+        },
         move |store| {
             store.consume_approval(
                 &device.device_id,
@@ -1105,10 +1224,21 @@ fn runner_capability(headers: &HeaderMap) -> Result<Option<&'static str>> {
     if value.len() > 1024 {
         return Err(WorkError::Invalid);
     }
-    Ok(value
-        .split(',')
-        .any(|name| name.trim() == store::MULTI_DEVICE_SESSION_CAPABILITY)
-        .then_some(store::MULTI_DEVICE_SESSION_CAPABILITY))
+    Ok(
+        if value
+            .split(',')
+            .any(|name| name.trim() == store::MULTI_DEVICE_SESSION_CAPABILITY)
+        {
+            Some(store::MULTI_DEVICE_SESSION_CAPABILITY)
+        } else if value
+            .split(',')
+            .any(|name| name.trim() == "multi_device_session_v1")
+        {
+            Some("multi_device_session_v1")
+        } else {
+            None
+        },
+    )
 }
 fn label_candidates(assignment: &mut Assignment, network: &crate::network::DeviceNetwork) {
     for candidate in &mut assignment.allowed_child_candidates {
@@ -1165,7 +1295,11 @@ async fn attempt(
                 .assignment
                 .required_runner_capabilities
                 .iter()
-                .any(|required| Some(required.as_str()) != capability)
+                .any(|required| {
+                    Some(required.as_str()) != capability
+                        && !(capability == Some(store::MULTI_DEVICE_SESSION_CAPABILITY)
+                            && required == "multi_device_session_v1")
+                })
             {
                 return Err(WorkError::NotFound);
             }
@@ -1181,7 +1315,12 @@ async fn report(
     Extension(device): Extension<DeviceIdentity>,
     Json(input): Json<Report>,
 ) -> ApiResult<Job> {
-    let access = if matches!(
+    let progress = matches!(input.outcome, ReportOutcome::Progress { .. });
+    let access = if progress {
+        DeviceAccess::Progress {
+            attempt_id: input.attempt_id.clone(),
+        }
+    } else if matches!(
         input.outcome,
         ReportOutcome::Started
             | ReportOutcome::YieldToChild { .. }
@@ -1194,11 +1333,13 @@ async fn report(
     };
     operation(state, device.clone(), access, move |store| {
         let result = store.report(&device.device_id, &input, crate::service::now_ms())?;
-        store.observe_attempt(
-            &device.device_id,
-            &input.attempt_id,
-            crate::service::now_ms(),
-        )?;
+        if !progress {
+            store.observe_attempt(
+                &device.device_id,
+                &input.attempt_id,
+                crate::service::now_ms(),
+            )?;
+        }
         Ok(result)
     })
     .await
@@ -1253,6 +1394,7 @@ async fn project_services(
     Extension(device): Extension<DeviceIdentity>,
     Query(query): Query<ServiceQuery>,
 ) -> ApiResult<Vec<ServiceLeaseView>> {
+    let caller = device.device_id.clone();
     authenticated(
         state,
         headers,
@@ -1262,12 +1404,18 @@ async fn project_services(
             new_usage: false,
         },
         move |store, actor| {
-            store.project_services(
+            let mut services = store.project_services(
                 &actor,
                 &query.project_id,
                 query.conversation_id.as_deref(),
                 crate::service::now_ms(),
-            )
+            )?;
+            for service in &mut services {
+                service.can_stop &= store
+                    .require_service_origin(&actor, &service.service_id, &caller)
+                    .is_ok();
+            }
+            Ok(services)
         },
     )
     .await
@@ -1321,6 +1469,7 @@ async fn service_stop(
     Extension(device): Extension<DeviceIdentity>,
     Path(id): Path<String>,
 ) -> ApiResult<ServiceLeaseView> {
+    let caller = device.device_id.clone();
     authenticated(
         state,
         headers,
@@ -1329,7 +1478,10 @@ async fn service_stop(
             target: ControllerTarget::Service(id.clone()),
             new_usage: false,
         },
-        move |store, actor| store.request_service_stop(&actor, &id, crate::service::now_ms()),
+        move |store, actor| {
+            store.require_service_origin(&actor, &id, &caller)?;
+            store.request_service_stop(&actor, &id, crate::service::now_ms())
+        },
     )
     .await
 }
@@ -1346,6 +1498,7 @@ async fn stop_conversation_services(
     Path(conversation_id): Path<String>,
     Json(input): Json<StopConversationServices>,
 ) -> ApiResult<Value> {
+    let caller = device.device_id.clone();
     authenticated(
         state,
         headers,
@@ -1355,6 +1508,12 @@ async fn stop_conversation_services(
             new_usage: false,
         },
         move |store, actor| {
+            store.require_conversation_origin(
+                &actor,
+                &input.project_id,
+                &conversation_id,
+                &caller,
+            )?;
             store.request_conversation_services_stop(
                 &actor,
                 &input.project_id,
@@ -1373,6 +1532,7 @@ async fn stop_project_conversation(
     Path(conversation): Path<String>,
     Json(input): Json<StopConversationServices>,
 ) -> ApiResult<Value> {
+    let caller = device.device_id.clone();
     authenticated(
         state,
         headers,
@@ -1382,6 +1542,7 @@ async fn stop_project_conversation(
             new_usage: false,
         },
         move |store, actor| {
+            store.require_conversation_origin(&actor, &input.project_id, &conversation, &caller)?;
             store.stop_project_conversation(
                 &actor,
                 &input.project_id,

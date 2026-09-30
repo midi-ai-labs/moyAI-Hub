@@ -83,7 +83,11 @@ for (const name of ["pointerup", "pointercancel", "lostpointercapture"]) {
         queueMicrotask(flush);
     }, true);
 }
-document.addEventListener("keydown", event => keys.add(event.code), true);
+document.addEventListener("keydown", event => {
+    // Native select popups can consume keyup (for example Alt+ArrowDown).
+    // Select focus already protects its options; do not retain a second lock.
+    if (!(event.target instanceof HTMLSelectElement)) keys.add(event.code);
+}, true);
 document.addEventListener("keyup", event => {
     keys.delete(event.code);
     queueMicrotask(flush);
@@ -142,6 +146,15 @@ function render(next: Snapshot) {
     el("gateway-summary").classList.toggle("attention", execution.attention);
     setText("hub-identity", `Hub ${next.store.hub_id}`);
     options("logical-model", models, "新しいモデルとして登録");
+    const selectedLogicalModel = models.find(model => model.id === select("logical-model").value);
+    const modelPromptField = el<HTMLTextAreaElement>("model-system-prompt");
+    if (selectedLogicalModel) {
+        modelPromptField.readOnly = true;
+        modelPromptField.value = selectedLogicalModel.system_prompt ?? "";
+    } else if (modelPromptField.readOnly) {
+        modelPromptField.readOnly = false;
+        modelPromptField.value = "";
+    }
     options("capacity-pool", pools, "このホストに新しいグループを作成");
     reconcileModelRows(el<HTMLTableSectionElement>("model-rows"), next.deployments.map(row => {
         const d = row.deployment;
@@ -299,6 +312,12 @@ select("model").addEventListener("change", () => {
     if (model && !input("label").value.trim())
         input("label").value = model.label;
 });
+select("logical-model").addEventListener("change", () => {
+    const model = snapshot?.store.catalog.models.find(model => model.id === select("logical-model").value);
+    const field = el<HTMLTextAreaElement>("model-system-prompt");
+    field.readOnly = Boolean(model);
+    field.value = model?.system_prompt ?? "";
+});
 select("capacity-pool").addEventListener("change", () => {
     input("capacity").disabled = Boolean(select("capacity-pool").value);
 });
@@ -317,6 +336,7 @@ el<HTMLFormElement>("register-form").addEventListener("submit", async (event) =>
                 provider_profile: select("profile").value,
                 model_id: select("model").value,
                 label: input("label").value,
+                system_prompt: select("logical-model").value ? null : el<HTMLTextAreaElement>("model-system-prompt").value,
                 logical_model_id: select("logical-model").value || null,
                 capacity_pool_id: select("capacity-pool").value || null,
                 capacity: Number(input("capacity").value),
@@ -327,6 +347,8 @@ el<HTMLFormElement>("register-form").addEventListener("submit", async (event) =>
         if (discoveryOwner.accepts(generation)) {
             select("model").value = "";
             input("label").value = "";
+            if (!select("logical-model").value)
+                el<HTMLTextAreaElement>("model-system-prompt").value = "";
             input("allow-tools").checked = false;
             if (input("api-key").value) {
                 input("api-key").value = "";
@@ -414,6 +436,7 @@ el("model-rows").addEventListener("click", event => {
         revision: snapshot.store.revision
     };
     input("edit-label").value = row.deployment.label;
+    el<HTMLTextAreaElement>("edit-system-prompt").value = snapshot.store.catalog.models.find(model => model.id === row.deployment.logical_model_id)?.system_prompt ?? "";
     input("edit-api-key").value = "";
     input("edit-api-key").disabled = false;
     input("edit-api-key").placeholder = row.deployment.upstream_credential_id ? "変更する場合だけ入力" : "APIキーを入力";
@@ -456,6 +479,7 @@ async function saveEdit(remove: boolean) {
                 revision: editTarget.revision,
                 deployment_id: editTarget.row.deployment.id,
                 label: input("edit-label").value,
+                system_prompt: remove ? null : el<HTMLTextAreaElement>("edit-system-prompt").value,
                 capacity: Number(input("edit-capacity").value),
                 enabled: input("edit-enabled").checked,
                 api_key: remove ? null : input("edit-api-key-clear").checked ? "" : input("edit-api-key").value || null,

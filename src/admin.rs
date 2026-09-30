@@ -465,6 +465,8 @@ struct Register {
     capacity: u32,
     #[serde(default)]
     allow_tools: bool,
+    #[serde(default)]
+    system_prompt: Option<String>,
 }
 fn hub_register(admin: &Admin, request: Register) -> Result<(), String> {
     let evidence = admin
@@ -495,6 +497,12 @@ fn hub_register(admin: &Admin, request: Register) -> Result<(), String> {
     if request.allow_tools {
         model.capabilities.insert("tools".into());
     }
+    let system_prompt = request
+        .system_prompt
+        .as_deref()
+        .map(crate::catalog::normalize_model_system_prompt)
+        .transpose()
+        .map_err(|error| error.to_string())?;
     let deployment_id = ulid::Ulid::new().to_string();
     let directory = admin.path.parent().ok_or("保存先がありません。")?;
     let mut created_credential = None;
@@ -518,6 +526,12 @@ fn hub_register(admin: &Admin, request: Register) -> Result<(), String> {
                         .into(),
                 );
             }
+            if system_prompt
+                .as_ref()
+                .is_some_and(|prompt| prompt != &existing.system_prompt)
+            {
+                return Err("既存の論理モデルのシステムプロンプトは、登録済みモデルの編集画面から変更してください。".into());
+            }
             id
         } else {
             let id = ulid::Ulid::new().to_string();
@@ -525,6 +539,7 @@ fn hub_register(admin: &Admin, request: Register) -> Result<(), String> {
                 id: id.clone(),
                 label: request.label.trim().to_owned(),
                 capabilities: model.capabilities.clone(),
+                system_prompt: system_prompt.clone().unwrap_or_default(),
             });
             id
         };
@@ -596,6 +611,9 @@ struct Edit {
     /// Missing/null preserves the saved key; empty explicitly clears it.
     #[serde(default)]
     api_key: Option<String>,
+    /// Omitted preserves instructions shared by this logical model's deployments.
+    #[serde(default)]
+    system_prompt: Option<String>,
 }
 fn hub_edit(admin: &Admin, request: Edit) -> Result<(), String> {
     let directory = admin.path.parent().ok_or("保存先がありません。")?;
@@ -638,6 +656,15 @@ fn hub_edit(admin: &Admin, request: Edit) -> Result<(), String> {
                 .ok_or("配置がありません。")?;
             target.label = request.label.trim().to_owned();
             target.enabled = request.enabled;
+            if let Some(prompt) = &request.system_prompt {
+                catalog
+                    .models
+                    .iter_mut()
+                    .find(|model| model.id == row.logical_model_id)
+                    .ok_or("論理モデルがありません。")?
+                    .system_prompt = crate::catalog::normalize_model_system_prompt(prompt)
+                    .map_err(|error| error.to_string())?;
+            }
             catalog
                 .capacity_pools
                 .iter_mut()

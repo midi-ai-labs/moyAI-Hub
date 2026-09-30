@@ -137,7 +137,9 @@ impl Fixture {
             .db
             .execute_batch(
                 "
-            DROP TABLE shared_conversation_details;
+            ALTER TABLE shared_projects DROP COLUMN overview;
+            ALTER TABLE shared_jobs DROP COLUMN project_context_json;
+            DROP TABLE shared_attempt_progress; DROP TABLE shared_conversation_details;
             DROP INDEX shared_jobs_controller_participation;
             ALTER TABLE shared_jobs DROP COLUMN controller_device_id;
             ALTER TABLE shared_jobs DROP COLUMN controller_participation_generation; ALTER TABLE shared_jobs DROP COLUMN revises_job_id;
@@ -695,7 +697,8 @@ fn approval_expiry_and_revoked_project_role_never_deliver_an_old_approval() {
                 attempt.generation,
                 1000
             )
-            .is_err()
+            .unwrap()
+            .is_none()
     );
     assert_eq!(
         f.work
@@ -1126,13 +1129,17 @@ fn runner_admission_keeps_every_active_attempt_reachable_for_stop() {
     );
 }
 
+mod approval_controller;
 mod approval_reconfirmation;
 mod completion;
 mod controller_projection;
 mod data_tests;
 mod deadlines;
 mod origin;
+mod origin_control;
 mod participation;
+mod progress;
+mod project_context;
 mod project_setup;
 mod runner_capability;
 mod runner_contact;
@@ -1168,7 +1175,7 @@ fn conversation_id_survives_confirmed_continuations_and_v15_forward_migration() 
     f.work
         .db
         .execute_batch(
-            "DROP TABLE shared_conversation_details; DROP INDEX shared_jobs_controller_participation; ALTER TABLE shared_jobs DROP COLUMN controller_device_id; ALTER TABLE shared_jobs DROP COLUMN controller_participation_generation; ALTER TABLE shared_jobs DROP COLUMN revises_job_id; ALTER TABLE shared_projects DROP COLUMN deleted_at_ms; ALTER TABLE shared_project_devices DROP COLUMN participation_generation; DROP INDEX shared_jobs_origin_turn; DROP INDEX shared_jobs_conversation_history; DROP TABLE shared_project_stop_receipts; DROP TABLE shared_conversation_stop_fences; DROP TABLE shared_origin_turns; DROP TABLE shared_origin_scopes; ALTER TABLE shared_jobs DROP COLUMN origin_turn_revision; ALTER TABLE shared_jobs DROP COLUMN origin_turn_epoch; ALTER TABLE shared_jobs DROP COLUMN origin_turn_ref; DROP INDEX shared_jobs_origin_device; ALTER TABLE shared_jobs DROP COLUMN required_capability; ALTER TABLE shared_jobs DROP COLUMN origin_device_id; ALTER TABLE shared_jobs DROP COLUMN origin_session_ref; DROP TABLE shared_service_leases; DROP INDEX shared_jobs_conversation; DROP TABLE shared_environment_capabilities; ALTER TABLE shared_jobs DROP COLUMN conversation_id; PRAGMA user_version=15;",
+            "ALTER TABLE shared_projects DROP COLUMN overview; ALTER TABLE shared_jobs DROP COLUMN project_context_json; DROP TABLE shared_attempt_progress; DROP TABLE shared_conversation_details; DROP INDEX shared_jobs_controller_participation; ALTER TABLE shared_jobs DROP COLUMN controller_device_id; ALTER TABLE shared_jobs DROP COLUMN controller_participation_generation; ALTER TABLE shared_jobs DROP COLUMN revises_job_id; ALTER TABLE shared_projects DROP COLUMN deleted_at_ms; ALTER TABLE shared_project_devices DROP COLUMN participation_generation; DROP INDEX shared_jobs_origin_turn; DROP INDEX shared_jobs_conversation_history; DROP TABLE shared_project_stop_receipts; DROP TABLE shared_conversation_stop_fences; DROP TABLE shared_origin_turns; DROP TABLE shared_origin_scopes; ALTER TABLE shared_jobs DROP COLUMN origin_turn_revision; ALTER TABLE shared_jobs DROP COLUMN origin_turn_epoch; ALTER TABLE shared_jobs DROP COLUMN origin_turn_ref; DROP INDEX shared_jobs_origin_device; ALTER TABLE shared_jobs DROP COLUMN required_capability; ALTER TABLE shared_jobs DROP COLUMN origin_device_id; ALTER TABLE shared_jobs DROP COLUMN origin_session_ref; DROP TABLE shared_service_leases; DROP INDEX shared_jobs_conversation; DROP TABLE shared_environment_capabilities; ALTER TABLE shared_jobs DROP COLUMN conversation_id; PRAGMA user_version=15;",
         )
         .unwrap();
     f.reopen();
@@ -1205,12 +1212,17 @@ fn omitted_environment_uses_authorized_stable_initial_placement() {
     assert_eq!(on_solver.conversation_id, on_solver.id);
     assert_eq!(
         f.work
-            .submit_for_device(&f.alice, &request, 11, Some("WinC"))
+            .submit_for_device(&f.alice, &request, 11, Some("WinE"))
             .unwrap()
             .id,
         on_solver.id,
         "a retry must keep the original placement"
     );
+    assert!(matches!(
+        f.work
+            .submit_for_device(&f.alice, &request, 11, Some("WinC")),
+        Err(WorkError::Forbidden)
+    ));
     let another = SubmitJob {
         request_id: "next-automatic".into(),
         ..request
@@ -1323,58 +1335,6 @@ fn locally_originated_completion_stays_in_its_local_conversation_instead_of_shar
         30,
     )
     .unwrap();
-    let handed = f
-        .work
-        .submit(
-            &f.alice,
-            &SubmitJob {
-                request_id: "local-handover".into(),
-                project_id: "alpha".into(),
-                project_participation: None,
-                conversation_id: None,
-                revises_job_id: None,
-                expected_revised_revision: None,
-                environment_id: "solver".into(),
-                origin_session_ref: Some("local-session-2".into()),
-                origin_turn_ref: None,
-                origin_turn_epoch: None,
-                title: "Local handover".into(),
-                input: json!({"version":1,"prompt":"Do work"}),
-                descendant_budget: 0,
-                start_before_ms: None,
-            },
-            30,
-        )
-        .unwrap();
-    f.work
-        .handover(
-            &f.alice,
-            &handed.id,
-            &HandoverRequest {
-                expected_revision: handed.revision,
-                new_assignee_id: f.bob.user_id.clone(),
-            },
-            31,
-        )
-        .unwrap();
-    let assigned = f.work.claim("WinE", 32).unwrap().unwrap();
-    assert_eq!(assigned.job.id, handed.id);
-    f.report(&assigned, "handed-started", ReportOutcome::Started);
-    f.report(&assigned, "handed-finished", finished());
-    assert!(
-        !f.work.inbox(&f.alice, None, 10, 35).unwrap()["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["job_id"] == handed.id && item["kind"] == "finished")
-    );
-    assert!(
-        f.work.inbox(&f.bob, None, 10, 35).unwrap()["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["job_id"] == handed.id && item["kind"] == "finished")
-    );
     let ordinary = f.submit("solver", "shared-completion", 0);
     let assigned = f.work.claim("WinE", 31).unwrap().unwrap();
     assert_eq!(assigned.job.id, ordinary.id);

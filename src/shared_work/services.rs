@@ -11,7 +11,7 @@ pub struct ServiceLeaseView {
     pub generation: u64,
     pub conversation_id: String,
     pub environment_id: String,
-    pub expires_at_ms: u64,
+    pub expires_at_ms: Option<u64>,
     pub stop_requested: bool,
     pub uncertain: bool,
     pub uncertainty_reason: Option<String>,
@@ -42,7 +42,9 @@ impl SharedWork {
             stop_requested: row.get::<_, Option<u64>>(6)?.is_some()
                 || matches!(root_state.as_str(), "cancelling" | "cancelled" | "failed")
                 || authority_revoked
-                || now >= row.get::<_, u64>(5)?,
+                || row
+                    .get::<_, Option<u64>>(5)?
+                    .is_some_and(|deadline| now >= deadline),
             uncertain: row.get::<_, String>(8)? == "uncertain"
                 || self
                     .environment_contact(&runner, &environment_id, now)

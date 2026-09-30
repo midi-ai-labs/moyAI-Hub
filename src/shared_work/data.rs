@@ -45,7 +45,8 @@ pub struct RunnerAssetUpload {
     pub base_sha256: Option<String>,
     pub upload: AssetUpload,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct TranscriptItem {
     pub position: u64,
     pub kind: String,
@@ -55,6 +56,221 @@ pub struct TranscriptItem {
 pub struct TranscriptPage {
     pub items: Vec<TranscriptItem>,
     pub next_after: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<TranscriptActivity>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TranscriptActivity {
+    pub job_id: String,
+    pub attempt_id: String,
+    pub generation: u64,
+    pub environment_id: String,
+    pub runner_id: String,
+    pub revision: u64,
+    pub observed_at_ms: u64,
+    pub items: Vec<TranscriptItem>,
+    pub truncated: bool,
+}
+
+fn progress_job(db: &Connection, runner: &str, attempt: &str, generation: u64) -> Result<Job> {
+    let (job_id, owner, actual, authority, state, uncertainty):
+        (String, String, u64, u64, String, Option<String>) = db.query_row(
+        "SELECT job_id,runner_id,generation,authority_generation,state,uncertainty_reason FROM shared_attempts WHERE id=?1",
+        [attempt], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)),
+    ).optional()?.ok_or(WorkError::NotFound)?;
+    if owner != runner {
+        return Err(WorkError::Forbidden);
+    }
+    let job = store::load(db, &job_id)?;
+    let root = store::load(db, &job.root_id)?;
+    if actual != generation
+        || authority != job.authority_generation
+        || authority != root.authority_generation
+        || state != "running"
+        || uncertainty.is_some()
+        || job.state != JobState::Running
+        || root.state.terminal()
+        || root.state == JobState::Cancelling
+    {
+        return Err(WorkError::Conflict);
+    }
+    let current: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM shared_environments e WHERE e.id=?1 AND e.runner_id=?2)",
+        params![job.environment_id, runner],
+        |r| r.get(0),
+    )?;
+    if !current {
+        return Err(WorkError::Forbidden);
+    }
+    super::handover::may_continue(db, &job, &job.environment_id)?;
+    Ok(job)
+}
+
+fn public_progress_payload(item: &TranscriptItem) -> bool {
+    let Some(value) = item.payload.as_object() else {
+        return false;
+    };
+    let fields = |keys: &[&str]| {
+        value.len() == keys.len() && keys.iter().all(|key| value.contains_key(*key))
+    };
+    let strings = |keys: &[&str]| keys.iter().all(|key| item.payload[*key].is_string());
+    match item.kind.as_str() {
+        "assistant_message" => {
+            fields(&["content"])
+                && item.payload["content"].as_array().is_some_and(|parts| {
+                    !parts.is_empty()
+                        && parts.iter().all(|part| {
+                            part.as_object().is_some_and(|object| object.len() == 2)
+                                && part["kind"] == "text"
+                                && part["text"].is_string()
+                        })
+                })
+        }
+        "tool_call" => {
+            fields(&["call_id", "tool_name", "arguments_json"])
+                && strings(&["call_id", "tool_name", "arguments_json"])
+        }
+        "tool_output" => {
+            fields(&["call_id", "status", "title", "output_text", "success"])
+                && strings(&["call_id", "status", "title", "output_text"])
+                && matches!(
+                    item.payload["status"].as_str(),
+                    Some("pending" | "running" | "completed" | "declined" | "cancelled" | "failed")
+                )
+                && (item.payload["success"].is_null() || item.payload["success"].is_boolean())
+        }
+        "error" => fields(&["message"]) && strings(&["message"]),
+        "file_change" => fields(&["summary"]) && strings(&["summary"]),
+        _ => false,
+    }
+}
+
+pub(super) fn record_progress(
+    db: &Connection,
+    runner: &str,
+    report: &Report,
+    payload: &str,
+    now: u64,
+) -> Result<Job> {
+    let ReportOutcome::Progress {
+        revision, items, ..
+    } = &report.outcome
+    else {
+        return Err(WorkError::Invalid);
+    };
+    if *revision == 0
+        || *revision > i64::MAX as u64
+        || items.is_empty()
+        || items.len() > 12
+        || serde_json::to_vec(&report.outcome)?.len() > 64 * 1024
+    {
+        return Err(WorkError::Invalid);
+    }
+    let mut previous = 0;
+    for item in items {
+        if item.position <= previous
+            || item.position > *revision
+            || !public_progress_payload(item)
+            || serde_json::to_vec(item)?.len() > 16 * 1024
+        {
+            return Err(WorkError::Invalid);
+        }
+        previous = item.position;
+    }
+    if previous != *revision {
+        return Err(WorkError::Invalid);
+    }
+    // Recheck authority even for a duplicate; a stale display report must not
+    // acknowledge authority after stop, leave, reassignment, or terminal.
+    let job = progress_job(db, runner, &report.attempt_id, report.generation)?;
+    if db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM shared_reports WHERE attempt_id=?1 AND event_id=?2)",
+        params![report.attempt_id, report.event_id],
+        |r| r.get::<_, bool>(0),
+    )? {
+        return Err(WorkError::Conflict);
+    }
+    let saved: Option<(u64, String)> = db
+        .query_row(
+            "SELECT revision,payload_json FROM shared_attempt_progress WHERE attempt_id=?1",
+            [&report.attempt_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    if let Some((saved_revision, saved_payload)) = saved {
+        if *revision < saved_revision || (*revision == saved_revision && payload != saved_payload) {
+            return Err(WorkError::Conflict);
+        }
+        if *revision == saved_revision {
+            return Ok(job);
+        }
+    }
+    db.execute("INSERT INTO shared_attempt_progress(attempt_id,revision,payload_json,observed_at_ms) VALUES(?1,?2,?3,?4) ON CONFLICT(attempt_id) DO UPDATE SET revision=excluded.revision,payload_json=excluded.payload_json,observed_at_ms=excluded.observed_at_ms",
+        params![report.attempt_id,revision,payload,now])?;
+    Ok(job)
+}
+
+fn transcript_activity(db: &Connection, selected: &Job) -> Result<Option<TranscriptActivity>> {
+    let mut job = selected.clone();
+    // The existing descendant budget bounds the chain. Follow only the current
+    // awaited child, never a previously completed sibling or another root.
+    for _ in 0..=1000 {
+        if job.state == JobState::WaitingChild {
+            let Some(child_id) = &job.awaiting_child_id else {
+                return Ok(None);
+            };
+            let child = store::load(db, child_id)?;
+            if child.parent_id.as_deref() != Some(job.id.as_str())
+                || child.root_id != selected.root_id
+            {
+                return Err(WorkError::Conflict);
+            }
+            job = child;
+            continue;
+        }
+        if job.state != JobState::Running {
+            return Ok(None);
+        }
+        let saved: Option<(String, String, u64, String, u64)> = db.query_row(
+            "SELECT a.id,a.runner_id,a.generation,p.payload_json,p.observed_at_ms FROM shared_attempts a JOIN shared_attempt_progress p ON p.attempt_id=a.id WHERE a.job_id=?1 AND a.state='running' AND NOT EXISTS(SELECT 1 FROM shared_assets archive WHERE archive.attempt_id=a.id AND archive.generation=a.generation AND archive.kind='archive' AND archive.purged_at_ms IS NULL)",
+            [&job.id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
+        ).optional()?;
+        let Some((attempt_id, runner_id, generation, payload, observed_at_ms)) = saved else {
+            return Ok(None);
+        };
+        match progress_job(db, &runner_id, &attempt_id, generation) {
+            Ok(_) => {}
+            Err(
+                WorkError::Forbidden
+                | WorkError::Conflict
+                | WorkError::NotFound
+                | WorkError::Identity(identity::IdentityError::Forbidden),
+            ) => return Ok(None),
+            Err(error) => return Err(error),
+        }
+        let report: Report = serde_json::from_str(&payload)?;
+        let ReportOutcome::Progress {
+            revision,
+            items,
+            truncated,
+        } = report.outcome
+        else {
+            return Err(WorkError::Conflict);
+        };
+        return Ok(Some(TranscriptActivity {
+            job_id: job.id,
+            attempt_id,
+            generation,
+            environment_id: job.environment_id,
+            runner_id,
+            revision,
+            observed_at_ms,
+            items,
+            truncated,
+        }));
+    }
+    Err(WorkError::Conflict)
 }
 fn row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Asset> {
     Ok(Asset {
@@ -329,8 +545,8 @@ impl SharedWork {
         };
         for root in roots {
             super::store::settle_cancel(&tx, &root, now)?;
-            super::handover::settle(&tx, &root, now)?;
         }
+        tx.execute("UPDATE shared_handovers SET state='cancelled',completed_at_ms=?1 WHERE state='pending'", [now])?;
         tx.execute("UPDATE shared_approvals SET invalidated_at_ms=?1", [now])?;
         tx.execute("DELETE FROM identity_sessions", [])?;
         tx.execute("DELETE FROM identity_refresh_sessions", [])?;
@@ -587,15 +803,17 @@ impl SharedWork {
         after: u64,
         limit: u32,
     ) -> Result<TranscriptPage> {
-        self.job(actor, job)?;
+        let selected = self.job(actor, job)?;
         if !(1..=100).contains(&limit) {
             return Err(WorkError::Invalid);
         }
+        let activity = transcript_activity(&self.db, &selected)?;
         let asset_id: Option<String>=self.db.query_row("SELECT id FROM shared_assets WHERE job_id=?1 AND kind='archive' AND purged_at_ms IS NULL ORDER BY created_at_ms DESC,id DESC LIMIT 1",[job],|r|r.get(0)).optional()?;
         let Some(asset_id) = asset_id else {
             return Ok(TranscriptPage {
                 items: vec![],
                 next_after: None,
+                activity,
             });
         };
         let asset = get(&self.db, &asset_id)?;
@@ -629,7 +847,11 @@ impl SharedWork {
             .last()
             .map(|item| item.position)
             .filter(|position| *position < source.len() as u64);
-        Ok(TranscriptPage { items, next_after })
+        Ok(TranscriptPage {
+            items,
+            next_after,
+            activity,
+        })
     }
 }
 

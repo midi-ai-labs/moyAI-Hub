@@ -2,6 +2,55 @@ use moyai_hub::{catalog::*, core::HubCore, protocol::*};
 use std::collections::BTreeSet;
 
 #[test]
+fn model_system_prompt_migrates_empty_then_tracks_reviewed_changes_and_unicode_limits() {
+    let mut previous = fixture().catalog_store().clone();
+    previous.schema_version = 3;
+    let encoded = serde_json::to_string(&previous).unwrap();
+    assert!(!encoded.contains("system_prompt"));
+    let mut reopened: CatalogStore = serde_json::from_str(&encoded).unwrap();
+    reopened.reconcile_software("0.1.0", 20).unwrap();
+    assert!(
+        reopened
+            .catalog
+            .models
+            .iter()
+            .all(|model| model.system_prompt.is_empty())
+    );
+    let prompt =
+        normalize_model_system_prompt("  日本語で回答してください。\n  固有名詞は原文のまま。\n ")
+            .unwrap();
+    assert_eq!(
+        prompt,
+        "日本語で回答してください。\n  固有名詞は原文のまま。"
+    );
+    let mut edited = reopened.catalog.clone();
+    edited.models[0].system_prompt = prompt;
+    reopened.replace_catalog(edited.clone(), 21).unwrap();
+    assert_eq!(
+        reopened.changes.last().unwrap().changed_model_ids,
+        ["model-a"]
+    );
+    let revision = reopened.revision;
+    assert_eq!(reopened.replace_catalog(edited, 22).unwrap(), revision);
+    assert_eq!(
+        serde_json::from_str::<CatalogStore>(&serde_json::to_string(&reopened).unwrap()).unwrap(),
+        reopened
+    );
+    for version in [1, 2, 3] {
+        let mut wrong_version = reopened.clone();
+        wrong_version.schema_version = version;
+        assert!(wrong_version.validate().is_err());
+    }
+    assert_eq!(normalize_model_system_prompt(" \r\n\t ").unwrap(), "");
+    assert!(normalize_model_system_prompt(&"界".repeat(MAX_MODEL_SYSTEM_PROMPT_CHARS)).is_ok());
+    assert!(
+        normalize_model_system_prompt(&"界".repeat(MAX_MODEL_SYSTEM_PROMPT_CHARS + 1)).is_err()
+    );
+    reopened.catalog.models[0].system_prompt = "界".repeat(MAX_MODEL_SYSTEM_PROMPT_CHARS + 1);
+    assert!(reopened.validate().is_err());
+}
+
+#[test]
 fn legacy_catalog_upgrades_without_assuming_a_standard_and_explicit_choice_is_validated() {
     let mut store = fixture().catalog_store().clone();
     store.schema_version = 1;
@@ -36,7 +85,7 @@ fn schema_two_catalog_upgrades_once_preserving_defaults_models_and_history() {
     let mut migrated: CatalogStore = serde_json::from_str(&saved).unwrap();
     migrated.validate().unwrap();
     assert!(migrated.reconcile_software("0.1.0", 20).unwrap());
-    assert_eq!(migrated.schema_version, 3);
+    assert_eq!(migrated.schema_version, SCHEMA_VERSION);
     assert_eq!(migrated.hub_id, previous.hub_id);
     assert_eq!(migrated.catalog, previous.catalog);
     assert_eq!(migrated.revision, previous.revision + 1);
@@ -54,7 +103,7 @@ fn schema_two_catalog_upgrades_once_preserving_defaults_models_and_history() {
 
 #[test]
 fn catalog_replacement_also_upgrades_legacy_schema_even_when_data_is_unchanged() {
-    for version in [1, 2] {
+    for version in [1, 2, 3] {
         let mut previous = fixture().catalog_store().clone();
         previous.schema_version = version;
         let mut migrated = previous.clone();
@@ -142,6 +191,7 @@ fn fixture() -> HubCore {
 
 fn model(id: &str, capabilities: &[&str]) -> LogicalModel {
     LogicalModel {
+        system_prompt: String::new(),
         id: id.into(),
         label: id.into(),
         capabilities: capabilities.iter().map(|value| value.to_string()).collect(),

@@ -53,11 +53,19 @@ Hub / Gateway の server 証明書だけに予約名 `hub.moyai.invalid` を含�
 
 HTTP エラーは本文や URL を含まない `{error,current_revision?}` です。401 `unauthorized`、409 `review_required` / `different_hub` / `active_turn` / `turn_closed` / `permit_expired` / `lease_expired` / `selection_required` / `stale_client`、400 `invalid_request` / `model_removed` / `capability_mismatch`、503 `gateway_unavailable`、429 `registry_full` を返します。Gateway 自体は `permit_consumed`、`provider_unavailable`、`upstream_uncertain` 等を返します。`upstream_uncertain` はその要求の応答を完了できなかったエラーであり、provider の稼働判定や容量プールの保留ではありません。metadata API と Gateway はブラウザー Origin 付き要求を拒否します。
 
+## モデルのシステムプロンプト
+
+管理画面のモデル登録・編集にある「システムプロンプト」は論理モデル単位で保存し、同じモデルの各配置で共有します。空欄は指示なし、上限は16,384 Unicode文字です。外側の空白を除き、本文・改行を維持します。編集は既存のcatalog revision確認とatomic保存を通り、変更後はDesktop/Runnerのモデル設定の再確認が必要です。プロジェクトやHub全体の指示階層は持ちません。
+
+公開catalogにこの指示を含め、Desktop/Runnerが確認済みrevisionと実際の割当modelから要求ごとに一度合成します。Gatewayは追加・置換しません。指示のある選択候補を利用するclientはPrepareに`supports_model_system_prompt:true`を付けます。省略はfalseとして扱い、未対応clientにはpermit発行前にHTTP 409 `model_system_prompt_unsupported`を返します。空欄のモデルは従来のPrepareを利用できます。
+
+JSON catalog schemaは4です。schema 1–3の指示なしcatalogは既存のロード時移行で一度revisionを進めて保存し、旧schemaで新しい指示を名乗るデータは拒否します。Hub管理者は指示の保存と確認を行い、実際のモデルが常にその指示に従うことは別途実行結果で確認します。
+
 ## AIホストのAPIキー
 
 管理画面で登録先ごとにキーを入力し、モデル一覧取得・「状態を確認」・実行準備時のモデル存在確認・Gatewayの生成要求で同じ認証設定を使います。送信形式は `Authorization: Bearer …` です。Desktopのrequest tokenをAIホストへ転送せず、従来のキー未設定ホストは認証なしのまま利用できます。
 
-キーの実値はHub保存先の `upstream-credentials/<ULID>.json` に置き、Windowsでは利用者限定ACL、Unixでは `0600` のファイル権限で保護・検証します。暗号化保存ではありません。catalog schema 3のDeploymentには任意の不透明な `upstream_credential_id` だけを保持します。従来のschema 1・2は既存モデルとHub識別情報を保持して前方移行します。公開端末catalog・管理snapshot・grantはキーを含まず、登録前のdiscovery evidenceが保持するキーもメモリー内だけで、応答へserializeしません。
+キーの実値はHub保存先の `upstream-credentials/<ULID>.json` に置き、Windowsでは利用者限定ACL、Unixでは `0600` のファイル権限で保護・検証します。暗号化保存ではありません。Deploymentには任意の不透明な `upstream_credential_id` だけを保持します。schema 3で加わったこの参照を含め、従来のcatalogは既存モデルとHub識別情報を保持してschema 4へ前方移行します。公開端末catalog・管理snapshot・grantはキーを含まず、登録前のdiscovery evidenceが保持するキーもメモリー内だけで、応答へserializeしません。
 
 登録先の編集ではキー欄の空欄が保持、入力が置換、削除チェックが削除です。Gatewayは予約受付時にキーを保持し、生成を開始した通信はキー変更後も継続します。まだclaimしていない要求は、他のモデル設定変更と同様にrevisionの再確認が必要です。再確認後の新しい要求から変更後のキーを使います。登録済み参照の欠落、権限不正、接続先・profileの不一致では失敗し、認証なしへ切り替えません。
 

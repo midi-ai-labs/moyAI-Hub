@@ -44,7 +44,13 @@ fn device(network: &mut DeviceNetwork, label: &str) -> Device {
     }
 }
 fn client(ca: &str, device: Option<&Device>) -> reqwest::Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "x-moyai-runner-capabilities",
+        store::MULTI_DEVICE_SESSION_CAPABILITY.parse().unwrap(),
+    );
     let mut builder = reqwest::Client::builder()
+        .default_headers(headers)
         .no_proxy()
         .timeout(std::time::Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
@@ -802,7 +808,7 @@ async fn runner_service_stop_route_requires_current_attempt_generation() {
                 "retain",
                 ReportOutcome::RetainService {
                     service_id: "preview".into(),
-                    expires_at_ms: now + 60_000,
+                    expires_at_ms: Some(now + 60_000),
                 },
             ),
             now,
@@ -883,6 +889,7 @@ async fn conversation_stop_handler_requires_device_bound_person_and_project_cont
                 .unwrap()
                 .into(),
             request: ManagementRequest::SaveProject {
+                overview: None,
                 id: "project".into(),
                 label: "Project".into(),
                 archived: false,
@@ -895,6 +902,11 @@ async fn conversation_stop_handler_requires_device_bound_person_and_project_cont
             },
         };
         work.manage(&fixture.actor, &command, now).unwrap();
+        // The base fixture submitted without a device. Restore the complete
+        // controller identity and current participation, not only its PC id.
+        work.db.execute("UPDATE shared_jobs SET controller_device_id=?1,
+            controller_participation_generation=(SELECT participation_generation FROM shared_project_devices WHERE project_id='project' AND device_id=?1)
+            WHERE id=?2", params![fixture.device.device_id, fixture.assignment.job.id]).unwrap();
         work.report(
             &fixture.device.device_id,
             &fixture.report("started", ReportOutcome::Started),
@@ -907,7 +919,7 @@ async fn conversation_stop_handler_requires_device_bound_person_and_project_cont
                 "retained",
                 ReportOutcome::RetainService {
                     service_id: "api-preview".into(),
-                    expires_at_ms: now + 60_000,
+                    expires_at_ms: Some(now + 60_000),
                 },
             ),
             now,
@@ -1018,6 +1030,196 @@ async fn runner_contact_is_not_inferred_from_a_fresh_desktop_job_read() {
     assert_eq!(
         work.assignments(&fixture.device.device_id).unwrap().len(),
         1
+    );
+}
+
+#[tokio::test]
+async fn progress_http_rechecks_device_stop_and_revocation_without_sweeping_or_heartbeat() {
+    for revoke in [false, true] {
+        let fixture = AdmissionFixture::new();
+        let now = crate::service::now_ms();
+        {
+            let mut work = fixture.state.store.lock().unwrap();
+            work.report(
+                &fixture.device.device_id,
+                &fixture.report("started", ReportOutcome::Started),
+                now,
+            )
+            .unwrap();
+        }
+        let progress = fixture.report(
+            "progress:1",
+            ReportOutcome::Progress {
+                revision: 1,
+                items: vec![TranscriptItem {
+                    position: 1,
+                    kind: "error".into(),
+                    payload: json!({"message":"visible progress"}),
+                }],
+                truncated: false,
+            },
+        );
+        let _ = report(
+            State(fixture.state.clone()),
+            Extension(fixture.device.clone()),
+            Json(progress.clone()),
+        )
+        .await
+        .unwrap();
+        {
+            let work = fixture.state.store.lock().unwrap();
+            let detail = work
+                .job_detail(&fixture.actor, &fixture.assignment.job.id)
+                .unwrap();
+            assert_eq!(
+                detail["runner_contact"]["state"], "unconfirmed",
+                "display updates are not heartbeat evidence"
+            );
+            // A queued expired job is deliberately present to verify this report
+            // cannot cause the shared API's ordinary lifecycle reconciliation.
+            work.db
+                .execute(
+                    "UPDATE shared_jobs SET state='queued',start_before_ms=1 WHERE id=?1",
+                    [&fixture.assignment.job.id],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            report(
+                State(fixture.state.clone()),
+                Extension(fixture.device.clone()),
+                Json(progress.clone())
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            fixture
+                .state
+                .store
+                .lock()
+                .unwrap()
+                .job(&fixture.actor, &fixture.assignment.job.id)
+                .unwrap()
+                .state,
+            JobState::Queued
+        );
+        fixture
+            .state
+            .store
+            .lock()
+            .unwrap()
+            .db
+            .execute(
+                "UPDATE shared_jobs SET state='running' WHERE id=?1",
+                [&fixture.assignment.job.id],
+            )
+            .unwrap();
+        let result = fixture
+            .after_device_change(
+                revoke,
+                report(
+                    State(fixture.state.clone()),
+                    Extension(fixture.device.clone()),
+                    Json(progress),
+                ),
+            )
+            .await;
+        assert_eq!(result.unwrap_err().0, StatusCode::FORBIDDEN);
+    }
+}
+
+#[tokio::test]
+async fn progress_transcript_hides_activity_after_origin_controller_network_stop() {
+    let fixture = AdmissionFixture::new();
+    let controller = device(
+        &mut fixture.state.network.lock().unwrap(),
+        "Origin controller",
+    );
+    {
+        let mut work = fixture.state.store.lock().unwrap();
+        work.db
+            .execute(
+                "UPDATE shared_jobs SET controller_device_id=?2 WHERE id=?1",
+                rusqlite::params![fixture.assignment.job.id, controller.id],
+            )
+            .unwrap();
+        work.report(
+            &fixture.device.device_id,
+            &fixture.report("started", ReportOutcome::Started),
+            crate::service::now_ms(),
+        )
+        .unwrap();
+    }
+    let _ = report(
+        State(fixture.state.clone()),
+        Extension(fixture.device.clone()),
+        Json(fixture.report(
+            "progress:1",
+            ReportOutcome::Progress {
+                revision: 1,
+                items: vec![TranscriptItem {
+                    position: 1,
+                    kind: "error".into(),
+                    payload: json!({"message":"public"}),
+                }],
+                truncated: false,
+            },
+        )),
+    )
+    .await
+    .unwrap();
+    let session = device_session(
+        State(fixture.state.clone()),
+        Extension(fixture.device.clone()),
+    )
+    .await
+    .unwrap()
+    .0;
+    let app = super::data::routes()
+        .layer(Extension(fixture.device.clone()))
+        .with_state(fixture.state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let url = format!(
+        "{endpoint}/v1/shared/jobs/{}/transcript",
+        fixture.assignment.job.id
+    );
+    let before = body(
+        client
+            .get(&url)
+            .bearer_auth(&session.token)
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    {
+        let mut network = fixture.state.network.lock().unwrap();
+        let revision = network.revision();
+        network
+            .set_admission(&revision, &controller.id, true)
+            .unwrap();
+    }
+    let after = body(
+        client
+            .get(&url)
+            .bearer_auth(&session.token)
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    server.abort();
+    let _ = server.await;
+    assert!(before["activity"].is_object());
+    assert!(
+        after["activity"].is_null(),
+        "stopped origin cannot retain active progress on another authorized controller"
     );
 }
 
@@ -1205,7 +1407,7 @@ async fn real_tls_requires_person_and_device_and_preserves_job_across_client_con
         title: "Offline request".into(),
         input: json!({"version":1,"prompt":"old"}),
         descendant_budget: 0,
-        start_before_ms: None,
+        start_before_ms: Some(now - 1),
     };
     let old_job = work
         .submit(&user, &old_request, now - DEFAULT_START_WINDOW_MS - 1)
@@ -1287,7 +1489,7 @@ async fn real_tls_requires_person_and_device_and_preserves_job_across_client_con
             .unwrap()
             .contains("開始期限")
     );
-    assert_eq!(expired["start_before_ms"], old_job.start_before_ms);
+    assert_eq!(expired["start_before_ms"], json!(old_job.start_before_ms));
     let authenticated_session = body(
         a.get(format!("{endpoint}/v1/shared/session"))
             .bearer_auth(token)
@@ -1379,10 +1581,7 @@ async fn real_tls_requires_person_and_device_and_preserves_job_across_client_con
     )
     .await;
     let job = accepted["id"].as_str().unwrap().to_owned();
-    assert_eq!(
-        accepted["start_before_ms"].as_u64().unwrap(),
-        accepted["created_at_ms"].as_u64().unwrap() + DEFAULT_START_WINDOW_MS
-    );
+    assert!(accepted["start_before_ms"].is_null());
     let mut expired_request = request.clone();
     expired_request["request_id"] = json!("explicit-expired");
     expired_request["start_before_ms"] = json!(now - 1);

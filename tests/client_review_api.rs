@@ -31,11 +31,13 @@ impl Server {
         let mut catalog = store.catalog.clone();
         catalog.models = vec![
             LogicalModel {
+                system_prompt: String::new(),
                 id: "model-a".into(),
                 label: "Model A".into(),
                 capabilities: BTreeSet::from(["tools".into()]),
             },
             LogicalModel {
+                system_prompt: String::new(),
                 id: "model-b".into(),
                 label: "Model B".into(),
                 capabilities: BTreeSet::from(["tools".into(), "vision".into()]),

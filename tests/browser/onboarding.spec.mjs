@@ -78,25 +78,30 @@ test("team preparation registers and names an exact PC and enables project acces
   await info.attach("join-and-purpose",{body:await page.locator("#join-project-dialog").screenshot(),contentType:"image/png"});
   await page.locator("#join-project-save").click(); await expect(page.locator("#join-project-dialog")).not.toBeVisible();
   const approval=await participant.collectApproval(); expect(approval.status).toBe("approved");
-  expect((await participant.sharedDeviceProjects()).projects.find(p=>p.id===id)).toMatchObject({can_control:true,can_execute:true,preparation_state:"waiting_setup"});
+  expect((await participant.sharedDeviceProjects()).projects.find(p=>p.id===id)).toMatchObject({can_control:true,can_execute:true,preparation_state:"waiting_local_folder",environment_id:expect.any(String)});
   const session=await participant.sharedDeviceSession();
   expect(session.principal.administrator).toBe(false);
   expect((await participant.sharedCall("projects")).some(project=>project.id===id)).toBe(true);
   await page.locator("#shared-admin-refresh").click();
-  await expect(page.locator("#onboarding-steps")).toContainText("実行PCの保存先・権限の確認待ち");
+  await expect(page.locator("#onboarding-steps")).toContainText("このPCでプロジェクトの作業フォルダーを選んでください");
+  await expect(page.locator("#onboarding-steps")).not.toContainText("waiting_local_folder");
+  await expect(page.locator("#onboarding-next-title")).toHaveText("実行PCでプロジェクトの作業フォルダーを選んでください");
+  await expect(page.locator("#onboarding-next")).toContainText("2. プロジェクトの作業フォルダー");
+  await info.attach("onboarding-local-folder-selection",{body:await page.locator("#team-onboarding").screenshot(),contentType:"image/png"});
   await page.reload(); await expect(page.locator("#onboarding-project")).toHaveValue(id);
   await expect(page.locator("#onboarding-steps")).toContainText("Desktopからサンプルを依頼し、回答と成果ファイルを開いてください。");
   // A prepared folder is not enough to run a shared job without a Hub model.
-  // The participant simulates only the authenticated provisioning receipt.
-  await participant.sharedTemplates([{id:"desktop-default",label:"このPCの実行設定"}]);
+  // The participant simulates only the authenticated local-folder receipt.
   const [preparation]=await participant.sharedProvisioning();
-  expect(preparation.template_id).toBe("desktop-default");
-  await participant.sharedProvisionReceipt({...preparation,success:true,error:null});
+  expect(preparation.template_id).toBe("local-folder");
+  await participant.sharedProvisionReceipt({environment_id:preparation.environment_id,template_id:preparation.template_id,generation:preparation.generation,success:true,error:null});
   await page.locator("#shared-admin-refresh").click();
   await expect(page.locator("#onboarding-next-title")).toHaveText("チームで使うAIをHubに登録してください");
   await expect(page.locator('#onboarding-next a[href="#models"]')).toHaveText("共有AIを登録する");
   await page.locator("#onboarding-first-job > summary").click();
-  await expect(page.locator("#onboarding-first-job")).toContainText("Desktopの「接続状況とサンプル」");
+  await expect(page.locator("#onboarding-first-job")).toContainText("通常のチャット欄");
+  await expect(page.locator("#onboarding-first-job")).toContainText("10・20・30の件数と合計");
+  await expect(page.locator("#onboarding-first-job")).not.toContainText("サンプルの依頼を入力");
   await info.attach("team-preparation",{body:await page.locator("#team-onboarding").screenshot(),contentType:"image/png"});
 });
 test("approval survives a concurrent project edit and retries only project purposes for the same registered PC",async({page,context,hub})=>{

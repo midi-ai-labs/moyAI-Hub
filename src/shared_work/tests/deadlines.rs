@@ -37,55 +37,53 @@ fn report_at(
     )
 }
 
+const LONG_WAIT: u64 = 73 * 60 * 60 * 1000;
+
 #[test]
-fn shared_deadline_stale_queued_work_cannot_start_when_runner_returns() {
+fn ordinary_queue_and_receipt_survive_more_than_seventy_two_hours() {
     let mut f = Fixture::new();
-    let job = f.submit("solver", "old-offline-request", 0);
-    let after_default_window = job.created_at_ms + 24 * 60 * 60 * 1000;
-    assert!(
-        f.work
-            .claim("WinE", after_default_window)
-            .unwrap()
-            .is_none(),
-        "the returning Runner must not start a request after its default start deadline"
-    );
-    let expired = f.work.job(&f.alice, &job.id).unwrap();
-    assert_eq!(expired.state, JobState::Failed);
+    let original = request("long-queue", "solver", None);
+    let job = f.work.submit(&f.alice, &original, 10).unwrap();
+    assert_eq!(job.start_before_ms, None);
+    f.reopen();
     assert_eq!(
-        expired.result.as_ref().unwrap()["error"],
-        "start_deadline_exceeded"
+        f.work.submit(&f.alice, &original, LONG_WAIT).unwrap().id,
+        job.id
     );
-    assert!(f.work.assignments("WinE").unwrap().is_empty());
-    assert!(
-        f.work.job_detail(&f.alice, &job.id).unwrap()["wait_reason"]
-            .as_str()
-            .unwrap()
-            .contains("開始期限")
+    f.work.expire_start_deadlines(LONG_WAIT).unwrap();
+    let assigned = f.work.claim("WinE", LONG_WAIT).unwrap().unwrap();
+    assert_eq!(assigned.job.id, job.id);
+    report_at(
+        &mut f,
+        &assigned,
+        "start",
+        ReportOutcome::Started,
+        LONG_WAIT + 1,
+    )
+    .unwrap();
+    report_at(&mut f, &assigned, "finish", finished(), LONG_WAIT + 2).unwrap();
+    assert_eq!(
+        f.work.job(&f.alice, &job.id).unwrap().state,
+        JobState::Succeeded
     );
 }
 
 #[test]
-fn shared_deadline_is_finite_persisted_and_receipt_replay_never_extends_it() {
+fn explicit_legacy_queue_deadline_is_validated_and_receipt_replay_cannot_extend_it() {
     let mut f = Fixture::new();
-    let original = request("default", "solver", None);
-    assert!(
-        serde_json::to_value(&original)
-            .unwrap()
-            .get("start_before_ms")
-            .is_none()
-    );
+    let original = request("explicit", "solver", Some(100));
     let job = f.work.submit(&f.alice, &original, 10).unwrap();
-    assert_eq!(job.start_before_ms, 10 + DEFAULT_START_WINDOW_MS);
+    assert_eq!(job.start_before_ms, Some(100));
     f.reopen();
     assert_eq!(
         f.work
-            .submit(&f.alice, &original, job.start_before_ms + 1)
+            .submit(&f.alice, &original, 101)
             .unwrap()
             .start_before_ms,
-        job.start_before_ms
+        Some(100)
     );
     let changed = SubmitJob {
-        start_before_ms: Some(job.start_before_ms + 1000),
+        start_before_ms: Some(1000),
         ..original
     };
     assert!(matches!(
@@ -103,17 +101,143 @@ fn shared_deadline_is_finite_persisted_and_receipt_replay_never_extends_it() {
                 .is_err()
         );
     }
-    let explicit = f
-        .work
-        .submit(&f.alice, &request("explicit", "parent", Some(100)), 31)
-        .unwrap();
-    assert_eq!(explicit.start_before_ms, 100);
+    assert!(f.work.claim("WinE", 101).unwrap().is_none());
     assert_eq!(
-        f.work.job_detail(&f.alice, &explicit.id).unwrap()["start_before_ms"],
-        100
+        f.work.job(&f.alice, &job.id).unwrap().state,
+        JobState::Failed
     );
 }
 
+#[test]
+fn child_and_parent_resume_have_no_inherited_deadline_even_after_restart() {
+    for queued_before in [None, Some(100)] {
+        let mut f = Fixture::new();
+        let root = f
+            .work
+            .submit(&f.alice, &request("parent", "parent", queued_before), 10)
+            .unwrap();
+        let parent = f.work.claim("WinC", 11).unwrap().unwrap();
+        report_at(&mut f, &parent, "start", ReportOutcome::Started, 12).unwrap();
+        assert_eq!(
+            f.work.job(&f.alice, &root.id).unwrap().start_before_ms,
+            None
+        );
+        let waiting = report_at(&mut f, &parent, "yield", child(), LONG_WAIT).unwrap();
+        assert_eq!(waiting.state, JobState::WaitingChild);
+        let child_id = waiting.awaiting_child_id.clone().unwrap();
+        assert_eq!(
+            f.work.job(&f.alice, &child_id).unwrap().start_before_ms,
+            None
+        );
+        f.reopen();
+        let child = f.work.claim("WinE", LONG_WAIT * 2).unwrap().unwrap();
+        assert_eq!(child.job.id, child_id);
+        report_at(
+            &mut f,
+            &child,
+            "start",
+            ReportOutcome::Started,
+            LONG_WAIT * 2 + 1,
+        )
+        .unwrap();
+        report_at(&mut f, &child, "finish", finished(), LONG_WAIT * 3).unwrap();
+        f.reopen();
+        let resumed = f.work.claim("WinC", LONG_WAIT * 4).unwrap().unwrap();
+        assert_eq!(resumed.job.id, root.id);
+        assert!(resumed.child_result.is_some());
+        report_at(
+            &mut f,
+            &resumed,
+            "resume",
+            ReportOutcome::Started,
+            LONG_WAIT * 4 + 1,
+        )
+        .unwrap();
+        report_at(&mut f, &resumed, "finish", finished(), LONG_WAIT * 4 + 2).unwrap();
+        assert_eq!(
+            f.work.job(&f.alice, &root.id).unwrap().state,
+            JobState::Succeeded
+        );
+    }
+}
+
+#[test]
+fn optional_lifetime_migration_clears_implicit_queue_and_started_deadlines_only() {
+    let mut f = Fixture::new();
+    let implicit = f.submit("solver", "implicit", 0);
+    let explicit = f
+        .work
+        .submit(&f.alice, &request("explicit", "solver", Some(1000)), 10)
+        .unwrap();
+    let root = f
+        .work
+        .submit(&f.alice, &request("started", "parent", Some(1000)), 10)
+        .unwrap();
+    let parent = f.work.claim("WinC", 11).unwrap().unwrap();
+    report_at(&mut f, &parent, "start", ReportOutcome::Started, 12).unwrap();
+    report_at(&mut f, &parent, "yield", child(), 20).unwrap();
+    let child_id = f
+        .work
+        .job(&f.alice, &root.id)
+        .unwrap()
+        .awaiting_child_id
+        .unwrap();
+    f.work
+        .db
+        .execute(
+            "UPDATE shared_jobs SET start_before_ms=?1 WHERE id IN (?2,?3,?4)",
+            rusqlite::params![10 + DEFAULT_START_WINDOW_MS, implicit.id, root.id, child_id],
+        )
+        .unwrap();
+    f.work
+        .db
+        .execute(
+            "UPDATE shared_jobs SET required_capability='multi_device_session_v1' WHERE id=?1",
+            [&explicit.id],
+        )
+        .unwrap();
+    f.work.db.execute_batch("PRAGMA user_version=25;").unwrap();
+    f.reopen();
+    assert!(
+        f.work
+            .claim_for_capability("WinE", None, Some("multi_device_session_v1"), 30)
+            .unwrap()
+            .is_none()
+    );
+    let explicit_capability: String = f
+        .work
+        .db
+        .query_row(
+            "SELECT required_capability FROM shared_jobs WHERE id=?1",
+            [&explicit.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(explicit_capability, store::MULTI_DEVICE_SESSION_CAPABILITY);
+    for id in [&implicit.id, &root.id, &child_id] {
+        assert_eq!(f.work.job(&f.alice, id).unwrap().start_before_ms, None);
+    }
+    assert_eq!(
+        f.work.job(&f.alice, &explicit.id).unwrap().start_before_ms,
+        Some(1000)
+    );
+    f.work.cancel(&f.alice, &implicit.id, 31).unwrap();
+    let explicit_assignment = f.work.claim("WinE", 32).unwrap().unwrap();
+    assert_eq!(explicit_assignment.job.id, explicit.id);
+    assert_eq!(explicit_assignment.job.start_before_ms, Some(1000));
+    assert_eq!(
+        f.work
+            .db
+            .pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
+            .unwrap(),
+        26
+    );
+    f.reopen();
+    assert_eq!(
+        f.work.job(&f.alice, &root.id).unwrap().start_before_ms,
+        None
+    );
+}
 #[test]
 fn shared_deadline_fences_unstarted_but_holds_unknown_and_allows_started_work_to_finish() {
     let mut f = Fixture::new();
@@ -196,76 +320,6 @@ fn shared_deadline_fences_unstarted_but_holds_unknown_and_allows_started_work_to
 }
 
 #[test]
-fn shared_deadline_expired_child_settles_waiting_parent_and_cancellation_never_reopens_work() {
-    let mut f = Fixture::new();
-    let root = f
-        .work
-        .submit(&f.alice, &request("late-child", "parent", Some(100)), 10)
-        .unwrap();
-    let parent = f.work.claim("WinC", 11).unwrap().unwrap();
-    report_at(&mut f, &parent, "start", ReportOutcome::Started, 12).unwrap();
-    let result = report_at(
-        &mut f,
-        &parent,
-        "yield-after-deadline",
-        ReportOutcome::YieldToChild {
-            checkpoint: json!({"version":1}),
-            child_environment_id: "solver".into(),
-            child_title: "expired child".into(),
-            child_input: json!({"prompt":"child"}),
-            resources_released: true,
-        },
-        100,
-    )
-    .unwrap();
-    assert_eq!(result.state, JobState::Failed);
-    assert_eq!(
-        f.work
-            .job(&f.alice, result.awaiting_child_id.as_ref().unwrap())
-            .unwrap()
-            .state,
-        JobState::Failed
-    );
-    assert!(f.work.claim("WinE", 101).unwrap().is_none());
-    assert_eq!(
-        f.work.cancel(&f.alice, &root.id, 102).unwrap().state,
-        JobState::Failed
-    );
-
-    let cancelled = f
-        .work
-        .submit(&f.alice, &request("cancel-first", "solver", Some(200)), 110)
-        .unwrap();
-    let attempt = f.work.claim("WinE", 120).unwrap().unwrap();
-    assert_eq!(
-        f.work.cancel(&f.alice, &cancelled.id, 130).unwrap().state,
-        JobState::Cancelling
-    );
-    f.work.expire_start_deadlines(201).unwrap();
-    assert_eq!(
-        f.work.job(&f.alice, &cancelled.id).unwrap().state,
-        JobState::Cancelling
-    );
-    assert!(f.work.assignments("WinE").unwrap()[0].stop_requested);
-    report_at(
-        &mut f,
-        &attempt,
-        "stopped",
-        ReportOutcome::Finished {
-            success: false,
-            result: json!({"stopped":true}),
-            resources_released: true,
-        },
-        202,
-    )
-    .unwrap();
-    assert_eq!(
-        f.work.job(&f.alice, &cancelled.id).unwrap().state,
-        JobState::Cancelled
-    );
-}
-
-#[test]
 fn shared_deadline_offline_reconciliation_is_persisted_and_unknown_slots_still_block_capacity() {
     let mut f = Fixture::new();
     let unknown = f
@@ -322,248 +376,69 @@ fn shared_deadline_offline_reconciliation_is_persisted_and_unknown_slots_still_b
 }
 
 #[test]
-fn shared_deadline_covers_parent_resume_without_stopping_an_already_started_child() {
+fn migrated_active_attempt_requires_current_runner_without_releasing_or_replaying_it() {
     let mut f = Fixture::new();
-    let root = f
+    let root = f.submit("solver", "old-live", 0);
+    let attempt = f.work.claim("WinE", 11).unwrap().unwrap();
+    f.report(&attempt, "started", ReportOutcome::Started);
+    f.work.db.execute("UPDATE shared_jobs SET start_before_ms=?2,required_capability='multi_device_session_v1' WHERE id=?1",rusqlite::params![root.id,10+DEFAULT_START_WINDOW_MS]).unwrap();
+    f.work.db.execute_batch("PRAGMA user_version=25;").unwrap();
+    f.reopen();
+    assert!(
+        f.work
+            .assignments_for_capability("WinE", Some("multi_device_session_v1"))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        f.work
+            .claim_for_capability("WinE", None, Some("multi_device_session_v1"), LONG_WAIT)
+            .unwrap()
+            .is_none()
+    );
+    let current = f
         .work
-        .submit(&f.alice, &request("parent", "parent", Some(100)), 10)
+        .assignments_for_capability("WinE", Some(store::MULTI_DEVICE_SESSION_CAPABILITY))
         .unwrap();
-    let parent = f.work.claim("WinC", 11).unwrap().unwrap();
-    report_at(&mut f, &parent, "start", ReportOutcome::Started, 12).unwrap();
-    let yielded = report_at(
+    assert_eq!(current.len(), 1);
+    assert_eq!(current[0].attempt_id, attempt.attempt_id);
+    assert_eq!(current[0].job.state, JobState::Running);
+    assert_eq!(
+        current[0].required_runner_capabilities,
+        [store::MULTI_DEVICE_SESSION_CAPABILITY]
+    );
+    let queued = f.submit("solver", "other", 0);
+    assert!(f.work.claim("WinE", LONG_WAIT + 1).unwrap().is_none());
+    report_at(
         &mut f,
-        &parent,
-        "yield",
-        ReportOutcome::YieldToChild {
-            checkpoint: json!({"version":1}),
-            child_environment_id: "solver".into(),
-            child_title: "child".into(),
-            child_input: json!({"version":1,"prompt":"child"}),
-            resources_released: true,
+        &attempt,
+        "old-runner-unknown",
+        ReportOutcome::Uncertain {
+            reason: "old Runner stopped after capability fence".into(),
         },
-        20,
+        LONG_WAIT + 2,
     )
     .unwrap();
-    let child = f.work.claim("WinE", 30).unwrap().unwrap();
-    assert_eq!(child.job.start_before_ms, root.start_before_ms);
-    report_at(&mut f, &child, "start", ReportOutcome::Started, 40).unwrap();
-    assert!(f.work.claim("WinC", 100).unwrap().is_none());
-    assert_eq!(
-        f.work.job(&f.alice, &root.id).unwrap().state,
-        JobState::WaitingChild
-    );
-    assert_eq!(
-        f.work
-            .job(&f.alice, yielded.awaiting_child_id.as_ref().unwrap())
-            .unwrap()
-            .state,
-        JobState::Running
-    );
-    report_at(&mut f, &child, "finish", finished(), 110).unwrap();
-    assert!(f.work.claim("WinC", 111).unwrap().is_none());
+    assert_eq!(f.work.assignments("WinE").unwrap().len(), 1);
+    assert!(f.work.claim("WinE", LONG_WAIT + 3).unwrap().is_none());
+    report_at(
+        &mut f,
+        &attempt,
+        "old-runner-drained",
+        ReportOutcome::Finished {
+            success: false,
+            result: json!({"stopped":true}),
+            resources_released: true,
+        },
+        LONG_WAIT + 4,
+    )
+    .unwrap();
     assert_eq!(
         f.work.job(&f.alice, &root.id).unwrap().state,
         JobState::Failed
     );
     assert_eq!(
-        f.work.job(&f.alice, &child.job.id).unwrap().state,
-        JobState::Succeeded
+        f.work.claim("WinE", LONG_WAIT + 5).unwrap().unwrap().job.id,
+        queued.id
     );
-}
-
-#[test]
-fn shared_deadline_v9_forward_migration_is_finite_and_keeps_started_authority() {
-    let mut f = Fixture::new();
-    let root = f.submit("parent", "legacy-root", 1);
-    let parent = f.work.claim("WinC", 11).unwrap().unwrap();
-    report_at(&mut f, &parent, "start", ReportOutcome::Started, 12).unwrap();
-    report_at(
-        &mut f,
-        &parent,
-        "yield",
-        ReportOutcome::YieldToChild {
-            checkpoint: json!({"version":1}),
-            child_environment_id: "solver".into(),
-            child_title: "child".into(),
-            child_input: json!({"prompt":"child"}),
-            resources_released: true,
-        },
-        20,
-    )
-    .unwrap();
-    let child = f.work.claim("WinE", 30).unwrap().unwrap();
-    report_at(&mut f, &child, "start", ReportOutcome::Started, 40).unwrap();
-    f.remove_post_v10_fixture_schema();
-    f.work.db.execute_batch("DROP INDEX shared_jobs_start_deadline; ALTER TABLE shared_jobs DROP COLUMN start_before_ms; PRAGMA user_version=9;").unwrap();
-    f.reopen();
-    assert_eq!(
-        f.work
-            .db
-            .pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
-            .unwrap(),
-        22
-    );
-    for id in [&root.id, &child.job.id] {
-        assert_eq!(
-            f.work.job(&f.alice, id).unwrap().start_before_ms,
-            10 + DEFAULT_START_WINDOW_MS
-        );
-    }
-    assert_eq!(
-        f.work.attempt("WinE", &child.attempt_id).unwrap().state,
-        "running"
-    );
-    f.reopen();
-    assert_eq!(
-        f.work.job(&f.alice, &root.id).unwrap().start_before_ms,
-        10 + DEFAULT_START_WINDOW_MS
-    );
-}
-
-#[test]
-fn shared_deadline_handover_keeps_uncertain_child_capacity_until_exact_stop() {
-    for (expired, manual) in [(false, false), (false, true), (true, false)] {
-        let mut f = Fixture::new();
-        identity::set_project_role(
-            &f.work.db,
-            &f.admin,
-            "alpha",
-            &f.bob.user_id,
-            Some(ProjectRole::Contributor),
-            5,
-        )
-        .unwrap();
-        let root = f
-            .work
-            .submit(&f.alice, &request("handover", "parent", Some(1000)), 10)
-            .unwrap();
-        let parent = f.work.claim("WinC", 11).unwrap().unwrap();
-        report_at(&mut f, &parent, "start", ReportOutcome::Started, 12).unwrap();
-        report_at(
-            &mut f,
-            &parent,
-            "yield",
-            ReportOutcome::YieldToChild {
-                checkpoint: json!({"version":1}),
-                child_environment_id: "solver".into(),
-                child_title: "uncertain child".into(),
-                child_input: json!({"prompt":"child"}),
-                resources_released: true,
-            },
-            20,
-        )
-        .unwrap();
-        let child = f.work.claim("WinE", 30).unwrap().unwrap();
-        report_at(
-            &mut f,
-            &child,
-            "uncertain",
-            ReportOutcome::Uncertain {
-                reason: "preparation could not be reconciled".into(),
-            },
-            40,
-        )
-        .unwrap();
-        let latest = f.work.job(&f.alice, &root.id).unwrap();
-        f.work
-            .handover(
-                &f.alice,
-                &root.id,
-                &HandoverRequest {
-                    expected_revision: latest.revision,
-                    new_assignee_id: f.bob.user_id.clone(),
-                },
-                50,
-            )
-            .unwrap();
-        let held = f.work.assignments("WinE").unwrap();
-        assert_eq!(
-            held.len(),
-            1,
-            "handover must not release uncertain preparation capacity"
-        );
-        assert!(held[0].stop_requested);
-        assert_eq!(
-            f.work.job(&f.alice, &root.id).unwrap().assignee_id,
-            f.alice.user_id
-        );
-        assert!(
-            f.work
-                .handover_view(&f.alice, &root.id)
-                .unwrap()
-                .pending
-                .is_some()
-        );
-        let now = if expired { 1001 } else { 80 };
-        f.work.expire_start_deadlines(now).unwrap();
-        assert!(report_at(&mut f, &child, "late-start", ReportOutcome::Started, now).is_err());
-        assert_eq!(f.work.assignments("WinE").unwrap().len(), 1);
-        if manual {
-            let command = ManagementCommand {
-                request_id: "confirmed-stop".into(),
-                expected_revision: f.work.management_snapshot(&f.admin).unwrap()["revision"]
-                    .as_str()
-                    .unwrap()
-                    .into(),
-                request: ManagementRequest::SettleAttempt {
-                    attempt_id: child.attempt_id.clone(),
-                    generation: child.generation,
-                    acknowledge_stopped: true,
-                    reason: "operator confirmed the process has stopped".into(),
-                },
-            };
-            f.work.manage(&f.admin, &command, now).unwrap();
-            f.work.manage(&f.admin, &command, now + 1).unwrap();
-        } else {
-            report_at(
-                &mut f,
-                &child,
-                "stopped",
-                ReportOutcome::Finished {
-                    success: false,
-                    result: json!({"stopped":true}),
-                    resources_released: true,
-                },
-                now,
-            )
-            .unwrap();
-        }
-        assert!(f.work.assignments("WinE").unwrap().is_empty());
-        let final_root = f.work.job(&f.alice, &root.id).unwrap();
-        if expired {
-            assert_eq!(final_root.state, JobState::Failed);
-            assert_eq!(final_root.assignee_id, f.alice.user_id);
-        } else {
-            assert_eq!(final_root.state, JobState::Queued);
-            assert_eq!(final_root.assignee_id, f.bob.user_id);
-        }
-        assert!(
-            f.work
-                .handover_view(&f.alice, &root.id)
-                .unwrap()
-                .pending
-                .is_none()
-        );
-        let replay = report_at(
-            &mut f,
-            &child,
-            "stopped",
-            ReportOutcome::Finished {
-                success: false,
-                result: json!({"stopped":true}),
-                resources_released: true,
-            },
-            now + 1,
-        );
-        if manual {
-            assert!(replay.is_err());
-        } else {
-            replay.unwrap();
-        }
-        assert_eq!(
-            f.work.job(&f.alice, &root.id).unwrap().revision,
-            final_root.revision
-        );
-        assert!(f.work.assignments("WinE").unwrap().is_empty());
-    }
 }
