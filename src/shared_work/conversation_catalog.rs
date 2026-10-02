@@ -1,15 +1,19 @@
 //! The first submitted root job is a shared conversation's stable identity.
 //! Edits and deletion are small metadata over that canonical job history.
+//! External attempts use the same job ledger for capacity, but their conversations
+//! remain owned by the local Desktop/CLI/TUI session.
 use super::*;
 use crate::identity::{self, Principal, ProjectRole};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde_json::json;
 
-fn anchor_exists(db: &Connection, project: &str, conversation: &str) -> Result<bool> {
+pub(super) fn anchor_exists(db: &Connection, project: &str, conversation: &str) -> Result<bool> {
     Ok(db.query_row(
         "SELECT EXISTS(SELECT 1 FROM shared_jobs j JOIN shared_projects p ON p.id=j.project_id
          WHERE j.id=?2 AND j.project_id=?1 AND j.id=j.root_id AND j.parent_id IS NULL
-           AND j.conversation_id=j.id AND p.archived=0 AND p.deleted_at_ms IS NULL)",
+           AND j.conversation_id=j.id AND p.archived=0 AND p.deleted_at_ms IS NULL
+           AND NOT EXISTS(SELECT 1 FROM shared_attempts a JOIN shared_external_attempts x
+                          ON x.attempt_id=a.id WHERE a.job_id=j.id))",
         params![project, conversation],
         |row| row.get(0),
     )?)
@@ -153,7 +157,10 @@ impl SharedWork {
              FROM shared_jobs anchor LEFT JOIN shared_conversation_details details
                ON details.project_id=anchor.project_id AND details.conversation_id=anchor.id
              WHERE anchor.project_id=?1 AND anchor.id=anchor.root_id AND anchor.parent_id IS NULL
-               AND anchor.conversation_id=anchor.id ORDER BY anchor.created_at_ms DESC,anchor.id DESC LIMIT 1000"
+               AND anchor.conversation_id=anchor.id
+               AND NOT EXISTS(SELECT 1 FROM shared_attempts a JOIN shared_external_attempts x
+                              ON x.attempt_id=a.id WHERE a.job_id=anchor.id)
+             ORDER BY anchor.created_at_ms DESC,anchor.id DESC LIMIT 1000"
         )?.query_map([project],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<String>>(2)?,row.get::<_,u64>(3)?,row.get::<_,Option<u64>>(4)?,row.get::<_,u64>(5)?)))?
           .collect::<std::result::Result<Vec<_>,_>>()?;
         let role =

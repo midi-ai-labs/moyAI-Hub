@@ -49,7 +49,7 @@ export function onboardingNextStep(shared: SharedAdminSnapshot, network: Network
     if (modelCount === null) return { kind: "checking", title: "Hubの登録モデルを確認しています", ...manager, detail: "モデルの一覧が届くと、次の操作を表示します。", action: null };
     if (modelCount === 0) return { kind: "models", title: "チームで使うAIをHubに登録してください", ...manager, detail: "作業フォルダーは準備済みですが、仕事に使うAIがHubに登録されていません。モデルを登録し、「最初に使う共有モデル」を選んでから、Desktopでサンプルを依頼してください。", action: { kind: "link", href: "#models", label: "共有AIを登録する" } };
     const unfinished = p.executors.filter(row => row.preparation_state !== "ready");
-    return { kind: "sample", title: "Desktopからサンプルを依頼してください", owner: "操作PCを使う人", location: `${pcNames(p.requesters)} のDesktop`, detail: `「${p.project.label}」を開き、通常のチャット欄から依頼してください。使うPCはAIが準備済みのPC（${pcNames(ready)}）から判断します。特定のPCを使いたい場合は依頼文にPC名を書きます。作業フォルダーは準備済みですが、AIの接続・実行結果はこのサンプルで確認します。${unfinished.length ? ` ${pcNames(unfinished)} は準備が未完了です。` : ""}`, action: { kind: "first", label: "サンプルの依頼手順" } };
+    return { kind: "sample", title: "Desktopからサンプルを依頼してください", owner: "操作PCを使う人", location: `${pcNames(p.requesters)} のDesktop`, detail: `「${p.project.label}」を開き、通常のチャット欄から依頼してください。使うPCはAIが準備済みのPC（${pcNames(ready)}）から判断します。AIの接続・実行結果はこのサンプルで確認します。${unfinished.length ? ` ${pcNames(unfinished)} は準備が未完了です。` : ""}`, action: { kind: "first", label: "サンプルの依頼手順" } };
   }
   const failed = p.executors.filter(row => row.preparation_state === "failed");
   if (failed.length) return { kind: "preparation_failed", title: "実行PCの保存先を確認してください", owner: "実行PCの担当者 → Hub管理者", location: `${pcNames(failed)} のDesktop → このHub管理画面`, detail: "PCの担当者が保存先・権限と、下の「実行するPCとAI」にあるエラーを確認します。原因を解消したら、Hub管理者が管理画面の「プロジェクト」で「フォルダー作成を再試行」を押してください。", action: { kind: "link", href: "#shared-administration", label: "プロジェクトの管理へ" } };

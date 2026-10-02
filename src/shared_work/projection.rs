@@ -160,11 +160,7 @@ impl SharedWork {
         }
         let role =
             identity::require_project_role(&self.db, &actor.user_id, project, ProjectRole::Reader)?;
-        let anchor:bool=self.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM shared_jobs WHERE id=?1 AND project_id=?2 AND id=root_id AND parent_id IS NULL AND conversation_id=id)",
-            params![conversation,project],|r|r.get(0),
-        )?;
-        if !anchor {
+        if !super::conversation_catalog::anchor_exists(&self.db, project, conversation)? {
             return Err(WorkError::NotFound);
         }
         if !super::conversation_catalog::visible(&self.db, project, conversation)? {
@@ -543,11 +539,11 @@ impl SharedWork {
         job: &Job,
         now: u64,
     ) -> Result<JobSummary> {
-        let (environment_label,enabled,capacity,resource_id):(String,bool,u32,String) = self.db.query_row(
-            "SELECT e.label,e.enabled,r.capacity,r.id FROM shared_environments e JOIN shared_resources r ON r.id=e.resource_id WHERE e.id=?1", [&job.environment_id],
-            |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+        let (environment_label, enabled, runner_id): (String, bool, String) = self.db.query_row(
+            "SELECT label,enabled,runner_id FROM shared_environments WHERE id=?1",
+            [&job.environment_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
-        let occupied = super::store::resource_occupancy(&self.db, &resource_id)?;
         let uncertainty_reason:Option<String> = self.db.query_row("SELECT uncertainty_reason FROM shared_attempts WHERE job_id=?1 AND state IN ('assigned','running','stop_requested')", [&job.id], |r|r.get(0)).optional()?.flatten();
         let runner_contact = self.job_contact(job, now)?;
         let wait_reason = if super::deadlines::is_expired_result(job) {
@@ -577,15 +573,15 @@ impl SharedWork {
                 {
                     Some("担当者の現在の利用権限を確認する必要があります。".into())
                 }
-                JobState::Queued if occupied >= capacity => {
-                    Some("ほかの仕事が使っている共通利用枠が空くのを待っています。".into())
+                JobState::Queued => {
+                    match super::store::check_job_capacity(&self.db, &runner_id, job) {
+                        Ok(_) => Some("実行端末の受付を待っています。".into()),
+                        Err(WorkError::Capacity) => {
+                            Some("ほかの仕事が使っている共通利用枠が空くのを待っています。".into())
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
-                JobState::Queued if self.db.query_row(
-                    "SELECT required_capability IS NOT NULL FROM shared_jobs WHERE id=?1",
-                    [&job.id],
-                    |row| row.get::<_, bool>(0),
-                )? => Some("対象PCの実行プログラムがこの仕事に対応して接続するまで待っています。最新版か稼働状況を確認してください。".into()),
-                JobState::Queued => Some("実行端末の受付を待っています。".into()),
                 JobState::Assigned => Some("実行端末が開始を確認しています。".into()),
                 JobState::WaitingChild => Some("子の仕事の結果を待っています。".into()),
                 JobState::Cancelling => Some("実行端末の停止確認を待っています。".into()),

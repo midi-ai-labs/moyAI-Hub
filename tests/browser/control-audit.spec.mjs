@@ -251,7 +251,7 @@ test("Legacy invitation and directed-rule API data stay compatible without expos
     const invite=await hub.command("hub_network_invite",{expectedRevision:state.revision,label:"Legacy invited fixture",groups:[servers.id]});
     expect(typeof invite.code).toBe("string"); expect(invite.code.length).toBeGreaterThan(20);
     await page.reload();
-    for(const selector of ["#network-group-form","#network-rule-form",'details[data-details-key="network-legacy-invite"]']) await expect(page.locator(selector)).toBeHidden();
+    for(const selector of ["#network-group-form","#network-rule-form",'details[data-details-key="network-legacy-invite"]']) await expect(page.locator(selector)).toHaveCount(0);
     expect((await hub.command("hub_network_snapshot")).rules).toEqual(state.rules);
     await capture(page,testInfo,"legacy-compatibility-project-navigation"); expect(errors).toEqual([]);
 });

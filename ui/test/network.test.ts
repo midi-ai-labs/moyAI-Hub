@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { NetworkEdits, networkAdmissionStatus, networkCanDistribute, networkIsLocalOnly, networkCertificateStatus, networkClientAction, networkClients, networkDeviceDeletion, networkDevices, networkDeviceStatus, networkDiagnosticMatches, networkDiagnosticStages, networkDiagnosticTarget, networkGatewayPort, networkHostingAddress, networkServerAddress, networkSetupStep, networkSubject, type NetworkSnapshot, type NetworkDiagnostics } from "../src/network_state.ts";
+import { NetworkEdits, networkAdmissionStatus, networkCanDistribute, networkIsLocalOnly, networkCertificateStatus, networkClientAction, networkClients, networkDeviceDeletion, networkDevices, networkDeviceStatus, networkDiagnosticMatches, networkDiagnosticStages, networkDiagnosticTarget, networkGatewayPort, networkHostingAddress, networkServerAddress, networkSetupStep, type NetworkSnapshot, type NetworkDiagnostics } from "../src/network_state.ts";
 
 function snapshot(revision = "9007199254740993"): NetworkSnapshot {
     return { revision, hub_id: "hub-a", ca_certificate_pem: "public-ca", ca_sha256: "digest", gateway_port: 0, hosting: { configured: false, bind: null, advertise_ip: null, error: null }, server: { running: false, bind: null, gateway_bind: null, certificate: null },
@@ -204,12 +204,6 @@ test("stop and reallow keep the same registered identity and never invoke irreve
     device.admission = "allowed"; device.revoked = true;
     assert.equal(networkClientAction({ kind: "device", device }, current.revision), null);
 });
-test("permission subjects preserve direction and typed device or group identity", () => {
-    assert.deepEqual(networkSubject("device:from"), { kind: "device", id: "from" });
-    assert.deepEqual(networkSubject("group:to"), { kind: "group", id: "to" });
-    for (const invalid of ["", "device:", "from", "profile:to"]) assert.equal(networkSubject(invalid), null);
-});
-
 test("deletion confirms the exact identity even for duplicate names and reports unsettled work", () => {
     const current = snapshot(); const first = current.devices[0];
     const second = { ...first, device_id: "replacement", registered_ip: "192.168.1.20", unsettled_jobs: 2 };

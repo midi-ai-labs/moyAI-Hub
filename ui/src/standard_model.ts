@@ -3,7 +3,7 @@ import type { Snapshot } from "./state.ts";
 
 export function attachStandardModel(host: HTMLElement, refresh: () => Promise<void>) {
     const section = document.createElement("div"); section.className = "standard-model";
-    section.innerHTML = `<h3>最初に使う共有モデル</h3><p>初めてHubのAIを使うPCで選ばれるモデルを指定します。すでに利用者が選んだモデルはそのまま使われます。設定後はDesktopでサンプルを実行し、回答と成果を確認してください。</p><label>初めて接続するPCのモデル<select id="team-standard-model"></select></label><button id="team-standard-save" class="secondary" type="button" disabled>標準モデルの設定を保存</button><p id="team-standard-status" role="status"></p>`;
+    section.innerHTML = `<h3>最初に使う共有モデル</h3><p>初めてHubのAIを使うPC向けのモデルです。利用者がすでに選んだモデルは変わりません。</p><label>初めて接続するPCのモデル<select id="team-standard-model"></select></label><button id="team-standard-save" class="secondary" type="button" disabled>標準モデルの設定を保存</button><p id="team-standard-status" role="status"></p>`;
     host.prepend(section);
     const select = section.querySelector<HTMLSelectElement>("select")!;
     const button = section.querySelector<HTMLButtonElement>("button")!;
@@ -20,7 +20,7 @@ export function attachStandardModel(host: HTMLElement, refresh: () => Promise<vo
             option.disabled = !enabled; return option;
         }));
         select.value = chosen;
-        status.textContent = chosen ? `初めて接続するPCのモデル：${models.find(model => model.id === chosen)?.label ?? chosen}。Desktopでサンプルを実行してください。` : "標準のモデルは未指定です。接続時に登録済みの候補から自動で選ばれます。";
+        status.textContent = chosen ? `初めて接続するPCのモデル：${models.find(model => model.id === chosen)?.label ?? chosen}。` : "標準のモデルは未指定です。接続時に登録済みの候補から自動で選ばれます。";
         button.disabled = true;
     }
     select.addEventListener("change", () => { if (!snapshot || busy) return; draftRevision ??= snapshot.store.revision; button.disabled = false; status.textContent = "選択は未保存です。"; });

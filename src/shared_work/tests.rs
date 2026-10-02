@@ -945,33 +945,6 @@ fn non_quiescent_checkpoint_and_result_keep_resource_occupied() {
 }
 
 #[test]
-fn descendant_budget_is_cumulative_and_exhaustion_is_an_explicit_error() {
-    let mut f = Fixture::new();
-    f.submit("parent", "budget", 1);
-    let parent = f.work.claim("WinC", 12).unwrap().unwrap();
-    f.report(&parent, "start", ReportOutcome::Started);
-    f.report(&parent, "yield", child());
-    let c = f.work.claim("WinE", 21).unwrap().unwrap();
-    f.report(&c, "start", ReportOutcome::Started);
-    f.report(&c, "done", finished());
-    let resumed = f.work.claim("WinC", 22).unwrap().unwrap();
-    f.report(&resumed, "start", ReportOutcome::Started);
-    assert!(matches!(
-        f.work.report(
-            "WinC",
-            &Report {
-                event_id: "another-child".into(),
-                attempt_id: resumed.attempt_id,
-                generation: resumed.generation,
-                outcome: child()
-            },
-            23
-        ),
-        Err(WorkError::Capacity)
-    ));
-}
-
-#[test]
 fn wrong_worker_generation_and_event_payload_cannot_change_an_attempt() {
     let mut f = Fixture::new();
     f.submit("solver", "fenced", 0);
@@ -1135,6 +1108,7 @@ mod completion;
 mod controller_projection;
 mod data_tests;
 mod deadlines;
+mod descendant_capacity;
 mod origin;
 mod origin_control;
 mod participation;

@@ -340,7 +340,7 @@
               モデルはまだ登録されていません
             </h3>
             <p>
-              まずは上のフォームに、LLM ホストの IP:port を入力してください。
+              上のフォームに、モデルホストの IP:port を入力してください。
             </p>
           </div>
           <div class="legend">
@@ -361,7 +361,7 @@
             </span>
           </div>
           <p class="footnote">一覧にあるモデルへ要求を中継します。ロードや実行可否の判断は oMLX や LM Studio などのホスト側が行います。</p>
-          <details class="technical-details"><summary>モデルの確認と同時接続数の詳しい説明</summary><p class="footnote">Hub はモデル一覧・接続状態・管理者の設定に基づいて接続先を選びます。未ロードでも一覧にあれば割当候補になります。生成の成功はホスト側の設定と応答によります。同じホストなど、同時接続数を共有したい接続先は同時接続数を共有するグループにまとめます。</p></details>
+          <details class="technical-details"><summary>モデルの確認と同時接続数の詳しい説明</summary><p class="footnote">Hub はモデル一覧・接続状態・管理者の設定に基づいて接続先を選びます。未ロードでも一覧にあれば割当候補になります。生成の成功はホスト側の設定と応答によります。同時接続数をまとめて制限する接続先は、同じグループに登録します。</p></details>
         </section>
         <section class="panel" id="clients" aria-labelledby="clients-heading">
           <div class="section-title">
@@ -416,7 +416,7 @@
             </p>
           </div>
           <p class="footnote">
-            端末の状態は Desktop からの申告です。この Hub のモデル通信は概要の「Hub のモデル中継」で確認できます。
+            端末の状態はDesktopからの申告です。このHubのモデル通信は概要の「Hub のモデル中継」で確認できます。
           </p>
           <p class="footnote">ここに表示する ID はモデル通信の接続 ID です。PCの登録ID とは別で、サーバー再起動時に作り直します。30秒間応答がない接続は切断として表示します。</p>
           </details>
@@ -437,7 +437,7 @@
             </span>
           </div>
           <p class="subtle">
-            モデルや同時接続数の設定を変更すると、モデル設定の更新番号が進みます。Desktop では次に Hub へ送信する前に、変更内容の確認が必要です。
+            モデルや同時接続数の設定を変更すると、モデル設定の更新番号が進みます。Desktopでは次にHubへ送信する前に、変更内容の確認が必要です。
           </p>
           <div id="revision-rows" class="revision-list">
           </div>
@@ -447,7 +447,7 @@
         </section>
         <section class="network-card" aria-label="管理画面とHub本体">
           <h3>管理画面とHub本体</h3>
-          <p class="footnote">この画面を閉じても、Hubの受付と中継は継続します。端末からの受付を止める場合は「ネットワークを停止」を使用してください。Hub本体を終了する場合は、起動元で停止してください。</p>
+          <p class="footnote">この画面を閉じても、Hubの受付と中継は継続します。端末からの受付を止める場合は「接続の受付を停止」を押してください。Hub本体を終了する場合は、起動元で停止してください。</p>
           <p id="management-status" role="status">Hub本体に接続しています…</p>
           <button id="management-reconnect" type="button" class="secondary">Hub本体へ再接続</button>
         </section>
@@ -485,7 +485,7 @@
         <label>システムプロンプト（任意）
           <textarea id="edit-system-prompt" rows="5" spellcheck="false"></textarea>
         </label>
-        <p class="footnote">同じ論理モデルのすべての登録先に適用します（最大16,384文字）。空欄で保存すると削除します。DesktopとRunnerで更新後のモデル設定を確認すると、次の実行から反映されます。</p>
+        <p class="footnote">このモデルを使うすべての接続先に適用します（最大16,384文字）。空欄で保存すると削除します。DesktopとRunnerで更新後のモデル設定を確認すると、次の実行から反映されます。</p>
         <label>
           APIキー
           <input id="edit-api-key" type="password" spellcheck="false" autocomplete="off" aria-describedby="edit-api-key-status"/>

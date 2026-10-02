@@ -136,7 +136,6 @@ test("one prepared executor enables a real sample while another incomplete execu
   assert.equal(step.action?.kind, "first");
   assert.match(step.detail, /通常のチャット欄から依頼/);
   assert.match(step.detail, /AIが準備済みのPC（WinB）から判断/);
-  assert.match(step.detail, /依頼文にPC名/);
   assert.doesNotMatch(step.detail, /実行先に.*選んで/);
   assert.match(step.detail, /WinC は準備が未完了/);
   assert.match(step.detail, /AIの接続・実行結果はこのサンプルで確認/);

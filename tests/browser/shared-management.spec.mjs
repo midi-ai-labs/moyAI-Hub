@@ -1,5 +1,6 @@
 import { test, expect } from "./fixture.mjs";
 import { createDeviceParticipant } from "./device-fixture.mjs";
+import { randomUUID } from "node:crypto";
 
 
 async function sharedSnapshot(page,hub) {
@@ -99,6 +100,36 @@ test("one project form assigns both PC purposes and waits for the execution PC t
   expect(await second.participant.sharedProvisioning()).toEqual([]);
   const retiredProject=page.locator(".shared-admin-row").filter({has:page.getByRole("heading",{name:"設計プロジェクト A",exact:true})});
   await expect(retiredProject).toContainText("仕事を実行するPC未選択");
+  // Existing groups remain an API/data contract even though their creation form
+  // is absent. Exercise the surviving users UI against one such stored group.
+  const groupId="existing-research", userId=removed.device_principals.find(row=>row.device_id===first.deviceId).user_id;
+  const session=await (await page.request.get(new URL("/admin/session",hub.url).href)).json();
+  const groupResponse=await page.request.post(new URL("/admin/command",hub.url).href,{
+    headers:{Origin:new URL(hub.url).origin,"X-Moyai-Csrf":session.csrf,"X-Moyai-Session":session.authentication.session_id},
+    data:{command:"hub_shared_command",args:{request_id:randomUUID(),expected_revision:removed.revision,request:{kind:"create_group",id:groupId,label:"既存の研究グループ"}}},
+  });
+  expect(groupResponse.ok()).toBe(true);
+  await open(page,hub);
+  await page.getByText("既存の利用者・権限（詳細）",{exact:true}).click();
+  await page.locator('[data-sa-tab="users"]').click();
+  await operation(page,"group_member");
+  await page.locator("#shared-admin-group_id").selectOption(groupId);
+  await page.locator("#shared-admin-user_id").selectOption(userId);
+  await page.getByLabel("このグループへ所属させる",{exact:true}).check(); await save(page);
+  await operation(page,"group_project_role");
+  await page.locator("#shared-admin-project_id").selectOption(projectId);
+  await page.locator("#shared-admin-group_id").selectOption(groupId);
+  await page.locator("#shared-admin-role").selectOption("reader"); await save(page);
+  await operation(page,"project_member");
+  await page.locator("#shared-admin-project_id").selectOption(projectId);
+  await page.locator("#shared-admin-user_id").selectOption(userId);
+  await page.locator("#shared-admin-role").selectOption("manager"); await save(page);
+  const permissions=await sharedSnapshot(page,hub);
+  expect(permissions.group_memberships).toContainEqual({group_id:groupId,user_id:userId});
+  expect(permissions.group_project_roles).toContainEqual({group_id:groupId,project_id:projectId,role:"reader"});
+  expect(permissions.project_memberships).toContainEqual({user_id:userId,project_id:projectId,role:"manager"});
+  expect(permissions.resources).toEqual(removed.resources);
+  await info.attach("existing-users-permissions",{body:await page.locator("#shared-administration").screenshot(),contentType:"image/png"});
   await page.locator('[data-sa-tab="storage"]').click(); await operation(page,"prune_shared_data");
   await page.locator("#shared-admin-cutoff").fill("2020-01-01"); await page.locator("#shared-admin-preview").click();
   await expect(page.locator("#shared-admin-preview-result")).toContainText("0件 / 0 bytes");

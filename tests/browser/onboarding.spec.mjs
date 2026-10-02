@@ -5,6 +5,7 @@ test("first setup starts with PC and project choices without user or password ch
   await page.goto(hub.url);
   await expect(page.locator("#onboarding-steps")).toContainText("最初のプロジェクト");
   await expect(page.locator("#onboarding-new-user")).toHaveCount(0);
+  await expect(page.locator("#onboarding-steps").getByRole("link",{name:"プロジェクトのPC用途を確認",exact:true})).toHaveCount(0);
   await expect(page.locator("#onboarding-steps")).toContainText("チームの仕事にはHubに登録したAIが必要です");
   await expect(page.locator("#team-onboarding")).not.toContainText("PCに直接設定したAIなら不要");
   await page.locator("#onboarding-new-project").click();
@@ -25,6 +26,43 @@ async function start(page,hub) {
   await page.locator("#network-ip").fill("127.0.0.1"); await page.locator("#network-port").fill(String(hub.networkPort));
   await page.locator("#network-start").click(); await expect(page.locator("#network-stop")).toBeVisible();
 }
+
+test("PC-only admission enables project purposes only while a project is selected",async({page,hub},info)=>{
+  await start(page,hub);
+  await expect(page.locator("#onboarding-next-title")).toHaveText("最初のプロジェクトを作ってください");
+  await expect(page.locator("#team-onboarding").getByRole("button",{name:"プロジェクトを作る",exact:true})).toHaveCount(1);
+  await expect(page.locator("#onboarding-steps [data-onboarding-edit]")).toHaveCount(0);
+  const purposes=page.locator("#onboarding-steps").getByRole("link",{name:"プロジェクトのPC用途を確認",exact:true});
+  await expect(purposes).toHaveCount(0);
+  await info.attach("first-project-single-entry",{body:await page.locator("#team-onboarding").screenshot(),contentType:"image/png"});
+  const projectId=await project(page,"用途を選ぶプロジェクト");
+  await expect(purposes).toBeVisible();
+  await purposes.click();
+  await expect(page).toHaveURL(/#shared-administration$/);
+  await expect(page.locator("#shared-admin-content").getByRole("heading",{name:"用途を選ぶプロジェクト",exact:true})).toBeVisible();
+  const participant=await createDeviceParticipant(await hub.observeNetwork(),"用途を確認するPC");
+  await page.locator("#network-clients-refresh").click();
+  await page.locator(`[data-id="request:${participant.requestId}"] button[data-network-action]`).click();
+  const control=page.locator("#join-project-control"),execute=page.locator("#join-project-execute");
+  await expect(control).toBeDisabled(); await expect(execute).toBeDisabled();
+  await expect(page.locator("#join-project-save")).toHaveText("参加を許可");
+  await page.locator("#join-project-project").selectOption(projectId);
+  await expect(control).toBeEnabled(); await expect(execute).toBeEnabled();
+  await control.check(); await execute.check();
+  await expect(page.locator("#join-project-save")).toHaveText("参加と用途を許可");
+  await page.locator("#join-project-project").selectOption("");
+  await expect(control).toBeDisabled(); await expect(execute).toBeDisabled();
+  await expect(control).not.toBeChecked(); await expect(execute).not.toBeChecked();
+  await info.attach("pc-only-admission",{body:await page.locator("#join-project-dialog").screenshot(),contentType:"image/png"});
+  await page.locator("#join-project-save").click();
+  await expect(page.locator("#join-project-dialog")).not.toBeVisible();
+  expect((await participant.collectApproval()).status).toBe("approved");
+  const session=await (await page.request.get(new URL("/admin/session",hub.url).href)).json();
+  const response=await page.request.post(new URL("/admin/command",hub.url).href,{headers:{Origin:new URL(hub.url).origin,"X-Moyai-Csrf":session.csrf,"X-Moyai-Session":session.authentication.session_id},data:{command:"hub_shared_snapshot",args:{}}});
+  expect(response.ok()).toBe(true);
+  const shared=(await response.json()).result;
+  expect(shared.project_devices.filter(row=>row.project_id===projectId)).toEqual([]);
+});
 
 test("connection setup guides the first PC through start permission file and approval without claiming reachability",async({page,hub},info)=>{
   await page.goto(hub.url); await page.locator('nav a[href="#device-network"]').click();

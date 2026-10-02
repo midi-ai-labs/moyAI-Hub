@@ -166,12 +166,6 @@ export class NetworkEdits {
         if (this.snapshot) for (const editor of this.revisions.keys()) this.revisions.set(editor, this.snapshot.revision);
     }
 }
-export function networkSubject(value: string): NetworkSubject | null {
-    const delimiter = value.indexOf(":");
-    const kind = value.slice(0, delimiter);
-    const id = value.slice(delimiter + 1);
-    return delimiter > 0 && id && (kind === "device" || kind === "group") ? { kind, id } : null;
-}
 export function networkDeviceStatus(device: NetworkDevice): { label: string; color: string; detail: string } {
     if (!device.online) return { label: "オフライン", color: "gray", detail: "このPCからの接続がありません。" };
     return { label: "オンライン", color: "green", detail: "このPCはHubに接続しています。依頼や実行に使うプロジェクトを設定してください。" };

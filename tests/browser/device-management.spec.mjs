@@ -133,13 +133,15 @@ test(selection === "keyboard-popup" ? "Automatic refresh continues after keyboar
 }
 
 for (const region of ["project list", "onboarding steps", "next guidance"]) {
-    test(`Automatic refresh updates focused ${region} facts without changing an action target`, async ({ page, hub }, testInfo) => {
+    const title = region === "next guidance" ? "Automatic refresh keeps the project creation action distinct when next guidance changes"
+        : `Automatic refresh updates focused ${region} facts without changing an action target`;
+    test(title, async ({ page, hub }, testInfo) => {
         await startNetwork(page, hub);
         const initial = "更新前の仕事", updated = "更新後の仕事";
         const projectId = region === "next guidance" ? `project-${randomUUID()}` : await createProject(page, initial);
         const target = region === "project list"
             ? page.locator(`#shared-admin-content [data-sa-operation="save_project"][data-sa-id="${projectId}"]`)
-            : page.locator(region === "onboarding steps" ? "#onboarding-steps [data-onboarding-edit]" : "#onboarding-next [data-onboarding-edit]");
+            : page.locator(region === "onboarding steps" ? "#onboarding-steps [data-onboarding-edit]" : "#onboarding-new-project");
         await target.focus();
         await expect(target).toBeFocused();
         const focused = await target.elementHandle();
@@ -148,15 +150,12 @@ for (const region of ["project list", "onboarding steps", "next guidance"]) {
         const regionNode = page.locator(region === "project list" ? "#shared-admin-content"
             : region === "onboarding steps" ? "#onboarding-steps" : "#onboarding-next");
         await expect(regionNode).toContainText(region === "next guidance" ? "仕事を依頼するPCを指定してください" : updated);
-        if (region === "next guidance") {
-            // The old action creates a project; the new one edits an existing
-            // project. Do not retarget a still-focused action silently.
-            expect(await focused.evaluate(node => node.isConnected)).toBe(false);
-            await expect(regionNode).toBeFocused();
-        } else {
-            expect(await focused.evaluate(node => node.isConnected && node === document.activeElement)).toBe(true);
-        }
+        expect(await focused.evaluate(node => node.isConnected && node === document.activeElement)).toBe(true);
         await capture(page, testInfo, `automatic-focused-${region.replaceAll(" ", "-")}`);
+        if (region === "next guidance") {
+            await target.click();
+            await expect(page.locator("#shared-admin-label")).toHaveValue("");
+        }
     });
 }
 

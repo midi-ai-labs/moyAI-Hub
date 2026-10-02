@@ -1,6 +1,6 @@
 # Hub Web管理 GUI試験の範囲
 
-2026-09-27時点のHub Web管理にある現役の操作を対象にする。以下は再利用する試験の対応表であり、全操作の受入完了表ではない。各実行のPASS/FAIL・バイナリーSHA-256・画像の目視結果は、その実行の`project_sandbox`レポートを正とする。
+2026-10-01時点のHub Web管理にある現役の操作を対象にする。以下は再利用する試験の対応表であり、全操作の受入完了表ではない。各実行のPASS/FAIL・バイナリーSHA-256・画像の目視結果は、その実行の`project_sandbox`レポートを正とする。
 
 ## 管理画面と対応する試験
 
@@ -10,7 +10,7 @@
 | 実行PCで使えるソフト・機器の登録 | `shared-management.spec.mjs`でプロジェクトカードから編集し、別の読取要求で保存値と画面への反映を確認 | 宣言した機能の動作・ライセンス可用性は実行PCとDesktop側で確認 |
 | 競合したプロジェクトの編集 | `shared-management.spec.mjs`で入力保持→最新値と比較→明示継続→通常保存、再競合、削除対象、遅延比較後の利用終了と新ticketで再開 | 実行結果はtask-local reportを参照。破壊的・世代依存の操作は対象を開き直す |
 | 最初のPCへの接続手順 | `onboarding.spec.mjs`で設定・開始→受信許可案内→ファイル取得→実TLS申請・承認→Desktop診断案内、停止時の戻り、Gateway変更が任意で開始前に見えること | このケースはloopbackのprotocol fixture。実UAC・Firewall書込み・物理LAN到達・実AI応答を確認した意味ではない |
-| PC参加と用途の一括判断 | `onboarding.spec.mjs`でWindowsユーザー名の参考表示、同じPCの操作／実行用途、非管理者の専用actor発行とPWなしのproject閲覧、並行更新後の部分保存と同一PC再開 | 複数の物理PC、申請元と現物の照合 |
+| PC参加と用途の一括判断 | `onboarding.spec.mjs`でWindowsユーザー名の参考表示、同じPCの操作／実行用途、project未選択時の用途無効化・選択解除後のPCのみの保存、非管理者の専用actor発行とPWなしのproject閲覧、並行更新後の部分保存と同一PC再開 | 複数の物理PC、申請元と現物の照合 |
 | 自動更新とフォーカス | `device-management.spec.mjs`で手動更新なしの参加許可・PC名・用途・online・次の申請、native SELECTのクリック／Alt+ArrowDown／focus跨ぎTab、一覧／導入案内のfocus保持、削除された操作targetの退役。`stable-rows.spec.mjs`で存続行の移動時focus。`management-workflows.spec.mjs`で入力draft・caret保持と競合拒否 | headlessの結果と実画面操作は各証跡で区別。物理PCでのIME・ブラウザーのnative操作は実環境でも確認 |
 | LAN候補・固定Gateway・受信許可 | 候補読み取り、固定Gateway、`firewall.spec.mjs`のloopback拒否・起動時の現在ルール照合・LAN候補の明示入力・取得済み社内IPv4での実ルール読取preview・入力変更時の確認無効化。試験はapply/remove/UACを操作しない | 実Firewall書込み・UAC取消／権限拒否・GPO・物理別PC到達は専用実環境の受入。模擬NetSecurityのPS5.1検証とは区別 |
 | 最初に使う共有モデル | `management-workflows.spec.mjs`で管理者の明示選択、保存値と最後のモデル削除後の指定解除 | 新規Desktopへの初期選択と保存済み選択維持はconsumer側の結合。生成成功は別確認 |
@@ -28,13 +28,13 @@
 | 端末ネットワーク開始・停止 | IPv4・port入力、開始、設定保存有効化、停止してもWebは稼働、停止中の操作disable、使用中portのエラー・入力保持・修正後の再開始 | IPv6、不正bind、Gatewayだけの起動失敗、他端末からの到達、Windows FW |
 | 共通config | GUIダウンロード、URL・公開CA含有、秘密鍵非含有、実clipboardコピーとダウンロード内容の一致 | clipboard拒否時のGUI、ダウンロード取消、Desktop GUIのimportはcombined試験側 |
 | 接続詳細・診断・証明書 | Gateway portの範囲検証と自動設定、固定port保存→ネットワーク再開→画面reload後の再開で実Gateway URL一致、実Hub／Gateway診断、FW項目の未実施表示、3回pollingで展開と入力を維持、証明書更新、旧診断の無効化、760px幅 | Hubプロセスの再起動後適用、証明書期限切れ・更新失敗、既存通信を持ったままの更新、手動長時間ちらつき観察 |
-| 旧グループ（互換） | 互換APIによる保存・参照と既存所属の保持。通常GUIのフォームは非表示 | 新規共有仕事はプロジェクトとPC用途を使用 |
+| 旧グループ（互換） | 互換APIによる保存・参照と既存所属の保持。通常GUIにはフォームを作らない | 新規共有仕事はプロジェクトとPC用途を使用 |
 | 旧方向付き接続ルール（互換） | 互換APIの方向・経路・公開対象・保存保持と通常GUIの非表示。Rust試験は同じ適用範囲の重複拒否・旧重複保持と明示削除を確認 | 新規共有仕事の動線へ復活させない。旧物理再委任の受入とは分ける |
 | 接続PCの絞り込み | 全端末／承認待ち、空結果、PC名検索のdraft・focus、グループ／IP／識別ID検索とclear | 数百行の可読性・keyboard選択・scroll維持 |
 | 参加承認 | 実TLS参加要求、許可、名前・所属を確認して許可、承認済み表示、別端末とのID分離 | 期限切れ申請、承認待ちの名前競合が後から発生する場合、承認と他ページの削除競合 |
 | 端末名・所属・詳細 | 空白／大文字小文字を含む同名変更の拒否、rename、required、複数所属checkboxと解除、close／Escape取消とreopen、review後のdraft保持、照合ID展開維持、背景クリックを無視 | 160文字境界、dialogでの他ページ同時変更、複数checkboxのkeyboard操作 |
 | 端末の稼働・停止・削除 | mTLS生存確認／公開申告の差、停止・再許可、恒久失効、削除前の端末ID確認・取消・確定、別端末保持、削除済み一覧とreload | 実行中・終了未確認の削除拒否、実際のタスク停止、オフライン化の時間推移、失効後のDesktop GUI |
-| 従来の参加コード（互換） | 互換API発行・既存データ保持と通常GUIの非表示 | 通常は共通接続ファイルの配布を使用 |
+| 従来の参加コード（互換） | 互換API発行・既存データ保持を確認し、通常GUIにフォームがないことを確認 | 通常は共通接続ファイルの配布を使用 |
 | MCP履歴の取得 | 端末行のshortcutが自動取得、種類選択、取得中disable、失敗から再取得、一覧・前後page・空結果、遅い旧種類の応答を破棄 | 別端末への選択変更と応答の競合、60秒timeout、100件超・大量保持・30分expiry |
 | MCP履歴の詳細・保存 | 詳細ボタン、取得済み表示、truncated警告、HTMLを文字列として表示、Markdown保存、160行本文のTab／Shift+Tab・PageDown／Ctrl+End／Ctrl+Home・通常poll後のfocus/scroll保持、種類変更時のclear、停止端末から取得、削除済み端末のcached詳細 | 実Desktopの指示／実行履歴との一致、64KiB上限・全文案内、OS保存先選択の取消、再起動後のcache消失 |
 | モデル接続の生存確認 | 現在のHub単独試験は空表示まで | Main／Sideの選択承認、待機・処理・再確認・切断表示はactual Desktopを使うcombined試験側 |

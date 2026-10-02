@@ -25,8 +25,10 @@ fn accepted_context_survives_child_redelegation_parent_resume_and_hub_restart() 
     let first = f.work.claim("WinC", 11).unwrap().unwrap();
     let context = serde_json::to_value(first.project_context.as_ref().unwrap()).unwrap();
     assert_eq!(context["project_id"], "alpha");
-    assert_eq!(context["root_prompt"], "test");
+    assert_eq!(context["root_prompt"], "");
     assert_eq!(context["overview"], "solver: Worker\nparent: API");
+    let mut child_context = context.clone();
+    child_context["root_prompt"] = json!("test");
     f.report(&first, "context-start", ReportOutcome::Started);
     f.report(&first, "context-yield", child());
     edit_overview(&f, "NEW description for future requests");
@@ -38,7 +40,7 @@ fn accepted_context_survives_child_redelegation_parent_resume_and_hub_restart() 
     );
     assert_eq!(
         serde_json::to_value(&child_attempt.project_context).unwrap(),
-        context
+        child_context
     );
     assert_eq!(child_attempt.job.environment_id, "solver");
     f.report(
@@ -64,7 +66,7 @@ fn accepted_context_survives_child_redelegation_parent_resume_and_hub_restart() 
     );
     assert_eq!(
         serde_json::to_value(&grandchild.project_context).unwrap(),
-        context
+        child_context
     );
     f.report(
         &grandchild,
@@ -76,7 +78,7 @@ fn accepted_context_survives_child_redelegation_parent_resume_and_hub_restart() 
     assert_eq!(child_resumed.job.id, child_attempt.job.id);
     assert_eq!(
         serde_json::to_value(&child_resumed.project_context).unwrap(),
-        context
+        child_context
     );
     f.report(
         &child_resumed,

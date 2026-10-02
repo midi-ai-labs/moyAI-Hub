@@ -58,16 +58,6 @@ export function compareAdminEdit(kind: AdminOperation, draft: AdminDraft, origin
     }
     return result;
   }
-  if (["create_group", "update_group", "create_project", "update_project"].includes(kind)) {
-    const groups = kind.endsWith("group");
-    const old = (groups ? original.groups : original.projects).find(p => p.id === value("id"));
-    const saved = (groups ? latest.groups : latest.projects).find(p => p.id === value("id"));
-    if (kind.startsWith("update_") && (!old || !saved)) return block("編集していた対象が削除されました。対象を開き直してください。");
-    if (kind.startsWith("create_") && saved) return block("この識別名は登録済みです。別の識別名を入力して比較してください。");
-    row("識別名", saved?.id, draft.id); row("表示名", saved?.label, draft.label);
-    if (kind.startsWith("update_")) row(groups ? "利用停止" : "保管する", saved && ("disabled" in saved ? saved.disabled : saved.archived), groups ? draft.disabled === true : draft.archived === true);
-    return result;
-  }
   if (kind === "group_member" || kind === "project_member" || kind === "group_project_role") {
     if (kind !== "group_project_role" && !latest.users.some(u => u.user_id === value("user_id"))) return block("選択した利用者が削除されました。対象を開き直してください。");
     if (kind !== "project_member" && !latest.groups.some(g => g.id === value("group_id"))) return block("選択したグループが削除されました。対象を開き直してください。");

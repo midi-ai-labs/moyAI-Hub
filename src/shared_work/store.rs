@@ -172,7 +172,7 @@ pub(super) fn root_capacity(db: &Connection, budget: u32) -> Result<()> {
     if budget > 1000 {
         return Err(WorkError::Invalid);
     }
-    let (roots,reserved,remaining):(u64,u64,u64)=db.query_row("SELECT COUNT(*),COALESCE(SUM(descendant_budget),0),COALESCE(SUM(MAX(0,descendant_budget-(SELECT COUNT(*) FROM shared_jobs child WHERE child.root_id=root.id AND child.parent_id IS NOT NULL))),0) FROM shared_jobs root WHERE parent_id IS NULL AND state NOT IN ('succeeded','failed','cancelled')",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+    let (roots,reserved,remaining):(u64,u64,u64)=db.query_row("SELECT COUNT(*),COALESCE(SUM(descendant_budget),0),COALESCE(SUM(MAX(0,descendant_budget-(SELECT COUNT(*) FROM shared_jobs child WHERE child.root_id=root.id AND child.parent_id IS NOT NULL AND child.state NOT IN ('succeeded','failed','cancelled')))),0) FROM shared_jobs root WHERE parent_id IS NULL AND state NOT IN ('succeeded','failed','cancelled')",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
     let retained: u64 = db.query_row("SELECT COUNT(*) FROM shared_jobs", [], |r| r.get(0))?;
     if roots >= MAX_ROOTS
         || reserved + budget as u64 > MAX_RESERVED_DESCENDANTS
@@ -363,6 +363,25 @@ pub(super) fn submit_in_transaction(
     Ok(job)
 }
 
+/// The shared resource admission check used by reservation and its status projection.
+pub(super) fn check_job_capacity(db: &Connection, runner: &str, job: &Job) -> Result<String> {
+    let (resource,capacity,owner):(String,u32,String)=db.query_row("SELECT e.resource_id,r.capacity,e.runner_id FROM shared_environments e JOIN shared_resources r ON r.id=e.resource_id WHERE e.id=?1",[&job.environment_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+    if owner != runner {
+        return Err(WorkError::Forbidden);
+    }
+    let occupied = resource_occupancy(db, &resource)?;
+    let runner_active:u32=db.query_row("SELECT COUNT(*) FROM shared_attempts WHERE runner_id=?1 AND state IN ('assigned','running','stop_requested')",[runner],|r|r.get(0))?;
+    let owned_lease:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM shared_service_leases s JOIN shared_attempts a ON a.id=s.attempt_id JOIN shared_jobs j ON j.id=a.job_id WHERE s.state='active' AND a.resource_id=?1 AND a.runner_id=?2 AND j.conversation_id=?3)",params![resource,runner,job.conversation_id],|r|r.get(0))?;
+    let same_conversation_active:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM shared_attempts a JOIN shared_jobs j ON j.id=a.job_id WHERE a.resource_id=?1 AND j.conversation_id=?2 AND a.state IN ('assigned','running','stop_requested'))",params![resource,job.conversation_id],|r|r.get(0))?;
+    if (occupied >= capacity && !owned_lease)
+        || (owned_lease && same_conversation_active)
+        || runner_active >= MAX_RUNNER_ATTEMPTS
+    {
+        return Err(WorkError::Capacity);
+    }
+    Ok(resource)
+}
+
 pub(super) fn reserve_job(
     db: &Connection,
     runner: &str,
@@ -378,20 +397,7 @@ pub(super) fn reserve_job(
         return Err(WorkError::Conflict);
     }
     super::handover::may_continue(db, job, &job.environment_id)?;
-    let (resource,capacity,owner):(String,u32,String)=db.query_row("SELECT e.resource_id,r.capacity,e.runner_id FROM shared_environments e JOIN shared_resources r ON r.id=e.resource_id WHERE e.id=?1",[&job.environment_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
-    if owner != runner {
-        return Err(WorkError::Forbidden);
-    }
-    let occupied = resource_occupancy(db, &resource)?;
-    let runner_active:u32=db.query_row("SELECT COUNT(*) FROM shared_attempts WHERE runner_id=?1 AND state IN ('assigned','running','stop_requested')",[runner],|r|r.get(0))?;
-    let owned_lease:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM shared_service_leases s JOIN shared_attempts a ON a.id=s.attempt_id JOIN shared_jobs j ON j.id=a.job_id WHERE s.state='active' AND a.resource_id=?1 AND a.runner_id=?2 AND j.conversation_id=?3)",params![resource,runner,job.conversation_id],|r|r.get(0))?;
-    let same_conversation_active:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM shared_attempts a JOIN shared_jobs j ON j.id=a.job_id WHERE a.resource_id=?1 AND j.conversation_id=?2 AND a.state IN ('assigned','running','stop_requested'))",params![resource,job.conversation_id],|r|r.get(0))?;
-    if (occupied >= capacity && !owned_lease)
-        || (owned_lease && same_conversation_active)
-        || runner_active >= MAX_RUNNER_ATTEMPTS
-    {
-        return Err(WorkError::Capacity);
-    }
+    let resource = check_job_capacity(db, runner, job)?;
     let generation: u64 = db.query_row(
         "SELECT COALESCE(MAX(generation),0)+1 FROM shared_attempts WHERE job_id=?1",
         [&job.id],
@@ -1020,8 +1026,10 @@ impl SharedWork {
                 super::data::validate_inputs(&tx, &job.project_id, child_input)?;
                 let checkpoint = json(checkpoint)?;
                 let input = json(child_input)?;
-                let (budget,count): (u64,u64) = tx.query_row("SELECT descendant_budget,(SELECT COUNT(*)-1 FROM shared_jobs WHERE root_id=?1) FROM shared_jobs WHERE id=?1", [&job.root_id], |r|Ok((r.get(0)?,r.get(1)?)))?;
-                if count >= budget {
+                // Completed children return their slot, while their history remains stored.
+                // Check both live descendants and retained rows in this insertion transaction.
+                let (budget,open,retained): (u64,u64,u64) = tx.query_row("SELECT descendant_budget,(SELECT COUNT(*) FROM shared_jobs WHERE root_id=?1 AND parent_id IS NOT NULL AND state NOT IN ('succeeded','failed','cancelled')),(SELECT COUNT(*) FROM shared_jobs) FROM shared_jobs WHERE id=?1", [&job.root_id], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+                if open >= budget || retained >= MAX_RETAINED_JOBS {
                     return Err(WorkError::Capacity);
                 }
                 let child = ulid::Ulid::new().to_string();

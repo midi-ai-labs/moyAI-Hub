@@ -49,7 +49,14 @@ pub(super) fn for_job(db: &Connection, job: &Job) -> Result<Option<ProjectContex
         params![job.root_id, job.project_id],
         |row| row.get(0),
     )?;
-    context
-        .map(|value| serde_json::from_str(&value).map_err(Into::into))
-        .transpose()
+    let Some(context) = context else {
+        return Ok(None);
+    };
+    let mut context: ProjectContext = serde_json::from_str(&context)?;
+    if job.id == job.root_id {
+        // The root already receives its request through canonical user history.
+        // Keep the stored purpose intact for children and later child resumes.
+        context.root_prompt.clear();
+    }
+    Ok(Some(context))
 }

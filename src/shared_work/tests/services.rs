@@ -133,6 +133,12 @@ fn retained_service_keeps_capacity_and_rejoins_only_its_conversation() {
     assert!(f.work.request_service_stop(&f.bob, "server-1", 21).is_err());
 
     let other = f.submit("solver", "other", 0);
+    assert!(
+        f.work.job_detail_at(&f.alice, &other.id, 22).unwrap()["wait_reason"]
+            .as_str()
+            .unwrap()
+            .contains("利用枠")
+    );
     assert!(f.work.claim("WinE", 22).unwrap().is_none());
     let child = f.work.claim("WinC", 22).unwrap().unwrap();
     assert_eq!(child.job.conversation_id, root.id);
@@ -165,6 +171,11 @@ fn retained_service_keeps_capacity_and_rejoins_only_its_conversation() {
             result: json!({"reachable":true}),
             resources_released: true,
         },
+    );
+    assert_eq!(
+        f.work.job_detail_at(&f.alice, &root.id, 23).unwrap()["wait_reason"],
+        "実行端末の受付を待っています。",
+        "this conversation can reuse its own retained service capacity"
     );
     let resumed = f.work.claim("WinE", 23).unwrap().unwrap();
     assert_eq!(resumed.job.id, root.id);

@@ -326,6 +326,60 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn legacy_prompt_support_uses_only_selectable_models() {
+    for (wait_policy, alternative_tools, expected_status) in [
+        ("wait_for_preferred", true, 200),
+        ("allow_selected_fallback", false, 200),
+        ("allow_selected_fallback", true, 409),
+    ] {
+        let fixture = Fixture::new(false, false).await;
+        {
+            let mut core = fixture.core.lock().unwrap();
+            let mut catalog = core.catalog_store().catalog.clone();
+            catalog.models.push(LogicalModel {
+                id: "alternative".into(),
+                label: "Alternative".into(),
+                capabilities: if alternative_tools {
+                    ["tools".into()].into()
+                } else {
+                    BTreeSet::new()
+                },
+                system_prompt: "Alternative model instructions".into(),
+            });
+            let mut deployment = catalog.deployments[0].clone();
+            deployment.id = "alternative-host".into();
+            deployment.logical_model_id = "alternative".into();
+            catalog.deployments.push(deployment);
+            core.replace_catalog(catalog, now_ms()).unwrap();
+        }
+        let client = fixture.register().await;
+        let (status, reviewed) = fixture.post("/v1/clients/review", client["client_token"].as_str().unwrap(), json!({
+            "id":client["id"],"context":"main","expected_hub_id":client["hub_id"],"reviewed_revision":client["revision"],
+            "selection":{"allowed_model_ids":["logical-qwen","alternative"],"preferred_model_id":"logical-qwen",
+                "required_capabilities":["tools"],"wait_policy":wait_policy,"affinity_turns":2}
+        })).await;
+        assert_eq!(status, 200, "{reviewed}");
+        let (status, prepared) = fixture.prepare(&client, "main", "turn", "legacy").await;
+        assert_eq!(
+            status, expected_status,
+            "policy={wait_policy}, alternative_tools={alternative_tools}: {prepared}"
+        );
+        if expected_status == 200 {
+            assert_eq!(prepared["state"], "ready");
+            assert_eq!(prepared["logical_model_id"], "logical-qwen");
+            fixture.generate(&prepared).await.bytes().await.unwrap();
+            assert_eq!(fixture.provider.records.lock().unwrap().len(), 1);
+        } else {
+            assert_eq!(prepared["error"], "model_system_prompt_unsupported");
+            assert!(fixture.provider.records.lock().unwrap().is_empty());
+        }
+        fixture
+            .wait_status(|status| status["reserved"] == 0 && status["running"] == 0)
+            .await;
+    }
+}
+
+#[tokio::test]
 async fn model_system_prompt_requires_client_support_before_any_permit_and_gateway_does_not_inject()
 {
     let fixture = Fixture::new(false, false).await;

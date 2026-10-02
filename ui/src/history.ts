@@ -19,7 +19,7 @@ export function attachHistory(host: HTMLElement): { updateNetwork: (snapshot: Ne
       <div class="history-pagination"><button id="history-previous" class="secondary" type="button" disabled>前のページ</button><span id="history-page-label"></span><button id="history-next" class="secondary" type="button" disabled>次のページ</button></div>
       <section id="history-detail" class="history-detail" hidden aria-labelledby="history-detail-heading"><div class="section-title"><h3 id="history-detail-heading">履歴の詳細</h3><button id="history-export" class="secondary" type="button">Markdownで保存</button></div>
         <p id="history-detail-acquired" class="footnote"></p><p id="history-truncated" class="history-warning" hidden>この詳細は一部を省略しています。全体の確認・保存は元のDesktopの「MCP履歴」で行ってください。</p>
-        <pre id="history-markdown" tabindex="0" aria-label="MCP履歴の詳細本文"></pre><p class="footnote">表示中の取得結果を、新しい .md ファイルへ保存します。同名の既存ファイルへは上書きしません。</p></section>
+        <pre id="history-markdown" tabindex="0" aria-label="MCP履歴の詳細本文"></pre><p class="footnote">表示中の取得結果をMarkdownファイルとしてダウンロードします。</p></section>
       <p class="footnote">取得結果はHubのメモリに最大64件・30分間保持します。Hub再起動で消えますが、各Desktopの履歴は残ります。未接続・旧バージョンの端末から取得できない場合は、その端末のDesktopで確認してください。</p>`;
     const node = <T extends HTMLElement = HTMLElement>(id: string) => host.querySelector<T>(`#${id}`)!;
     const deviceSelect = node<HTMLSelectElement>("history-device"), directionSelect = node<HTMLSelectElement>("history-direction");

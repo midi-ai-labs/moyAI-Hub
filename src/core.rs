@@ -172,15 +172,13 @@ impl HubCore {
             .ok_or(HubError::SelectionRequired)?;
         self.validate_selection(&context.selection)?;
         Ok(self
-            .store
-            .catalog
-            .deployments
-            .iter()
-            .filter(|deployment| {
-                context
-                    .selection
-                    .allowed_model_ids
-                    .contains(&deployment.logical_model_id)
+            .selectable_model_ids(&context.selection)
+            .flat_map(|id| {
+                self.store
+                    .catalog
+                    .deployments
+                    .iter()
+                    .filter(move |deployment| &deployment.logical_model_id == id)
             })
             .cloned()
             .collect())
@@ -842,36 +840,36 @@ impl HubCore {
         Ok(())
     }
 
+    fn selectable_model_ids<'a>(
+        &'a self,
+        selection: &'a Selection,
+    ) -> impl Iterator<Item = &'a String> {
+        let preferred = selection
+            .preferred_model_id
+            .as_ref()
+            .unwrap_or(&selection.allowed_model_ids[0]);
+        std::iter::once(preferred)
+            .chain(selection.allowed_model_ids.iter().filter(move |id| {
+                selection.wait_policy == WaitPolicy::AnyAllowed && *id != preferred
+            }))
+            .filter(|id| {
+                self.store.catalog.models.iter().any(|model| {
+                    &model.id == *id
+                        && selection
+                            .required_capabilities
+                            .is_subset(&model.capabilities)
+                })
+            })
+    }
+
     fn select_deployment(
         &self,
         selection: &Selection,
         now_ms: u64,
     ) -> Result<Deployment, RouteBlock> {
-        let preferred = selection
-            .preferred_model_id
-            .as_ref()
-            .unwrap_or(&selection.allowed_model_ids[0]);
-        let mut ids = vec![preferred];
-        if selection.wait_policy == WaitPolicy::AnyAllowed {
-            ids.extend(
-                selection
-                    .allowed_model_ids
-                    .iter()
-                    .filter(|id| *id != preferred),
-            );
-        }
         let mut first_reason = None;
         let mut first_error = None;
-        for id in ids {
-            let compatible = self.store.catalog.models.iter().any(|model| {
-                &model.id == id
-                    && selection
-                        .required_capabilities
-                        .is_subset(&model.capabilities)
-            });
-            if !compatible {
-                continue;
-            }
+        for id in self.selectable_model_ids(selection) {
             for deployment in self
                 .store
                 .catalog

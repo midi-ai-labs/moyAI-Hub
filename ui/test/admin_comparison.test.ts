@@ -67,7 +67,31 @@ test("selected deleted or revoked PCs cannot continue through a project comparis
   }
 });
 test("destructive and generation-bound commands are not rebased by a generic comparison", () => {
-  for (const kind of ["delete_user","settle_attempt","request_provision","prune_shared_data"] as const) {
+  for (const kind of ["delete_user","delete_project","settle_attempt","retry_project_device","prune_shared_data"] as const) {
     assert.ok(compareAdminEdit(kind,{user_id:"alice",password:"secret",generation:1},snapshot(),snapshot("2"),[]).blocked,kind);
+  }
+});
+
+test("existing group membership and project role comparisons remain available through users", () => {
+  const original = snapshot(), latest = snapshot("2");
+  for (const value of [original, latest]) value.groups = [{ id: "research", label: "研究", disabled: false }];
+  latest.group_memberships = [{ group_id: "research", user_id: "alice" }];
+  latest.group_project_roles = [{ project_id: "project", group_id: "research", role: "reader" }];
+  latest.project_memberships = [{ project_id: "project", user_id: "alice", role: "manager" }];
+  const cases = [
+    ["group_member", { group_id: "research", user_id: "alice", member: false }, "はい", "いいえ"],
+    ["group_project_role", { project_id: "project", group_id: "research", role: "contributor" }, "閲覧", "仕事の依頼・実行"],
+    ["project_member", { project_id: "project", user_id: "alice", role: "" }, "プロジェクト管理", "参加しない"],
+  ] as const;
+  for (const [kind, draft, saved, input] of cases) {
+    const before = JSON.stringify({ draft, latest });
+    const comparison = compareAdminEdit(kind, draft, original, latest, []);
+    assert.equal(comparison.blocked, null);
+    assert.deepEqual(comparison.rows.map(row => [row.saved, row.input]), [[saved, input]]);
+    assert.equal(JSON.stringify({ draft, latest }), before);
+    const missing = structuredClone(latest);
+    if (kind === "project_member") missing.users = [];
+    else missing.groups = [];
+    assert.match(compareAdminEdit(kind, draft, original, missing, []).blocked!, /削除/);
   }
 });

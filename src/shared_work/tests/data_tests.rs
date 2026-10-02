@@ -447,7 +447,8 @@ fn continuation_uses_only_the_latest_settled_root_and_never_overlaps_a_turn() {
     assert_eq!(second_attempt.job.id, second.id);
     let next_context = second_attempt.project_context.as_ref().unwrap();
     assert_eq!(next_context.overview, "next request overview");
-    assert_eq!(next_context.root_prompt, "Second turn");
+    assert_eq!(next_context.root_prompt, "");
+    assert_eq!(second_attempt.job.input["prompt"], "Second turn");
     f.report(
         &second_attempt,
         "second-continuation-start",

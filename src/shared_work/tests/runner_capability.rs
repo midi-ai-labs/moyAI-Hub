@@ -58,7 +58,7 @@ fn old_runner_claims_legacy_jobs_but_not_new_unbounded_jobs() {
             .is_none()
     );
     let waiting = f.work.status(&f.alice, "alpha", None, 20, None).unwrap();
-    assert!(
+    assert_eq!(
         waiting
             .jobs
             .iter()
@@ -66,8 +66,9 @@ fn old_runner_claims_legacy_jobs_but_not_new_unbounded_jobs() {
             .unwrap()
             .wait_reason
             .as_deref()
-            .unwrap()
-            .contains("最新版")
+            .unwrap(),
+        "実行端末の受付を待っています。",
+        "a required capability is not evidence of an incompatible Runner"
     );
     let new = f
         .work

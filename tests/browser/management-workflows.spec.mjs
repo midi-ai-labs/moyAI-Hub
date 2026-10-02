@@ -67,7 +67,7 @@ test("Model registration, profile discovery, edit and deletion use the real cata
         const standardId = registered.store.catalog.models[0].id;
         await page.locator("#team-standard-model").selectOption(standardId);
         await page.locator("#team-standard-save").click();
-        await expect(page.locator("#team-standard-status")).toHaveText("初めて接続するPCのモデル：Alpha <Hub> & tools。Desktopでサンプルを実行してください。");
+        await expect(page.locator("#team-standard-status")).toHaveText("初めて接続するPCのモデル：Alpha <Hub> & tools。");
         expect((await hub.command("hub_snapshot")).store.catalog.team_default_model_id).toBe(standardId);
 
         await row.getByRole("button", { name: /を編集/ }).click();
