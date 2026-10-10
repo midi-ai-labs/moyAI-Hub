@@ -77,6 +77,8 @@ export interface Snapshot {
         revision: string;
         catalog: {
             team_default_model_id?: string | null;
+            team_default_side_model_id?: string | null;
+            team_default_approve_model_id?: string | null;
             models: LogicalModel[];
             capacity_pools: Pool[];
         };

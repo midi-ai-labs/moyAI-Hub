@@ -20,7 +20,7 @@ Gateway の管理用待受は一時的な IPv4 loopback port です。従来の�
 {"id":"client-id","context":"main","turn_id":"stable-user-turn","request_id":"request-attempt","expected_hub_id":"hub-id","reviewed_revision":"3"}
 ```
 
-`context` は `main` / `side_chat`、revision は正の十進文字列です。待機時は 200 `{state:"waiting",reason,retry_after_ms:1000}`。reason は `busy` / `global_capacity` / `target_unavailable` / `maintenance` です。旧版の `jit_pending` は型の互換性を保ちますが、現行 Hub は返しません。
+`context` は `main` / `side_chat` / `approve`、revision は正の十進文字列です。待機時は 200 `{state:"waiting",reason,retry_after_ms:1000}`。reason は `busy` / `global_capacity` / `target_unavailable` / `maintenance` です。旧版の `jit_pending` は型の互換性を保ちますが、現行 Hub は返しません。
 
 `purpose` の省略は通常の user turn です。`preparation` は依頼整形、`delegated` は [子エージェントの独立実行](delegated-execution.md) に使い、どちらも同じ permit / 中継枠の認可を通し、user-turn affinity 回数を消費しません。Delegated だけは確認済み選択の snapshot と独立した context を使い、finish/cancel と heartbeat に対象を区別する `delegated:true` を渡します。
 
@@ -59,13 +59,13 @@ HTTP エラーは本文や URL を含まない `{error,current_revision?}` で�
 
 この指示は公開catalogにも含まれます。Desktop/Runnerは確認済みrevisionと実際に割り当てられたmodelを使い、要求ごとに一度だけ指示を組み込みます。Gatewayは指示を追加・置換しません。候補は許可モデル・必須機能・wait policyで絞ります。preferredだけを待つ場合は代替モデルを含めません。指示のある選択可能な候補を利用するclientはPrepareに`supports_model_system_prompt:true`を付けます。省略はfalseとして扱い、未対応clientにはpermit発行前にHTTP 409 `model_system_prompt_unsupported`を返します。空欄のモデルは従来のPrepareを利用できます。
 
-JSON catalog schemaは4です。schema 1–3の指示なしcatalogは既存のロード時移行で一度revisionを進めて保存し、旧schemaで新しい指示を名乗るデータは拒否します。Hub管理者は指示の保存と確認を行い、実際のモデルが常にその指示に従うことは別途実行結果で確認します。
+JSON catalog schemaは5です。schema 1–4は、対応する旧形式の内容を保持してロード時に一度revisionを進めて保存します。新しいSub/Approve標準モデルは未指定として読み、旧schemaで新しい標準値を名乗るデータは拒否します。schema 1–3で新しいモデル指示を名乗るデータも従来どおり拒否します。Hub管理者は指示の保存と確認を行い、実際のモデルが常にその指示に従うことは別途実行結果で確認します。
 
 ## AIホストのAPIキー
 
 管理画面で登録先ごとにキーを入力し、モデル一覧取得・「状態を確認」・実行準備時のモデル存在確認・Gatewayの生成要求で同じ認証設定を使います。送信形式は `Authorization: Bearer …` です。Desktopのrequest tokenをAIホストへ転送せず、従来のキー未設定ホストは認証なしのまま利用できます。
 
-キーの実値はHub保存先の `upstream-credentials/<ULID>.json` に置き、Windowsでは利用者限定ACL、Unixでは `0600` のファイル権限で保護・検証します。暗号化保存ではありません。Deploymentには任意の不透明な `upstream_credential_id` だけを保持します。schema 3で加わったこの参照を含め、従来のcatalogは既存モデルとHub識別情報を保持してschema 4へ前方移行します。公開端末catalog・管理snapshot・grantはキーを含まず、登録前のdiscovery evidenceが保持するキーもメモリー内だけで、応答へserializeしません。
+キーの実値はHub保存先の `upstream-credentials/<ULID>.json` に置き、Windowsでは利用者限定ACL、Unixでは `0600` のファイル権限で保護・検証します。暗号化保存ではありません。Deploymentには任意の不透明な `upstream_credential_id` だけを保持します。schema 3で加わったこの参照を含め、従来のcatalogは既存モデルとHub識別情報を保持してschema 5へ前方移行します。公開端末catalog・管理snapshot・grantはキーを含まず、登録前のdiscovery evidenceが保持するキーもメモリー内だけで、応答へserializeしません。
 
 登録先の編集ではキー欄の空欄が保持、入力が置換、削除チェックが削除です。Gatewayは予約受付時にキーを保持し、生成を開始した通信はキー変更後も継続します。まだclaimしていない要求は、他のモデル設定変更と同様にrevisionの再確認が必要です。再確認後の新しい要求から変更後のキーを使います。登録済み参照の欠落、権限不正、接続先・profileの不一致では失敗し、認証なしへ切り替えません。
 
@@ -127,4 +127,6 @@ mTLS `GET /v1/network/diagnostics` はメタデータ / Gateway の実 endpoint�
 | `POST /v1/requests/prepare` | 端末・context・turn・request・revisionを確認し、待機理由またはGateway宛先を返す |
 | `POST /v1/turns/finish` / `POST /v1/turns/cancel` | turnを閉じ、予約と当該中継接続を終了する |
 
-`context` は `main` / `side_chat`、revisionは十進文字列です。確認保存はMain/Side独立で、一覧取得やheartbeatは確認の代わりになりません。heartbeatで有効な同一turnのleaseを延長しても、permit期限やrequest IDは再発行しません。IPや自己申告のactivityを端末認証・provider実測として使いません。厳密なrequest/responseと互換条件は同ファイルと近傍testsを参照してください。
+`context` は `main` / `side_chat` / `approve`、revisionは十進文字列です。確認保存はMain/Sub/Approve独立で、一覧取得やheartbeatは確認の代わりになりません。heartbeatで有効な同一turnのleaseを延長しても、permit期限やrequest IDは再発行しません。IPや自己申告のactivityを端末認証・provider実測として使いません。厳密なrequest/responseと互換条件は同ファイルと近傍testsを参照してください。
+
+公開catalogと端末のmodel-session応答は `default_selections:{main,side_chat,approve}` を返します。各値は従来の選択DTOまたはnullです。Mainはツール利用対応を必要とし、SubとApproveの `required_capabilities` は空です。未指定のSub/ApproveをMainへ補完せず、有効な登録先がない明示標準もnullにします。旧 `default_selection` は端末model-session応答のMain互換値として保持します。Hubの標準値は新規PCの候補であり、既に確認したPCの選択を変更しません。

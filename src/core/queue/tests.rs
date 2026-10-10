@@ -5,6 +5,8 @@ fn fixture() -> HubCore {
     let mut store = CatalogStore::empty("queue-fixture");
     let catalog = Catalog {
         team_default_model_id: None,
+        team_default_side_model_id: None,
+        team_default_approve_model_id: None,
         models: ["a", "b"]
             .into_iter()
             .map(|id| LogicalModel {
@@ -236,4 +238,38 @@ fn an_abandoned_request_does_not_keep_priority_from_desktop_heartbeats_alone() {
     hub.observe_deployment("a", Availability::Ready, 9000)
         .unwrap();
     admit(&mut hub, "later", "r", 10_001);
+}
+
+#[test]
+fn queue_accepts_8192_requests_retries_at_capacity_and_rejects_the_next_new_request() {
+    let mut hub = fixture();
+    hub.observe_deployment("a", Availability::Offline, 0)
+        .unwrap();
+    for index in 0..8192 {
+        waiting(prepare(&mut hub, "older", &format!("request-{index}"), 0));
+    }
+    waiting(prepare(&mut hub, "older", "request-0", 1));
+    assert!(matches!(
+        hub.prepare_request(
+            "older",
+            "main",
+            "turn",
+            "overflow",
+            RequestPurpose::UserTurn,
+            1
+        ),
+        Err(HubError::RegistryFull)
+    ));
+    hub.cancel_turn("older", "main", "turn").unwrap();
+    waiting(
+        hub.prepare_request(
+            "older",
+            "main",
+            "next-turn",
+            "after-cancel",
+            RequestPurpose::UserTurn,
+            2,
+        )
+        .expect("a new turn can queue after cancellation releases capacity"),
+    );
 }

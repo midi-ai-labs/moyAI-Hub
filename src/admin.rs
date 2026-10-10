@@ -27,6 +27,7 @@ mod hosting_options;
 mod network_admin;
 pub(crate) use network_admin::dispatch_network_locked;
 mod network_hosting;
+const MAX_CATALOG_BYTES: usize = 4 * 1024 * 1024;
 #[cfg(test)]
 mod upstream_auth_tests;
 
@@ -98,7 +99,7 @@ impl Admin {
             if std::fs::metadata(&path)
                 .map_err(|error| error.to_string())?
                 .len()
-                > 4 * 1024 * 1024
+                > MAX_CATALOG_BYTES as u64
             {
                 return Err("カタログがサイズ上限を超えています。".into());
             }
@@ -258,6 +259,33 @@ impl Admin {
                 })?;
                 output(())
             }
+            "hub_set_standard_models" => {
+                let request: StandardModels = serde_json::from_value(args.clone())
+                    .map_err(|_| "標準モデルの保存内容を確認してください。".to_string())?;
+                edit_catalog(self, parse_revision(&request.revision)?, |catalog| {
+                    for id in [
+                        &request.main_model_id,
+                        &request.side_model_id,
+                        &request.approve_model_id,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        if !catalog
+                            .deployments
+                            .iter()
+                            .any(|d| &d.logical_model_id == id && d.enabled)
+                        {
+                            return Err("有効な登録先を持つモデルを選択してください。".into());
+                        }
+                    }
+                    catalog.team_default_model_id = request.main_model_id;
+                    catalog.team_default_side_model_id = request.side_model_id;
+                    catalog.team_default_approve_model_id = request.approve_model_id;
+                    Ok(())
+                })?;
+                output(())
+            }
             "hub_register" => output(hub_register(self, argument(args, "request")?)?),
             "hub_edit" => output(hub_edit(self, argument(args, "request")?)?),
             "hub_history_request" => output(hub_history_request(
@@ -302,16 +330,38 @@ fn argument<T: serde::de::DeserializeOwned>(args: &Value, name: &str) -> Result<
         .map_err(|_| format!("操作の引数 {name} を確認してください。"))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StandardModels {
+    revision: String,
+    #[serde(deserialize_with = "required_model_id")]
+    main_model_id: Option<String>,
+    #[serde(deserialize_with = "required_model_id")]
+    side_model_id: Option<String>,
+    #[serde(deserialize_with = "required_model_id")]
+    approve_model_id: Option<String>,
+}
+
+fn required_model_id<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    Option::<String>::deserialize(deserializer)
+}
+
 fn output<T: Serialize>(value: T) -> Result<Value, String> {
     serde_json::to_value(value).map_err(|_| "管理操作の結果を取得できません。".into())
 }
 
 fn save(path: &Path, store: &CatalogStore) -> Result<(), String> {
+    let mut bytes = serde_json::to_vec_pretty(store).map_err(|_| "設定を書き込めません。")?;
+    bytes.push(b'\n');
+    if bytes.len() > MAX_CATALOG_BYTES {
+        return Err("カタログ全体が保存上限（4 MiB）を超えています。モデルの指示や登録数を減らしてください。元の設定は保持されています。".into());
+    }
     let parent = path.parent().ok_or("保存先がありません。")?;
     let mut temp = tempfile::NamedTempFile::new_in(parent)
         .map_err(|_| "設定の一時ファイルを作成できません。")?;
-    serde_json::to_writer_pretty(&mut temp, store).map_err(|_| "設定を書き込めません。")?;
-    temp.write_all(b"\n")
+    temp.write_all(&bytes)
         .map_err(|_| "設定を書き込めません。")?;
     temp.as_file()
         .sync_all()
@@ -638,6 +688,12 @@ fn hub_edit(admin: &Admin, request: Edit) -> Result<(), String> {
                 if catalog.team_default_model_id.as_deref() == Some(&row.logical_model_id) {
                     catalog.team_default_model_id = None;
                 }
+                if catalog.team_default_side_model_id.as_deref() == Some(&row.logical_model_id) {
+                    catalog.team_default_side_model_id = None;
+                }
+                if catalog.team_default_approve_model_id.as_deref() == Some(&row.logical_model_id) {
+                    catalog.team_default_approve_model_id = None;
+                }
             }
             if !catalog
                 .deployments
@@ -882,6 +938,158 @@ async fn hub_start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_catalog_edit_preserves_saved_and_live_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("catalog.json");
+        let admin = Admin::open(path.clone()).unwrap();
+        let models = |count| {
+            (0..count)
+                .map(|index| LogicalModel {
+                    id: format!("model-{index}"),
+                    label: format!("Model {index}"),
+                    capabilities: Default::default(),
+                    system_prompt: "界".repeat(16_384),
+                })
+                .collect::<Vec<_>>()
+        };
+        edit_catalog(&admin, 1, |catalog| {
+            catalog.models = models(80);
+            Ok(())
+        })
+        .unwrap();
+        let saved = std::fs::read(&path).unwrap();
+        assert!(saved.len() <= MAX_CATALOG_BYTES);
+        let before = admin.core.lock().unwrap().catalog_store().clone();
+        let oversized = models(86);
+        assert!(
+            oversized
+                .iter()
+                .all(|model| model.system_prompt.chars().count() == 16_384)
+        );
+        let result = edit_catalog(&admin, before.revision, |catalog| {
+            catalog.models = oversized;
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), saved);
+        assert_eq!(admin.core.lock().unwrap().catalog_store(), &before);
+        drop(admin);
+        let reopened = Admin::open(path).unwrap();
+        assert_eq!(reopened.core.lock().unwrap().catalog_store(), &before);
+    }
+
+    #[tokio::test]
+    async fn role_standard_models_save_atomically_and_legacy_command_changes_only_main() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("catalog.json");
+        let admin = Admin::open(path.clone()).unwrap();
+        edit_catalog(&admin, 1, |catalog| {
+            catalog.models = vec![
+                LogicalModel {
+                    id: "main".into(),
+                    label: "Main".into(),
+                    capabilities: ["tools".into()].into(),
+                    system_prompt: String::new(),
+                },
+                LogicalModel {
+                    id: "chat".into(),
+                    label: "Chat".into(),
+                    capabilities: Default::default(),
+                    system_prompt: String::new(),
+                },
+            ];
+            catalog.capacity_pools.push(CapacityPool {
+                id: "pool".into(),
+                label: "Pool".into(),
+                max_concurrent: 2,
+            });
+            catalog.deployments = ["main", "chat"]
+                .map(|id| Deployment {
+                    id: id.into(),
+                    logical_model_id: id.into(),
+                    capacity_pool_id: "pool".into(),
+                    label: id.into(),
+                    endpoint: "http://localhost:1234/v1".into(),
+                    provider_model: id.into(),
+                    provider_profile: "openai_compatible_chat".into(),
+                    upstream_credential_id: None,
+                    enabled: true,
+                })
+                .into();
+            Ok(())
+        })
+        .unwrap();
+        let args = json!({"revision":"2","mainModelId":"main","sideModelId":"chat","approveModelId":"chat"});
+        admin
+            .dispatch("hub_set_standard_models", args.clone())
+            .await
+            .unwrap();
+        let saved = admin.dispatch("hub_snapshot", json!({})).await.unwrap();
+        assert_eq!(saved["store"]["revision"], "3");
+        assert_eq!(
+            saved["store"]["catalog"]["team_default_approve_model_id"],
+            "chat"
+        );
+        assert!(
+            admin
+                .dispatch("hub_set_standard_models", args.clone())
+                .await
+                .is_err()
+        );
+        let mut invalid = args.clone();
+        invalid["revision"] = json!("3");
+        invalid["mainModelId"] = json!("chat");
+        assert!(
+            admin
+                .dispatch("hub_set_standard_models", invalid)
+                .await
+                .is_err()
+        );
+        let mut incomplete = args.clone();
+        incomplete["revision"] = json!("3");
+        incomplete.as_object_mut().unwrap().remove("approveModelId");
+        assert!(
+            admin
+                .dispatch("hub_set_standard_models", incomplete)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            admin.dispatch("hub_snapshot", json!({})).await.unwrap()["store"],
+            saved["store"]
+        );
+        admin
+            .dispatch(
+                "hub_set_standard_model",
+                json!({"revision":"3","modelId":null}),
+            )
+            .await
+            .unwrap();
+        let last = admin.dispatch("hub_snapshot", json!({})).await.unwrap()["store"].clone();
+        assert!(last["catalog"]["team_default_model_id"].is_null());
+        assert_eq!(last["catalog"]["team_default_side_model_id"], "chat");
+        assert_eq!(last["catalog"]["team_default_approve_model_id"], "chat");
+        drop(admin);
+        let reopened = Admin::open(path).unwrap();
+        assert_eq!(
+            reopened.dispatch("hub_snapshot", json!({})).await.unwrap()["store"],
+            last
+        );
+        reopened.dispatch("hub_edit", json!({"request":{"revision":"4","deployment_id":"chat","label":"Chat","capacity":2,"enabled":true,"remove":true}})).await.unwrap();
+        let removed = reopened.dispatch("hub_snapshot", json!({})).await.unwrap();
+        assert!(removed["store"]["catalog"]["team_default_side_model_id"].is_null());
+        assert!(removed["store"]["catalog"]["team_default_approve_model_id"].is_null());
+        assert_eq!(
+            removed["store"]["catalog"]["models"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
     #[test]
     fn local_snapshot_and_input_preserve_full_revision_precision() {
         let mut store = CatalogStore::empty("0.1.0");

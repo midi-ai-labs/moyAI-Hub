@@ -33,16 +33,6 @@ async function startNetwork(page, hub) {
     await expect(page.locator("#network-stop")).toBeVisible();
     return hub.observeNetwork();
 }
-async function group(hub, label) {
-    const snapshot=await hub.command("hub_network_snapshot");
-    await hub.command("hub_network_group",{expectedRevision:snapshot.revision,id:null,label});
-    return (await hub.command("hub_network_snapshot")).groups.find(row=>row.label===label);
-}
-async function legacyRule(hub,rule) {
-    const snapshot=await hub.command("hub_network_snapshot");
-    await hub.command("hub_network_rule",{expectedRevision:snapshot.revision,rule:{id:null,profile_id:null,max_depth:1,...rule}});
-}
-
 test("Every page link and explanatory disclosure opens its own current target", async ({ page, hub }, testInfo) => {
     const errors = await ready(page, hub);
     for (const hash of ["#device-network", "#web-management", "#overview", "#models", "#clients", "#mcp-history", "#revisions"]) {
@@ -177,10 +167,9 @@ test("Model dropdown alternatives reset dependent values and register each provi
     } finally { await provider.close(); }
 });
 
-test("Device dialogs cancel drafts and preserve existing legacy memberships while editing names", async ({ page, hub }, testInfo) => {
+test("Device dialogs cancel name drafts and preserve the current registration", async ({ page, hub }, testInfo) => {
     const errors = await ready(page, hub);
     const network = await startNetwork(page, hub);
-    await group(hub, "Clients"); await group(hub, "Servers");
     const participant = await createDeviceParticipant(network, "Pending control fixture");
     await page.locator("#network-clients-refresh").click();
     await page.locator("#network-filter").selectOption("pending");
@@ -197,8 +186,6 @@ test("Device dialogs cancel drafts and preserve existing legacy memberships whil
     await page.locator("#network-device-save").click();
     await expect(page.locator("#network-device-dialog")).not.toBeVisible();
     const approval = await participant.collectApproval(); expect(approval.status).toBe("approved");
-    const legacy=await hub.command("hub_network_snapshot");
-    await hub.command("hub_network_device",{expectedRevision:legacy.revision,deviceId:approval.deviceId,label:"Pending control fixture",groups:legacy.groups.map(g=>g.id),revoked:false});
     await participant.presence(); await page.locator("#network-clients-refresh").click();
     await page.locator("#network-filter").selectOption("all");
     const row = page.locator(`[data-id="device:${approval.deviceId}"]`);
@@ -217,20 +204,19 @@ test("Device dialogs cancel drafts and preserve existing legacy memberships whil
     await expect(page.locator("#network-device-dialog")).not.toBeVisible();
     await row.locator("[data-network-edit]").click();
     await expect(page.locator("#network-device-label")).toHaveValue("Pending control fixture");
-    await expect(page.locator("#network-device-groups").getByLabel("Servers", { exact: true })).toBeChecked();
+    await expect(page.locator("#network-device-groups")).toBeHidden();
     await page.locator("#network-device-label").fill("変更を保持する端末");
     await page.locator("#network-device-revoke-details > summary").click();
     await page.locator("#network-device-revoked").check(); await page.locator("#network-device-revoked").uncheck();
     await page.locator("#network-device-review").click();
     await expect(page.locator("#network-device-error")).toContainText("入力内容を確認して保存");
     await expect(page.locator("#network-device-label")).toHaveValue("変更を保持する端末");
-    await expect(page.locator("#network-device-groups").getByLabel("Clients", { exact: true })).toBeChecked();
-    await capture(page, testInfo, "device-draft-review-memberships");
+    await capture(page, testInfo, "device-draft-review-registration");
     await page.locator("#network-device-save").click();
     await expect(page.locator("#network-device-dialog")).not.toBeVisible();
     const state = await hub.command("hub_network_snapshot"), device = state.devices.find(device => device.device_id === approval.deviceId);
     expect(device.label).toBe("変更を保持する端末"); expect(device.revoked).toBe(false);
-    expect(device.groups.sort()).toEqual(state.groups.map(group=>group.id).sort());
+    expect(device.groups).toEqual([]);
     await row.locator("[data-network-delete-device]").click();
     await page.mouse.click(4, 4); await expect(page.locator("#network-delete-dialog")).toBeVisible();
     await page.keyboard.press("Escape"); await expect(page.locator("#network-delete-dialog")).not.toBeVisible();
@@ -242,18 +228,12 @@ test("Device dialogs cancel drafts and preserve existing legacy memberships whil
     expect(errors).toEqual([]);
 });
 
-test("Legacy invitation and directed-rule API data stay compatible without exposing their removed forms",async({page,hub},testInfo)=>{
+test("Retired group, rule and invitation forms stay absent from current management",async({page,hub},testInfo)=>{
     const errors=await ready(page,hub); await startNetwork(page,hub);
-    const clients=await group(hub,"Client 日本語"),servers=await group(hub,"Server 日本語");
-    await legacyRule(hub,{from:{kind:"group",id:clients.id},to:{kind:"group",id:servers.id},usage:"delegated",effect:"deny",max_depth:3});
-    const state=await hub.command("hub_network_snapshot");
-    expect(state.rules[0]).toMatchObject({from:{kind:"group",id:clients.id},to:{kind:"group",id:servers.id},usage:"delegated",effect:"deny",max_depth:3,profile_id:null});
-    const invite=await hub.command("hub_network_invite",{expectedRevision:state.revision,label:"Legacy invited fixture",groups:[servers.id]});
-    expect(typeof invite.code).toBe("string"); expect(invite.code.length).toBeGreaterThan(20);
     await page.reload();
     for(const selector of ["#network-group-form","#network-rule-form",'details[data-details-key="network-legacy-invite"]']) await expect(page.locator(selector)).toHaveCount(0);
-    expect((await hub.command("hub_network_snapshot")).rules).toEqual(state.rules);
-    await capture(page,testInfo,"legacy-compatibility-project-navigation"); expect(errors).toEqual([]);
+    await expect(page.locator("#shared-admin-content")).toBeVisible();
+    await capture(page,testInfo,"current-project-navigation"); expect(errors).toEqual([]);
 });
 
 test.describe("Configured external Web controls", () => {
@@ -355,10 +335,8 @@ test("Project PC purposes can be changed independently without inheriting anothe
     await capture(page,testInfo,"project-purpose-options"); expect(errors).toEqual([]);
 });
 
-test("Device disclosure drafts remain intact while legacy rule API choices remain compatible", async ({ page, hub }, testInfo) => {
+test("Device identity and revocation disclosures preserve their current state and unsaved drafts", async ({ page, hub }, testInfo) => {
     const errors = await ready(page, hub), network = await startNetwork(page, hub);
-    await group(hub, "Reverse control sender");
-    const sender = (await hub.command("hub_network_snapshot")).groups.find(item => item.label === "Reverse control sender");
     const participant = await createDeviceParticipant(network, "Reverse control receiver");
     await page.locator('nav a[href="#clients"]').click();
     await page.locator("#network-clients-refresh").click();
@@ -369,13 +347,8 @@ test("Device disclosure drafts remain intact while legacy rule API choices remai
     await expect(requestRow).toHaveCount(0);
     const approval = await participant.collectApproval(); expect(approval.status).toBe("approved");
     await participant.presence();
-    await participant.publish({ profile_id: "reverse-control-project", name: "Reverse control project",
-        endpoint: "https://127.0.0.1:7332/mcp", mode: "agent", scope_id: "reverse-control-scope", enabled: true });
     await page.locator("#network-clients-refresh").click();
     const row = page.locator(`[data-id="device:${approval.deviceId}"]`), identity = row.locator("details[data-device-identity]");
-    await expect(row).toContainText("受付申告あり");
-    await expect(row.locator("details[data-network-legacy-mcp]")).not.toHaveAttribute("open", "");
-    await expect(row.getByText("受付申告あり",{exact:true})).toBeHidden();
 
     // C083: the same current device identity survives an explicit close, a normal poll and reopen.
     await identity.locator("summary").click(); await expect(identity).toHaveAttribute("open", "");
@@ -407,14 +380,5 @@ test("Device disclosure drafts remain intact while legacy rule API choices remai
     const unchanged = (await hub.command("hub_network_snapshot")).devices.find(item => item.device_id === approval.deviceId);
     expect(unchanged).toMatchObject({ label: "Reverse control receiver", revoked: false });
 
-    await page.locator('nav a[href="#device-network"]').click();
-    await expect(page.locator("#network-rule-form")).toBeHidden();
-    await legacyRule(hub,{from:{kind:"group",id:sender.id},to:{kind:"device",id:approval.deviceId},usage:"direct",effect:"deny",profile_id:"reverse-control-project"});
-    const denied=(await hub.command("hub_network_snapshot")).rules[0];
-    await legacyRule(hub,{from:{kind:"group",id:sender.id},to:{kind:"device",id:approval.deviceId},usage:"direct",effect:"allow",profile_id:null});
-    const rules=(await hub.command("hub_network_snapshot")).rules;
-    expect(rules.filter(item=>item.id===denied.id)).toEqual([denied]);
-    expect(rules.filter(item=>item.id!==denied.id)).toEqual([expect.objectContaining({from:{kind:"group",id:sender.id},to:{kind:"device",id:approval.deviceId},effect:"allow",profile_id:null})]);
-    await testInfo.attach("legacy-rule-api-compatibility",{contentType:"application/json",body:Buffer.from(JSON.stringify({deviceId:approval.deviceId,rules,scope:"Existing compatibility API only; removed controls are hidden."}))});
     expect(errors).toEqual([]);
 });

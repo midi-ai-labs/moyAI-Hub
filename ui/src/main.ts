@@ -173,7 +173,7 @@ function render(next: Snapshot) {
         })[client.activity];
         const color = stale ? "gray" : client.activity === "running" ? "blue" : client.activity === "waiting" ? "amber" : "green";
         const contextText = (context: string) => `${reviewStatus(client.contexts, context)}${client.contexts.find(row => row.context_id === context)?.active_model_id ? " / 割当中" : ""}`;
-        return `<tr><td><strong>${escape(client.label)}</strong><small>${escape(client.id)}</small></td><td>${escape(client.observed_ip)}</td><td><span class="badge ${color}"><i class="dot ${color}"></i>${label}</span></td><td><small>Main: ${escape(contextText("main"))}</small><small>Side Chat: ${escape(contextText("side_chat"))}</small></td><td>${time(client.last_seen_ms)}</td></tr>`;
+        return `<tr><td><strong>${escape(client.label)}</strong><small>${escape(client.id)}</small></td><td>${escape(client.observed_ip)}</td><td><span class="badge ${color}"><i class="dot ${color}"></i>${label}</span></td><td><small>Main: ${escape(contextText("main"))}</small><small>Sub（サイドチャット）: ${escape(contextText("side_chat"))}</small><small>Approve: ${escape(contextText("approve"))}</small></td><td>${time(client.last_seen_ms)}</td></tr>`;
     }).join(""));
     el("clients-empty").hidden = next.clients.length > 0;
     markup("revision-rows", [...next.store.changes].reverse().map(change => `<div class="revision-row"><b>更新 ${escape(change.revision)}</b><span>${escape(changeSummary(change))}</span><small>${new Date(change.changed_at_ms).toLocaleString("ja-JP")}</small></div>`).join(""));

@@ -2,7 +2,7 @@ use crate::protocol::{Availability, HubError};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 pub const MAX_CATALOG_ENTRIES: usize = 1024;
 pub const MAX_LOGICAL_MODELS: usize = 128;
 pub const MAX_MODEL_SYSTEM_PROMPT_CHARS: usize = 16_384;
@@ -70,6 +70,10 @@ pub struct Catalog {
     /// Explicit initial choice for new model clients; existing client choices are unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team_default_model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_default_side_model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_default_approve_model_id: Option<String>,
     pub models: Vec<LogicalModel>,
     pub deployments: Vec<Deployment>,
     pub capacity_pools: Vec<CapacityPool>,
@@ -135,12 +139,15 @@ impl CatalogStore {
             .models
             .iter()
             .all(|model| model.system_prompt.is_empty());
-        let legacy = no_model_prompts
+        let no_role_defaults = self.catalog.team_default_side_model_id.is_none()
+            && self.catalog.team_default_approve_model_id.is_none();
+        let legacy_prompt_schema = no_model_prompts
             && (self.schema_version == 3
                 || (no_credentials
                     && (self.schema_version == 2
                         || (self.schema_version == 1
                             && self.catalog.team_default_model_id.is_none()))));
+        let legacy = no_role_defaults && (self.schema_version == 4 || legacy_prompt_schema);
         if (!legacy && self.schema_version != SCHEMA_VERSION) || self.revision == 0 {
             return Err(invalid("unsupported schema or invalid revision"));
         }
@@ -227,7 +234,9 @@ impl CatalogStore {
             deployments_changed: before.deployments != catalog.deployments,
             policy_changed: before.policy != catalog.policy
                 || before.capacity_pools != catalog.capacity_pools
-                || before.team_default_model_id != catalog.team_default_model_id,
+                || before.team_default_model_id != catalog.team_default_model_id
+                || before.team_default_side_model_id != catalog.team_default_side_model_id
+                || before.team_default_approve_model_id != catalog.team_default_approve_model_id,
             software_changed: schema_changed,
         };
         self.catalog = catalog;
@@ -262,6 +271,17 @@ impl Catalog {
                 return Err(invalid(
                     "standard model must be an existing tools-capable model",
                 ));
+            }
+        }
+        for id in [
+            self.team_default_side_model_id.as_ref(),
+            self.team_default_approve_model_id.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !self.models.iter().any(|model| &model.id == id) {
+                return Err(invalid("role standard model must be an existing model"));
             }
         }
         if self.models.len() > MAX_LOGICAL_MODELS {

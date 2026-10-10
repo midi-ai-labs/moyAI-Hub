@@ -199,6 +199,8 @@ impl Fixture {
         let mut store = CatalogStore::empty("0.1.0");
         let catalog = Catalog {
             team_default_model_id: None,
+            team_default_side_model_id: None,
+            team_default_approve_model_id: None,
             models: vec![LogicalModel {
                 system_prompt: String::new(),
                 id: "logical-qwen".into(),
@@ -323,6 +325,46 @@ impl Fixture {
         .await
         .unwrap()
     }
+}
+
+#[tokio::test]
+async fn repeated_prepare_discovers_later_hosts_after_the_first_four_fail() {
+    let fixture = Fixture::new(false, false).await;
+    {
+        let mut core = fixture.core.lock().unwrap();
+        let mut catalog = core.catalog_store().catalog.clone();
+        let mut healthy = catalog.deployments[0].clone();
+        healthy.id = "later-healthy-host".into();
+        healthy.provider_profile = "lmstudio_chat".into();
+        catalog.deployments = (1..=4)
+            .map(|port| {
+                let mut row = healthy.clone();
+                row.id = format!("unreachable-host-{port}");
+                row.endpoint = format!("http://127.0.0.0:{port}/v1");
+                assert!(row.endpoint < healthy.endpoint);
+                row
+            })
+            .chain(std::iter::once(healthy.clone()))
+            .collect();
+        core.replace_catalog(catalog, now_ms()).unwrap();
+    }
+    let client = fixture.register().await;
+    let (status, waiting) = fixture.prepare(&client, "main", "turn", "request").await;
+    assert_eq!(status, 200, "{waiting}");
+    assert_eq!(waiting["state"], "waiting");
+    assert_eq!(waiting["reason"], "target_unavailable");
+    assert_eq!(fixture.provider.metadata_reads.load(Ordering::SeqCst), 0);
+
+    let (status, ready) = fixture.prepare(&client, "main", "turn", "request").await;
+    assert_eq!(status, 200, "{ready}");
+    assert_eq!(
+        fixture.provider.metadata_reads.load(Ordering::SeqCst),
+        1,
+        "{ready}"
+    );
+    assert_eq!(ready["state"], "ready", "{ready}");
+    fixture.generate(&ready).await.bytes().await.unwrap();
+    assert_eq!(fixture.provider.records.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]

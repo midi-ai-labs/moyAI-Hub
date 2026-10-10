@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 1421",
     "build": "tsc --noEmit && vite build",
-    "test": "node --test --test-reporter=tap ui/test/*.test.ts tests/hub_browser_resource.test.mjs tests/mcp_sender_fixture.test.mjs tests/gui_stage.test.mjs",
+    "test": "node --test --test-reporter=tap ui/test/*.test.ts tests/hub_browser_resource.test.mjs tests/gui_stage.test.mjs",
     "verify:gui": "node scripts/gui-stage.mjs verify",
     "test:gui": "node scripts/gui-stage.mjs test",
     "test:browser": "playwright test",

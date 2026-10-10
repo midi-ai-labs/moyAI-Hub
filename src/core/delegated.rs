@@ -1,8 +1,9 @@
 //! Delegated execution reuses the existing route/permit/queue owner with an
-//! immutable copy of a reviewed Main or Side selection and an independent scope.
+//! immutable copy of a reviewed role selection and an independent scope.
 use super::*;
 
-const MAX_DELEGATED_CONTEXTS: usize = MAX_CONTEXTS_PER_CLIENT - 2;
+const MAX_DELEGATED_CONTEXTS: usize = 14;
+const MAX_APPROVE_CONTEXTS: usize = 15;
 const MAX_DELEGATIONS_PER_CLIENT: usize = 4096;
 
 #[derive(Clone)]
@@ -18,7 +19,7 @@ impl DelegatedContext {
 
 impl HubCore {
     pub fn delegated_context_id(parent: &str, execution: &str) -> Result<String, HubError> {
-        if !matches!(parent, "main" | "side_chat")
+        if !matches!(parent, "main" | "side_chat" | "approve")
             || ulid::Ulid::from_string(execution)
                 .ok()
                 .is_none_or(|id| id.to_string() != execution)
@@ -71,7 +72,7 @@ impl HubCore {
                 .last_seen_ms = now_ms;
             return Ok(context_id);
         }
-        for other in ["main", "side_chat"] {
+        for other in ["main", "side_chat", "approve"] {
             if other != parent
                 && client
                     .contexts
@@ -94,8 +95,23 @@ impl HubCore {
             .values()
             .filter(|context| context.delegated.is_some())
             .count();
+        let role_count = client
+            .contexts
+            .values()
+            .filter(|context| {
+                context
+                    .delegated
+                    .as_ref()
+                    .is_some_and(|scope| (scope.parent == "approve") == (parent == "approve"))
+            })
+            .count();
+        let role_limit = if parent == "approve" {
+            MAX_APPROVE_CONTEXTS
+        } else {
+            MAX_DELEGATED_CONTEXTS
+        };
         if client.contexts.len() >= MAX_CONTEXTS_PER_CLIENT
-            || active_count >= MAX_DELEGATED_CONTEXTS
+            || role_count >= role_limit
             || active_count + client.closed_delegations.len() >= MAX_DELEGATIONS_PER_CLIENT
         {
             return Err(HubError::RegistryFull);
@@ -164,7 +180,7 @@ impl HubCore {
             {
                 return Err(HubError::RegistryFull);
             }
-            for other in ["main", "side_chat"] {
+            for other in ["main", "side_chat", "approve"] {
                 if other != parent
                     && client
                         .contexts

@@ -97,6 +97,159 @@ fn review_body(client: &Value, context: &str) -> Value {
 }
 
 #[tokio::test]
+async fn approve_review_is_independent_accepts_chat_only_model_and_requires_its_own_revision() {
+    let server = Server::new().await;
+    {
+        let mut core = server.core.lock().unwrap();
+        let mut catalog = core.catalog_store().catalog.clone();
+        catalog.models[1].capabilities.clear();
+        core.replace_catalog(catalog, 0).unwrap();
+    }
+    let a = server.register("Desktop").await;
+    let other = server.register("Other Desktop").await;
+    let token = a["client_token"].as_str().unwrap();
+    for context in ["main", "side_chat"] {
+        assert_eq!(
+            server
+                .post("/v1/clients/review", token, &review_body(&a, context))
+                .await
+                .0,
+            StatusCode::OK
+        );
+    }
+    let mut approve = review_body(&a, "approve");
+    approve["selection"]["allowed_model_ids"] = json!(["model-b"]);
+    approve["selection"]["preferred_model_id"] = json!("model-b");
+    approve["selection"]["required_capabilities"] = json!([]);
+    assert_eq!(
+        server
+            .post(
+                "/v1/clients/review",
+                other["client_token"].as_str().unwrap(),
+                &approve
+            )
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        server.post("/v1/clients/review", token, &approve).await.0,
+        StatusCode::OK
+    );
+    {
+        let mut core = server.core.lock().unwrap();
+        assert_eq!(
+            core.client_rows(0)
+                .iter()
+                .find(|row| row.id == a["id"])
+                .unwrap()
+                .contexts
+                .len(),
+            3
+        );
+        let mut catalog = core.catalog_store().catalog.clone();
+        catalog.models[0].label = "Updated".into();
+        core.replace_catalog(catalog, 1).unwrap();
+    }
+    let mut main = review_body(&a, "main");
+    main["reviewed_revision"] = json!("4");
+    assert_eq!(
+        server.post("/v1/clients/review", token, &main).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        server.post("/v1/clients/review", token, &approve).await.0,
+        StatusCode::CONFLICT
+    );
+    let core = server.core.lock().unwrap();
+    let rows = core.client_rows(1);
+    let row = rows.iter().find(|row| row.id == a["id"]).unwrap();
+    for context in ["side_chat", "approve"] {
+        assert!(
+            row.contexts
+                .iter()
+                .find(|value| value.context_id == context)
+                .unwrap()
+                .review_required
+        );
+    }
+}
+
+#[tokio::test]
+async fn public_catalog_exposes_role_selections_without_deployment_or_credential_data() {
+    use moyai_hub::catalog::{CapacityPool, Deployment};
+    let server = Server::new().await;
+    {
+        let mut core = server.core.lock().unwrap();
+        let mut catalog = core.catalog_store().catalog.clone();
+        catalog.models[1].capabilities.clear();
+        catalog.team_default_model_id = Some("model-a".into());
+        catalog.team_default_side_model_id = Some("model-b".into());
+        catalog.team_default_approve_model_id = Some("model-b".into());
+        catalog.capacity_pools.push(CapacityPool {
+            id: "pool".into(),
+            label: "Private pool".into(),
+            max_concurrent: 2,
+        });
+        catalog.deployments = ["model-a", "model-b"]
+            .map(|id| Deployment {
+                id: id.into(),
+                logical_model_id: id.into(),
+                capacity_pool_id: "pool".into(),
+                label: "Private host".into(),
+                endpoint: "https://private-model-host.test/v1".into(),
+                provider_model: "Private provider model".into(),
+                provider_profile: "openai_compatible_chat".into(),
+                upstream_credential_id: Some(ulid::Ulid::new().to_string()),
+                enabled: true,
+            })
+            .into();
+        core.replace_catalog(catalog, 0).unwrap();
+    }
+    let response = Client::new()
+        .get(format!("{}/v1/catalog", server.base))
+        .bearer_auth(BOOTSTRAP)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let catalog: Value = response.json().await.unwrap();
+    assert_eq!(catalog["team_default_model_id"], "model-a");
+    assert_eq!(catalog["team_default_side_model_id"], "model-b");
+    assert_eq!(catalog["team_default_approve_model_id"], "model-b");
+    assert_eq!(
+        catalog["default_selections"]["main"]["required_capabilities"],
+        json!(["tools"])
+    );
+    for role in ["side_chat", "approve"] {
+        assert_eq!(
+            catalog["default_selections"][role]["allowed_model_ids"],
+            json!(["model-b"])
+        );
+        assert_eq!(
+            catalog["default_selections"][role]["required_capabilities"],
+            json!([])
+        );
+    }
+    let public = catalog.to_string();
+    for private in ["deployments", "capacity_pools", "policy", "credentials"] {
+        assert!(catalog.get(private).is_none());
+    }
+    for private in [
+        "private-model-host",
+        "Private host",
+        "Private pool",
+        "Private provider model",
+        "upstream_credential_id",
+        "endpoint",
+        "capacity_pools",
+    ] {
+        assert!(!public.contains(private), "public catalog leaked {private}");
+    }
+}
+
+#[tokio::test]
 async fn authenticated_heartbeat_renews_only_its_exact_live_turn_and_accepts_legacy_clients() {
     use moyai_hub::{
         catalog::{CapacityPool, Deployment},

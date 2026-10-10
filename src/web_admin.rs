@@ -361,6 +361,7 @@ fn browser_command(command: &str) -> bool {
             | "hub_register"
             | "hub_edit"
             | "hub_set_standard_model"
+            | "hub_set_standard_models"
             | "hub_network_snapshot"
             | "hub_hosting_options"
             | "hub_network_settings"

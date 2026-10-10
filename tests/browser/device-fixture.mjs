@@ -1,7 +1,6 @@
 import { generateKeyPairSync, randomUUID, sign } from "node:crypto";
 import { createServer as createHttpsServer, request as httpsRequest } from "node:https";
-import { openSenderMcpSession } from "./mcp-sender-fixture.mjs";
-import { MCP_PROTOCOL } from "./mcp-sender-fixture.mjs";
+const MCP_PROTOCOL = "2025-11-25";
 
 // Test participant only. It uses the real enrollment/mTLS protocol; no Admin
 // mutation or Hub storage access. Its private key never leaves this process.
@@ -136,13 +135,6 @@ export async function createDeviceParticipant(network, label, windowsUsername = 
             let closed = false;
             return { endpoint: `https://127.0.0.1:${server.address().port}/mcp`, calls: () => [...calls],
                 async close() { if (closed) return; closed = true; const done = new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve())); for (const socket of sockets) socket.destroy(); await done; sessions.clear(); } };
-        },
-        async connectMcpPeer({ audienceDeviceId, profileId, rootTaskId, requestKey }) {
-            if (!certificate) throw new Error("Participant must be approved before requesting an MCP grant");
-            const grant = await request("grants", { audience_device_id: audienceDeviceId, profile_id: profileId,
-                root_task_id: rootTaskId, request_key: requestKey, parent_grant_id: null, parent_job_id: null, action: "execute" });
-            return openSenderMcpSession({ grant, target: { actorDeviceId: certificate.device_id, audienceDeviceId, profileId, rootTaskId, requestKey },
-                ca: network.ca_certificate_pem, certificate: certificate.certificate_pem, key });
         },
     };
 }

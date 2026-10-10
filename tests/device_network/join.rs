@@ -881,3 +881,49 @@ fn same_windows_username_remains_metadata_on_distinct_registered_keys() {
         snapshot["devices"]
     );
 }
+
+#[test]
+fn schema_four_load_preserves_missing_windows_usernames_until_forward_save() {
+    let mut fixture = Fixture::new();
+    let device = fixture.device("Existing PC");
+    let pending = fixture
+        .owner
+        .request_join_with_user(
+            "Pending PC".into(),
+            Some("DOMAIN\\new-user".into()),
+            &csr().1,
+            ip(),
+            fixture.now,
+        )
+        .unwrap();
+    let path = fixture.directory.path().join("network.json");
+    let mut old: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    old["schema_version"] = json!(4);
+    old["devices"][&device.receipt.device_id]
+        .as_object_mut()
+        .unwrap()
+        .remove("windows_username");
+    old["join_requests"][&pending.request_id]
+        .as_object_mut()
+        .unwrap()
+        .remove("windows_username");
+    let bytes = serde_json::to_vec(&old).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    let mut reopened = DeviceNetwork::open(&path, "hub-test").unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert!(reopened.current_certificate(
+        &device.receipt.device_id,
+        &device.receipt.certificate_sha256,
+        fixture.now
+    ));
+    let snapshot = reopened.snapshot(fixture.now);
+    assert!(snapshot["devices"][0]["windows_username"].is_null());
+    assert!(snapshot["join_requests"][0]["windows_username"].is_null());
+    reopened
+        .set_gateway_port(&reopened.revision(), 9550)
+        .unwrap();
+    let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(saved["schema_version"], 5);
+    assert!(saved["devices"][&device.receipt.device_id]["windows_username"].is_null());
+    assert!(saved["join_requests"][&pending.request_id]["windows_username"].is_null());
+}

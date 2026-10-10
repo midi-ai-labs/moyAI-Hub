@@ -67,7 +67,7 @@ test("Model registration, profile discovery, edit and deletion use the real cata
         const standardId = registered.store.catalog.models[0].id;
         await page.locator("#team-standard-model").selectOption(standardId);
         await page.locator("#team-standard-save").click();
-        await expect(page.locator("#team-standard-status")).toHaveText("初めて接続するPCのモデル：Alpha <Hub> & tools。");
+        await expect(page.locator("#team-standard-status")).toHaveText("Main：Alpha <Hub> & tools / Sub（サイドチャット）：未指定 / Approve（承認判定）：未指定。");
         expect((await hub.command("hub_snapshot")).store.catalog.team_default_model_id).toBe(standardId);
 
         await row.getByRole("button", { name: /を編集/ }).click();
@@ -120,6 +120,71 @@ test("Model registration, profile discovery, edit and deletion use the real cata
         await page.reload();
         await expect(page.locator("#model-rows tr")).toHaveCount(0);
         await expect(page.locator("#revision-rows")).toContainText("モデル削除 1 件");
+        expect(errors).toEqual([]);
+    } finally { await provider.close(); }
+});
+
+test("Main, Sub and Approve defaults save together and preserve independent chat choices", async ({ page, hub }, testInfo) => {
+    const provider = await createMetadataProvider();
+    const errors = []; page.on("pageerror", error => errors.push(error.message));
+    try {
+        await ready(page, hub.url);
+        await page.locator('nav a[href="#models"]').click();
+        await page.locator("#endpoint").fill(provider.url);
+        await page.locator("#discover").click();
+        await expect(page.locator("#model")).toBeEnabled();
+        await page.locator("#model").selectOption("fixture-alpha");
+        await page.locator("#label").fill("Main agent");
+        await page.locator("#allow-tools").check();
+        await page.locator("#register").click();
+        await expect(page.locator("#model-rows tr")).toHaveCount(1);
+        await page.locator("#model").selectOption("fixture-beta");
+        await page.locator("#label").fill("Small chat model");
+        await page.locator("#allow-tools").uncheck();
+        await page.locator("#register").click();
+        await expect(page.locator("#model-rows tr")).toHaveCount(2);
+        const registered = await hub.command("hub_snapshot");
+        const agent = registered.store.catalog.models.find(model => model.label === "Main agent");
+        const chat = registered.store.catalog.models.find(model => model.label === "Small chat model");
+        expect(chat.capabilities).not.toContain("tools");
+        await expect(page.locator("#team-standard-model option")).toHaveCount(2);
+        await expect(page.locator("#team-standard-side-model option")).toHaveCount(3);
+        await expect(page.locator("#team-standard-approve-model option")).toHaveCount(3);
+        await page.locator("#team-standard-model").selectOption(agent.id);
+        await page.locator("#team-standard-side-model").selectOption(chat.id);
+        await page.locator("#team-standard-approve-model").selectOption(chat.id);
+        await page.locator("#team-standard-approve-model").click();
+        await page.keyboard.press("Escape");
+        await polls(page);
+        await expect(page.locator("#team-standard-approve-model")).toBeFocused();
+        await expect(page.locator("#team-standard-approve-model")).toHaveValue(chat.id);
+        expect((await hub.command("hub_snapshot")).store.revision).toBe(registered.store.revision);
+        await page.locator("#team-standard-save").click();
+        await expect(page.locator("#team-standard-status")).toHaveText("Main：Main agent / Sub（サイドチャット）：Small chat model / Approve（承認判定）：Small chat model。");
+        const saved = await hub.command("hub_snapshot");
+        expect(BigInt(saved.store.revision)).toBe(BigInt(registered.store.revision) + 1n);
+        expect(saved.store.catalog).toMatchObject({ team_default_model_id: agent.id, team_default_side_model_id: chat.id, team_default_approve_model_id: chat.id });
+        await page.reload(); await ready(page, hub.url);
+        await expect(page.locator("#team-standard-model")).toHaveValue(agent.id);
+        await expect(page.locator("#team-standard-side-model")).toHaveValue(chat.id);
+        await expect(page.locator("#team-standard-approve-model")).toHaveValue(chat.id);
+        await page.locator("#team-standard-model").scrollIntoViewIfNeeded();
+        await screenshot(page, testInfo, "three-model-defaults");
+        await page.locator("#team-standard-approve-model").selectOption("");
+        const other = await page.context().newPage();
+        try {
+            await ready(other, hub.url);
+            await other.locator("#team-standard-side-model").selectOption("");
+            await other.locator("#team-standard-save").click();
+            await expect(other.locator("#team-standard-status")).toContainText("Sub（サイドチャット）：未指定");
+            await page.locator("#team-standard-save").click();
+            await expect(page.locator("#team-standard-status")).toContainText("カタログが変更されました");
+            await expect(page.locator("#team-standard-approve-model")).toHaveValue("");
+            const conflict = await hub.command("hub_snapshot");
+            expect(conflict.store.catalog.team_default_model_id).toBe(agent.id);
+            expect(conflict.store.catalog.team_default_side_model_id ?? null).toBeNull();
+            expect(conflict.store.catalog.team_default_approve_model_id).toBe(chat.id);
+        } finally { await other.close(); }
         expect(errors).toEqual([]);
     } finally { await provider.close(); }
 });

@@ -190,8 +190,9 @@ async fn device_session(
     // Hub owns this initial automatic receiver policy. Desktop does not select a
     // first model independently, and must review the exact returned revision.
     let default_selection = initial_model_selection(&core.catalog_store().catalog);
+    let default_selections = initial_model_selections(&core.catalog_store().catalog);
     Ok(Json(
-        json!({"id":id,"client_token":secret,"hub_id":core.catalog_store().hub_id,"revision":core.catalog_store().revision.to_string(),"heartbeat_interval_ms":10000,"supports_turn_heartbeat":true,"supports_delegated_execution":true,"identity_scope":"device_session","default_selection":default_selection}),
+        json!({"id":id,"client_token":secret,"hub_id":core.catalog_store().hub_id,"revision":core.catalog_store().revision.to_string(),"heartbeat_interval_ms":10000,"supports_turn_heartbeat":true,"supports_delegated_execution":true,"identity_scope":"device_session","default_selection":default_selection,"default_selections":default_selections}),
     ))
 }
 
@@ -219,6 +220,24 @@ fn initial_model_selection(catalog: &crate::catalog::Catalog) -> Option<Value> {
             .collect(),
     };
     models.first().map(|preferred| json!({"allowed_model_ids":models,"preferred_model_id":preferred,"required_capabilities":["tools"],"wait_policy":"allow_selected_fallback","affinity_turns":3}))
+}
+
+fn initial_model_selections(catalog: &crate::catalog::Catalog) -> Value {
+    let chat_selection = |id: &Option<String>| -> Option<Value> {
+        let id = id.as_ref()?;
+        if !catalog.models.iter().any(|model| &model.id == id)
+            || !catalog
+                .deployments
+                .iter()
+                .any(|d| &d.logical_model_id == id && d.enabled)
+        {
+            return None;
+        }
+        Some(
+            json!({"allowed_model_ids":[id],"preferred_model_id":id,"required_capabilities":[],"wait_policy":"allow_selected_fallback","affinity_turns":3}),
+        )
+    };
+    json!({"main":initial_model_selection(catalog),"side_chat":chat_selection(&catalog.team_default_side_model_id),"approve":chat_selection(&catalog.team_default_approve_model_id)})
 }
 
 type ApiResult = Result<Json<Value>, (StatusCode, Json<Value>)>;
@@ -320,7 +339,7 @@ async fn catalog(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult
         "summary":format!("models +{} / -{} / changed {}; deployments {}; policy {}; software {}",change.added_model_ids.len(),change.removed_model_ids.len(),change.changed_model_ids.len(),change.deployments_changed,change.policy_changed,change.software_changed)
     })).collect();
     Ok(Json(
-        json!({"hub_id":store.hub_id,"software_version":store.software_version,"revision":store.revision.to_string(),"models":store.catalog.models,"changes":changes}),
+        json!({"hub_id":store.hub_id,"software_version":store.software_version,"revision":store.revision.to_string(),"models":store.catalog.models,"changes":changes,"default_selections":initial_model_selections(&store.catalog),"team_default_model_id":store.catalog.team_default_model_id,"team_default_side_model_id":store.catalog.team_default_side_model_id,"team_default_approve_model_id":store.catalog.team_default_approve_model_id}),
     ))
 }
 
@@ -443,6 +462,7 @@ async fn heartbeat(
 enum ReviewContext {
     Main,
     SideChat,
+    Approve,
 }
 
 impl ReviewContext {
@@ -450,6 +470,7 @@ impl ReviewContext {
         match self {
             Self::Main => "main",
             Self::SideChat => "side_chat",
+            Self::Approve => "approve",
         }
     }
 }
@@ -632,6 +653,46 @@ mod tests {
         assert_eq!(choice["preferred_model_id"], "standard");
         catalog.deployments[0].enabled = false;
         assert!(initial_model_selection(&catalog).is_none());
+    }
+
+    #[test]
+    fn role_defaults_keep_chat_models_independent_without_tools_or_main_fallback() {
+        use crate::catalog::*;
+        let mut catalog = Catalog::default();
+        catalog.models.push(LogicalModel {
+            id: "chat".into(),
+            label: "Chat".into(),
+            capabilities: Default::default(),
+            system_prompt: String::new(),
+        });
+        catalog.deployments.push(Deployment {
+            id: "host".into(),
+            logical_model_id: "chat".into(),
+            capacity_pool_id: "pool".into(),
+            label: "Host".into(),
+            endpoint: "http://localhost:1234/v1".into(),
+            provider_model: "chat".into(),
+            provider_profile: "openai_compatible_chat".into(),
+            upstream_credential_id: None,
+            enabled: true,
+        });
+        assert_eq!(
+            initial_model_selections(&catalog),
+            json!({"main":null,"side_chat":null,"approve":null})
+        );
+        catalog.team_default_side_model_id = Some("chat".into());
+        catalog.team_default_approve_model_id = Some("chat".into());
+        let selected = initial_model_selections(&catalog);
+        assert!(selected["main"].is_null());
+        for role in ["side_chat", "approve"] {
+            assert_eq!(selected[role]["allowed_model_ids"], json!(["chat"]));
+            assert_eq!(selected[role]["required_capabilities"], json!([]));
+        }
+        catalog.deployments[0].enabled = false;
+        assert_eq!(
+            initial_model_selections(&catalog),
+            json!({"main":null,"side_chat":null,"approve":null})
+        );
     }
 
     #[tokio::test]

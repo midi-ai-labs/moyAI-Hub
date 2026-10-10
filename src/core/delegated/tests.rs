@@ -7,6 +7,8 @@ fn fixture() -> (HubCore, Selection) {
         .replace_catalog(
             Catalog {
                 team_default_model_id: None,
+                team_default_side_model_id: None,
+                team_default_approve_model_id: None,
                 models: vec![LogicalModel {
                     system_prompt: String::new(),
                     id: "model".into(),
@@ -321,6 +323,50 @@ fn delegated_close_overtakes_prepare_and_both_active_and_retired_identity_sets_a
         full.ensure_delegated_context("client", "main", &id(5000), selection, 0),
         Err(HubError::RegistryFull)
     ));
+}
+
+#[test]
+fn approve_scopes_have_bounded_capacity_without_expanding_normal_agent_capacity() {
+    let (mut hub, selection) = fixture();
+    hub.save_selection("client", "side_chat", selection.clone())
+        .unwrap();
+    hub.save_selection("client", "approve", selection.clone())
+        .unwrap();
+    for value in 1..=14 {
+        child(&mut hub, &selection, value);
+    }
+    assert!(matches!(
+        hub.ensure_delegated_context("client", "main", &id(15), selection.clone(), 0),
+        Err(HubError::RegistryFull)
+    ));
+    for value in 101..=115 {
+        let context = hub
+            .ensure_delegated_context("client", "approve", &id(value), selection.clone(), 0)
+            .unwrap();
+        assert_eq!(context, format!("delegated-approve-{}", id(value)));
+    }
+    assert_eq!(hub.clients["client"].contexts.len(), 32);
+    assert!(matches!(
+        hub.ensure_delegated_context("client", "approve", &id(116), selection.clone(), 0),
+        Err(HubError::RegistryFull)
+    ));
+    assert!(matches!(
+        hub.ensure_delegated_context("client", "side_chat", &id(101), selection.clone(), 0),
+        Err(HubError::WrongOwner)
+    ));
+    hub.close_delegated_context("client", "approve", &id(101), true)
+        .unwrap();
+    assert!(matches!(
+        hub.ensure_delegated_context("client", "side_chat", &id(16), selection.clone(), 0),
+        Err(HubError::RegistryFull)
+    ));
+    hub.ensure_delegated_context("client", "approve", &id(116), selection.clone(), 0)
+        .unwrap();
+    assert!(matches!(
+        hub.close_delegated_context("client", "main", &id(116), true),
+        Err(HubError::WrongOwner)
+    ));
+    assert_eq!(hub.clients["client"].contexts.len(), 32);
 }
 
 #[test]

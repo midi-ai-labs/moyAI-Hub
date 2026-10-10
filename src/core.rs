@@ -7,7 +7,7 @@ mod queue;
 use queue::RequestTicket;
 
 const MAX_CLIENTS: usize = 256;
-const MAX_CONTEXTS_PER_CLIENT: usize = 16;
+const MAX_CONTEXTS_PER_CLIENT: usize = 32;
 const MAX_REQUESTS_PER_TURN: usize = 4096;
 const MAX_RECENT_TURNS: usize = 256;
 const RETRY_AFTER_MS: u64 = 1000;
@@ -186,6 +186,12 @@ impl HubCore {
 
     pub fn needs_presence_refresh(&self, deployment_id: &str, now_ms: u64) -> bool {
         !self.model_present(deployment_id, now_ms)
+    }
+
+    pub(crate) fn deployment_observed_at(&self, deployment_id: &str) -> Option<u64> {
+        self.observations
+            .get(deployment_id)
+            .map(|observation| observation.observed_at_ms)
     }
 
     /// The gateway calls this at claim time. A prepared token cannot bypass a later review,

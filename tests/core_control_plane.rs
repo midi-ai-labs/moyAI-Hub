@@ -76,6 +76,50 @@ fn legacy_catalog_upgrades_without_assuming_a_standard_and_explicit_choice_is_va
 }
 
 #[test]
+fn role_defaults_upgrade_schema_four_without_changing_main_or_provider_data() {
+    let mut previous = fixture().catalog_store().clone();
+    previous.schema_version = 4;
+    previous.catalog.team_default_model_id = Some("model-a".into());
+    previous.catalog.models[1].system_prompt = "Keep this model instruction".into();
+    previous.catalog.deployments[1].upstream_credential_id = Some(ulid::Ulid::new().to_string());
+    let saved = serde_json::to_string(&previous).unwrap();
+    assert!(!saved.contains("team_default_side_model_id"));
+    assert!(!saved.contains("team_default_approve_model_id"));
+    let mut upgraded: CatalogStore = serde_json::from_str(&saved).unwrap();
+    assert!(upgraded.reconcile_software("0.1.0", 20).unwrap());
+    assert_eq!(upgraded.schema_version, 5);
+    assert_eq!(upgraded.catalog, previous.catalog);
+    assert_eq!(upgraded.hub_id, previous.hub_id);
+    assert_eq!(upgraded.revision, previous.revision + 1);
+    assert_eq!(
+        &upgraded.changes[..previous.changes.len()],
+        previous.changes
+    );
+    assert!(!upgraded.reconcile_software("0.1.0", 21).unwrap());
+
+    let mut chosen = upgraded.catalog.clone();
+    chosen.models[1].capabilities.clear();
+    chosen.team_default_side_model_id = Some("model-b".into());
+    chosen.team_default_approve_model_id = Some("model-b".into());
+    upgraded.replace_catalog(chosen.clone(), 22).unwrap();
+    assert!(upgraded.changes.last().unwrap().policy_changed);
+    assert_eq!(
+        serde_json::from_str::<CatalogStore>(&serde_json::to_string(&upgraded).unwrap()).unwrap(),
+        upgraded
+    );
+    for version in 1..=4 {
+        let mut wrong_version = upgraded.clone();
+        wrong_version.schema_version = version;
+        assert!(wrong_version.validate().is_err());
+    }
+    chosen.team_default_approve_model_id = Some("missing".into());
+    assert!(chosen.validate().is_err());
+    chosen.team_default_approve_model_id = None;
+    chosen.team_default_side_model_id = Some("missing".into());
+    assert!(chosen.validate().is_err());
+}
+
+#[test]
 fn schema_two_catalog_upgrades_once_preserving_defaults_models_and_history() {
     let mut previous = fixture().catalog_store().clone();
     previous.schema_version = 2;
@@ -103,7 +147,7 @@ fn schema_two_catalog_upgrades_once_preserving_defaults_models_and_history() {
 
 #[test]
 fn catalog_replacement_also_upgrades_legacy_schema_even_when_data_is_unchanged() {
-    for version in [1, 2, 3] {
+    for version in [1, 2, 3, 4] {
         let mut previous = fixture().catalog_store().clone();
         previous.schema_version = version;
         let mut migrated = previous.clone();
@@ -146,6 +190,8 @@ fn fixture() -> HubCore {
         .replace_catalog(
             Catalog {
                 team_default_model_id: None,
+                team_default_side_model_id: None,
+                team_default_approve_model_id: None,
                 models: vec![
                     model("model-a", &["tools"]),
                     model("model-b", &["tools", "vision"]),
@@ -1360,7 +1406,7 @@ fn reviewing_main_does_not_review_side_after_catalog_update() {
 fn context_registry_bound_rejects_new_context_without_losing_existing_reviews() {
     let mut hub = fixture();
     let selected = selection(hub.catalog_store().revision);
-    for index in 1..16 {
+    for index in 1..32 {
         hub.save_selection("client-a", &format!("context-{index}"), selected.clone())
             .unwrap();
     }
@@ -1374,7 +1420,7 @@ fn context_registry_bound_rejects_new_context_without_losing_existing_reviews() 
         .iter()
         .find(|client| client.id == "client-a")
         .unwrap();
-    assert_eq!(client.contexts.len(), 16);
+    assert_eq!(client.contexts.len(), 32);
     assert!(
         client
             .contexts

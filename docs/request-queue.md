@@ -6,6 +6,6 @@ Hubの `/v1/requests/prepare` は、認証済みclient・context・turn・reques
 
 先行要求が使えるcapacity poolとglobal枠を考慮して、後から問い合わせた同じ枠の要求による追い越しを防ぎます。先行要求のモデルが未接続・停止中、またはpoolが満杯でも、別の実行可能なpoolとglobal枠があれば後続は進めます。先行要求と後続が両方収まる場合も、後続の別poolを空けたまま待たせません。選択されていないモデルには切り替えず、active turnのleaseも移送しません。
 
-待ちqueueは最大4096件です。取消・turn終了・client切断で該当要求を取り除き、catalog revision変更で旧確認の待ち順序を破棄します。端末のheartbeat失効、選択のreview失効、turnの失効でも無効になります。個別要求の再問い合わせが `heartbeat_stale_ms`（既定30秒）以上途絶えた場合は、Desktopのheartbeatだけが生きていてもその順位を解放します。再問い合わせは有効な既存turnであれば末尾から始めます。端末側は従来どおり `retry_after_ms`（1秒）に従います。
+待ちqueueは最大8192件（client上限256 × context上限32）です。取消・turn終了・client切断で該当要求を取り除き、catalog revision変更で旧確認の待ち順序を破棄します。端末のheartbeat失効、選択のreview失効、turnの失効でも無効になります。個別要求の再問い合わせが `heartbeat_stale_ms`（既定30秒）以上途絶えた場合は、Desktopのheartbeatだけが生きていてもその順位を解放します。再問い合わせは有効な既存turnであれば末尾から始めます。端末側は従来どおり `retry_after_ms`（1秒）に従います。
 
 このqueueはメモリ内の通信準備順序で、Hub再起動後には復元しません。実モデルのGPU負荷・モデルのload/unload・生成の完了判定はoMLX/LM Studioなどのproviderが所有します。queueの順序やcoreの期限を、providerが生成を停止した証拠として扱いません。

@@ -198,12 +198,19 @@ async fn refresh_presence(
                 .or_default()
                 .push(row);
         }
+        let mut groups = groups.into_values().collect::<Vec<_>>();
+        groups.sort_by_key(|rows| {
+            rows.iter()
+                .map(|row| core.deployment_observed_at(&row.id))
+                .min()
+                .unwrap_or(None)
+        });
         groups
     };
     let mut tasks = tokio::task::JoinSet::new();
-    // One prepare does at most four bounded metadata reads. Later prepares continue with
-    // remaining stale hosts; no generation payload enters this process.
-    for (_, rows) in groups.into_iter().take(4) {
+    // Refresh unobserved or oldest hosts first so failures cannot exclude later hosts.
+    // One prepare still does at most four bounded metadata reads.
+    for rows in groups.into_iter().take(4) {
         let directory = state
             .gateway
             .as_ref()

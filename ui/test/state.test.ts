@@ -83,6 +83,7 @@ test("Main review does not imply Side review and revision text stays precise", (
     const contexts = [{context_id:"main",reviewed_revision:"9007199254740993",review_required:false,active_model_id:null}];
     assert.equal(reviewStatus(contexts, "main"), "確認済み（更新 9007199254740993）");
     assert.equal(reviewStatus(contexts, "side_chat"), "未確認");
+    assert.equal(reviewStatus(contexts, "approve"), "未確認");
     contexts[0].review_required = true;
     assert.equal(reviewStatus(contexts, "main"), "再確認が必要");
 });

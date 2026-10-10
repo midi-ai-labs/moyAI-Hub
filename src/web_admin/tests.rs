@@ -1122,6 +1122,18 @@ async fn remote_cookie_on_loopback_keeps_project_management_but_cannot_change_ho
         denied.json::<Value>().await.unwrap()["code"],
         "requires_hub_pc"
     );
+    let denied_roles = request(
+        "hub_set_standard_models",
+        json!({"revision":"1","mainModelId":null,"sideModelId":null,"approveModelId":null}),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(denied_roles.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        denied_roles.json::<Value>().await.unwrap()["code"],
+        "requires_hub_pc"
+    );
     let snapshot = request("hub_shared_snapshot", json!({}))
         .send()
         .await
