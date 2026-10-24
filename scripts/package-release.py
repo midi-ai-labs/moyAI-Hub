@@ -127,7 +127,10 @@ def payload(repo, executable, notices, version, commit, desktop_commit):
     if not files["THIRD_PARTY_NOTICES.txt"].strip():
         raise ValueError("Third-party notices must not be empty")
     sources = [repo / "README.md", *sorted((repo / "docs").rglob("*.md"))]
-    documents = {p.resolve(): p.relative_to(repo) for p in sources}
+    images = [repo / "logo/moyai-hub-screenshot.jpg"]
+    documents = {p.resolve(): p.relative_to(repo) for p in [*sources, *images]}
+    for source in images:
+        files[source.relative_to(repo).as_posix()] = source.read_bytes()
     rewrites = []
     for source in sources:
         destination = source.relative_to(repo)

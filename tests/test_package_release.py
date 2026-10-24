@@ -28,14 +28,17 @@ class PackageReleaseTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.repo = self.root / "Hub"
         self.repo.mkdir()
-        for directory in ("scripts", "docs/release", "src"):
+        for directory in ("scripts", "docs/release", "src", "logo"):
             (self.repo / directory).mkdir(parents=True)
         seed = {"schema": 1, "settings": {"local_port": 9080, "remote": {"mode": "off"}}}
         (self.repo / "web-management.json").write_bytes(package.json_bytes(seed))
         for name in ("Start-Hub.cmd", "Stop-Hub.cmd"):
             (self.repo / "scripts" / name).write_bytes(b"@echo off\r\n")
         (self.repo / "LICENSE").write_text("product license", encoding="utf-8")
-        (self.repo / "README.md").write_text("[Guide](docs/guide.md)", encoding="utf-8")
+        (self.repo / "README.md").write_text(
+            "[Guide](docs/guide.md)\n![Management](logo/moyai-hub-screenshot.jpg)", encoding="utf-8",
+        )
+        (self.repo / "logo/moyai-hub-screenshot.jpg").write_bytes(b"screenshot fixture")
         (self.repo / "docs/guide.md").write_text("[Source](../src/)", encoding="utf-8")
         (self.repo / "docs/release/v1.0.0.md").write_text(
             "# moyAI Hub v1.0.0\n\n[Guide](../guide.md)\n", encoding="utf-8",
@@ -57,6 +60,8 @@ class PackageReleaseTests(unittest.TestCase):
         files, rewrites = self.files()
         self.assertIn("web-management.json", files)
         self.assertIn("Start-Hub.cmd", files)
+        self.assertEqual(files["logo/moyai-hub-screenshot.jpg"], b"screenshot fixture")
+        self.assertIn(b"](logo/moyai-hub-screenshot.jpg)", files["README.md"])
         self.assertEqual(files["THIRD_PARTY_NOTICES.txt"], self.notices.read_bytes())
         self.assertIn(f"/tree/{COMMIT}/src)".encode(), files["docs/guide.md"])
         self.assertIn(b"](docs/guide.md)", files["RELEASE_NOTES.md"])
@@ -76,6 +81,7 @@ class PackageReleaseTests(unittest.TestCase):
         with zipfile.ZipFile(result["zip"]) as zipped:
             self.assertIsNone(zipped.testzip())
             self.assertEqual(zipped.read(folder.name + "/web-management.json"), files["web-management.json"])
+            self.assertEqual(zipped.read(folder.name + "/logo/moyai-hub-screenshot.jpg"), files["logo/moyai-hub-screenshot.jpg"])
         with self.assertRaisesRegex(ValueError, "already exists"):
             package.write_package(self.root / "out", "1.0.0", files, identity, rewrites)
 

@@ -1,6 +1,12 @@
 # moyAI Hub
 
+[Hub 1.0.0をダウンロード](https://github.com/midi-ai-labs/moyAI-Hub/releases/tag/v1.0.0) · [moyAI Desktop](https://github.com/midi-ai-labs/moyAI) · [チームの準備](docs/team-preparation.md)
+
 moyAI DesktopのAI接続、PCの参加、共有プロジェクトを管理するRustサーバーです。管理画面は通常のWebブラウザーで開きます。Hub 1.0.0のWindows x64単体版は、起動・終了用ファイルと固定ポートの初期設定ファイルを同梱します。Hub自体にTauriやWebView2は不要です。[1.0.0の変更点](docs/release/v1.0.0.md)を参照してください。
+
+管理サーバーにはHubを、依頼を送る操作PCや仕事を実行するPCには[moyAI Desktop](https://github.com/midi-ai-labs/moyAI)を用意します。Desktopの導入は[Windowsへの導入と更新](https://github.com/midi-ai-labs/moyAI/blob/main/docs/user/windows-setup.md)を参照してください。DesktopとHubの配布物は、それぞれの[Desktopリリース](https://github.com/midi-ai-labs/moyAI/releases)・[Hubリリース](https://github.com/midi-ai-labs/moyAI-Hub/releases)から取得できます。
+
+![moyAI Hub 1.0.0の管理画面](logo/moyai-hub-screenshot.jpg)
 
 ## チームで使い始める
 
@@ -13,7 +19,7 @@ moyAI DesktopのAI接続、PCの参加、共有プロジェクトを管理する
 
 PCごとにIDと鍵を持ち、同じWindowsユーザー名でも別PCを自動統合しません。通常の利用者アカウント作成・ログインは不要です。共有会話は通常の入力欄を使い、AIが許可されたPCを選択できます。Hubは端末フォルダーの実パスを決めず、各端末が登録した場所を使います。
 
-操作別の詳細は[チームの準備](docs/team-preparation.md)、[受信許可](docs/firewall.md)、[Desktopの共有プロジェクト](../moyAI/docs/shared-work-desktop.md)を参照してください。
+操作別の詳細は[チームの準備](docs/team-preparation.md)、[受信許可](docs/firewall.md)、[Desktopの共有プロジェクト](https://github.com/midi-ai-labs/moyAI/blob/main/docs/shared-work-desktop.md)を参照してください。
 
 ## 起動・管理・終了
 
