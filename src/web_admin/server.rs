@@ -124,6 +124,25 @@ impl WebSettings {
     }
 }
 
+pub(crate) fn initial_settings() -> Result<Value, String> {
+    let path = std::env::current_exe()
+        .map_err(|_| "初期Web管理設定の場所を確認できません。")?
+        .with_file_name("web-management.json");
+    let settings = match std::fs::File::open(path) {
+        Ok(file) => Manager::read_settings(file),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Manager::read_settings(include_bytes!("../../web-management.json").as_slice())
+        }
+        Err(_) => return Err("初期Web管理設定を開けません。".into()),
+    }?;
+    if settings.local_port == 0 {
+        return Err(
+            "初期Web管理設定の settings.local_port に1以上の固定ポートを指定してください。".into(),
+        );
+    }
+    serde_json::to_value(settings).map_err(|_| "初期Web管理設定を読み取れません。".into())
+}
+
 pub(crate) struct Manager {
     path: PathBuf,
     settings: WebSettings,
@@ -176,8 +195,11 @@ impl Manager {
             }
             Err(_) => return Err("Web管理設定を開けません。".into()),
         };
+        Self::read_settings(file)
+    }
+    fn read_settings(reader: impl std::io::Read) -> Result<WebSettings, String> {
         let mut bytes = Vec::new();
-        std::io::Read::read_to_end(&mut std::io::Read::take(file, 32 * 1024 + 1), &mut bytes)
+        std::io::Read::read_to_end(&mut std::io::Read::take(reader, 32 * 1024 + 1), &mut bytes)
             .map_err(|_| "Web管理設定を読み取れません。")?;
         if bytes.len() > 32 * 1024 {
             return Err("Web管理設定がサイズ上限を超えています。".into());

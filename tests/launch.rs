@@ -63,6 +63,7 @@ struct LaunchReply {
 
 struct Profile {
     directory: tempfile::TempDir,
+    executable: PathBuf,
 }
 
 impl Profile {
@@ -73,11 +74,32 @@ impl Profile {
             .join("project_sandbox/hub-launch-cli-tests");
         std::fs::create_dir_all(&parent).unwrap();
         Self {
+            executable: executable().to_path_buf(),
             directory: tempfile::Builder::new()
                 .prefix("launch-")
                 .tempdir_in(parent)
                 .unwrap(),
         }
+    }
+
+    fn with_initial_settings(mut self, settings: Value) -> Self {
+        let package = self.directory.path().join("package");
+        std::fs::create_dir(&package).unwrap();
+        self.executable = package.join("moyai-hub.exe");
+        std::fs::copy(executable(), &self.executable).unwrap();
+        self.write_initial_settings(settings);
+        self
+    }
+
+    fn write_initial_settings(&self, settings: Value) {
+        std::fs::write(
+            self.executable
+                .parent()
+                .unwrap()
+                .join("web-management.json"),
+            serde_json::to_vec(&json!({"schema":1,"settings":settings})).unwrap(),
+        )
+        .unwrap();
     }
 
     fn catalog(&self) -> PathBuf {
@@ -89,7 +111,7 @@ impl Profile {
     }
 
     async fn command(&self, args: &[&str]) -> Output {
-        let mut command = tokio::process::Command::new(executable());
+        let mut command = tokio::process::Command::new(&self.executable);
         command
             .args(args)
             .arg("--data-dir")
@@ -157,7 +179,7 @@ impl Drop for Profile {
         if !self.directory.path().join("host-control.json").exists() {
             return;
         }
-        let mut command = std::process::Command::new(executable());
+        let mut command = std::process::Command::new(&self.executable);
         command
             .arg("--stop")
             .arg("--data-dir")
@@ -298,6 +320,102 @@ async fn launch_first_profile_reports_setup_and_keeps_web_running() {
             .unwrap()["server"]["running"],
         false
     );
+    profile.stop(&client, &[web]).await;
+}
+
+#[tokio::test]
+async fn launch_initial_fixed_port_is_saved_and_takes_precedence_after_restart() {
+    let reserved = bind_fixture_listener("127.0.0.1:0").unwrap();
+    let port = reserved.local_addr().unwrap().port();
+    let profile = Profile::new().with_initial_settings(json!({
+        "local_port":port,"remote":{"mode":"off"}
+    }));
+    drop(reserved);
+
+    let first = profile.launch(false, true).await;
+    let client = profile.connect().await;
+    let web = assert_web(&client, &first).await;
+    assert_eq!(web.port(), port);
+    let settings_path = profile.directory.path().join("web-management.json");
+    let settings: Value = serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
+    assert_eq!(settings["settings"]["local_port"], port);
+    profile.stop(&client, &[web]).await;
+
+    profile.write_initial_settings(json!({"local_port":1,"remote":{"mode":"off"}}));
+    let resumed = profile.launch(false, true).await;
+    let client = profile.connect().await;
+    let web = assert_web(&client, &resumed).await;
+    assert_eq!(web.port(), port);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&std::fs::read(settings_path).unwrap()).unwrap(),
+        settings
+    );
+    profile.stop(&client, &[web]).await;
+}
+
+#[tokio::test]
+async fn launch_initial_port_conflict_does_not_switch_ports() {
+    let occupied = bind_fixture_listener("127.0.0.1:0").unwrap();
+    let port = occupied.local_addr().unwrap().port();
+    let profile = Profile::new().with_initial_settings(json!({
+        "local_port":port,"remote":{"mode":"off"}
+    }));
+    let output = profile.command(&["--launch", "--no-browser"]).await;
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(HostClient::connect(&profile.catalog()).await.is_err());
+    assert!(
+        !profile
+            .directory
+            .path()
+            .join("web-management.json")
+            .exists()
+    );
+    assert!(
+        TcpStream::connect(occupied.local_addr().unwrap())
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn launch_invalid_initial_settings_are_rejected_unless_explicitly_overridden() {
+    let profile = Profile::new().with_initial_settings(json!({
+        "local_port":"invalid","remote":{"mode":"off"}
+    }));
+    for settings in [
+        json!({"local_port":"invalid","remote":{"mode":"off"}}),
+        json!({"local_port":0,"remote":{"mode":"off"}}),
+        json!({"remote":{"mode":"off"}}),
+    ] {
+        profile.write_initial_settings(settings);
+        let failed = profile.command(&["--launch", "--no-browser"]).await;
+        assert_eq!(failed.status.code(), Some(1));
+        assert!(HostClient::connect(&profile.catalog()).await.is_err());
+        assert!(
+            !profile
+                .directory
+                .path()
+                .join("web-management.json")
+                .exists()
+        );
+    }
+
+    let reserved = bind_fixture_listener("127.0.0.1:0").unwrap();
+    let port = reserved.local_addr().unwrap().port().to_string();
+    drop(reserved);
+    let output = profile
+        .command(&["--launch", "--no-browser", "--web-port", &port])
+        .await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reply: LaunchReply = serde_json::from_slice(&output.stdout).unwrap();
+    let client = profile.connect().await;
+    let web = assert_web(&client, &reply).await;
+    assert_eq!(web.port().to_string(), port);
     profile.stop(&client, &[web]).await;
 }
 

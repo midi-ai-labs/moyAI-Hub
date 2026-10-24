@@ -416,7 +416,7 @@ pub async fn run_server(catalog_path: PathBuf, settings: Option<Value>) -> Resul
                 .join("web-management.json"),
         ) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Some(json!({"local_port":9080,"remote":{"mode":"off"}}))
+                Some(crate::web_admin::server::initial_settings()?)
             }
             _ => None,
         },
