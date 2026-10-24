@@ -1,6 +1,6 @@
 # moyAI Hubの実装索引
 
-HubはRustサーバー、ブラウザー管理画面、モデル中継用Gatewayで構成します。Desktop 3.0.0と組み合わせる開発版です。型・保存形式・制限値・状態遷移の正本はsourceと近傍testsです。利用手順は[README](../README.md)、検証の入口は[ブラウザー試験](../tests/browser/README.md)へ集約します。
+HubはRustサーバー、ブラウザー管理画面、モデル中継用Gatewayで構成します。moyAI Desktopと組み合わせて使います。型・保存形式・制限値・状態遷移の正本はsourceと近傍testsです。利用手順は[README](../README.md)、検証の入口は[ブラウザー試験](../tests/browser/README.md)へ集約します。
 
 ## 責任範囲
 

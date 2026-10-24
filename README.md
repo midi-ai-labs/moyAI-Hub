@@ -1,6 +1,6 @@
 # moyAI Hub
 
-moyAI DesktopのAI接続、PCの参加、共有プロジェクトを管理するRustサーバーです。管理画面は通常のWebブラウザーで開きます。Hub 0.1.0とDesktop 3.0.0を組み合わせる開発版で、正式リリースではありません。Hub自体にTauriやWebView2は不要です。
+moyAI DesktopのAI接続、PCの参加、共有プロジェクトを管理するRustサーバーです。管理画面は通常のWebブラウザーで開きます。Hub 1.0.0のWindows x64単体版は、起動・終了用ファイルと固定ポートの初期設定ファイルを同梱します。Hub自体にTauriやWebView2は不要です。[1.0.0の変更点](docs/release/v1.0.0.md)を参照してください。
 
 ## チームで使い始める
 
@@ -23,7 +23,11 @@ PCごとにIDと鍵を持ち、同じWindowsユーザー名でも別PCを自動�
 | 状態を見る | `moyai-hub.exe --status` |
 | HubとGatewayを終了する | `Stop-Hub.cmd` / `moyai-hub.exe --stop` |
 
-初回のローカル管理URLは `http://127.0.0.1:9080/admin/` です。URLだけを開いても管理権限は得られないため、上の方法で開きます。ブラウザーを閉じてもHubと仕事は続きます。「接続の受付を停止」は端末通信を止めますが、Web管理画面は残ります。
+初回のローカル管理URLは `http://127.0.0.1:9080/admin/` です。初回は実行ファイルと同じフォルダーに同梱した `web-management.json` を使います。別の固定ポートを使う場合は、初回起動前にこのファイルの `settings.local_port` を変更してください。指定ポートが使用中なら起動エラーになり、別のポートへ自動では切り替わりません。
+
+起動に成功した設定は保存先の `web-management.json` に保存され、次回からはこちらを使います。同梱ファイルの変更は、保存済みの設定へ反映されません。設定を変更する場合はHubを停止し、`--web-port PORT` または `--web-settings FILE` を指定して起動します。形式と手順は[Web管理](docs/web-management.md)を参照してください。
+
+`Start-Hub.cmd` が管理画面を開き、現在のURLは `--status` でも確認できます。URLだけを開いても管理権限は得られないため、上の方法で開きます。ブラウザーを閉じてもHubと仕事は続きます。「接続の受付を停止」は端末通信を止めますが、Web管理画面は残ります。
 
 `--launch` は成功した接続設定を再開し、起動済みなら同じHubを使います。ネットワークの再開に失敗した場合はWeb画面から修正できます。直接 `moyai-hub.exe` を実行するコンソール起動では、端末通信を画面から開始します。
 
@@ -80,5 +84,26 @@ cargo build --bin moyai-hub
 ```
 
 Web画面はRustビルドへ同梱するため、UI変更後は `npm run build` に続けてRustをビルドします。通常の実ブラウザー確認は `npm run verify:gui`、広い回帰は `npm run verify:gui -- --suite regression` です。[ブラウザー試験](tests/browser/README.md)で自動操作と目視・物理受入を区別します。
+
+### Windows単体版を作る
+
+`scripts/package-release.py` はPython 3.11以降の標準ライブラリーだけで配布ZIPを作ります。変更をマージした後、変更の残っていないcommitでWeb画面とrelease実行ファイルをビルドしてください。ビルドログと出力先はrepositoryの外に置きます。
+
+```powershell
+$releaseWork = [IO.Path]::GetFullPath('..\project_sandbox\hub-release')
+New-Item -ItemType Directory -Force -Path $releaseWork | Out-Null
+$hubCommit = (git rev-parse HEAD).Trim()
+npm run build
+cargo build --offline --locked --release --bin moyai-hub --message-format=json |
+  Out-File -LiteralPath "$releaseWork\hub-build.jsonl" -Encoding utf8
+python .\scripts\package-release.py `
+  --build-log "$releaseWork\hub-build.jsonl" `
+  --notices C:\release-inputs\THIRD_PARTY_NOTICES.txt `
+  --expected-commit $hubCommit `
+  --desktop-source-commit $desktopCommit `
+  --output "$releaseWork\distribution"
+```
+
+`$desktopCommit` にはDesktop文書の参照に使う40文字のcommitを指定します。互換性確認の記録ではありません。第三者通知は今回のビルドが使う依存・version・featuresと一致する内容を事前に確認して用意します。スクリプトはバージョン5箇所の一致、cleanなcommit、Cargoログ内のrelease実行ファイルを確認し、初期JSON、起動・終了用ファイル、文書、LICENSE、第三者通知を同梱します。identity、manifest、SHA256一覧も生成します。既存の出力は上書きしません。公開前に、生成したZIPを展開して `Start-Hub.cmd` の実画面での起動と停止を確認してください。
 
 2026-09-23の隔離Live試験では、同一Windows上の仮想WinAから唯一の実行PC WinBへの依頼・実行・成果取得を確認しました。複数の実行PCからのAI選択、物理別Windows、実Firewall、長時間運転、最終配布物は別の確認が必要です。実装済みAPIや自動試験の成功を正式リリースの合格とは扱いません。

@@ -7,7 +7,7 @@ Usage: moyai-hub [--data-dir PATH] [--web-port PORT | --web-settings FILE]\n\
        moyai-hub --launch [--data-dir PATH] [--no-browser]\n\
        moyai-hub --status [--data-dir PATH]\n\
        moyai-hub --stop [--data-dir PATH]\n\n\
-Starts Web management automatically. First start: http://127.0.0.1:9080/admin/\n\
+First start reads web-management.json beside the executable (default local port: 9080).\n\
 Use --launch to open authenticated management on this PC, or open it from an approved administrator device. No Hub ID/password is required.\n\
 --web-port PORT       Local HTTP port (0 selects a free port); saves on success.\n\
 --web-settings FILE   JSON Web settings; see docs/web-management.md for LAN/TLS.\n\

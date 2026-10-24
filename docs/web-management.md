@@ -10,7 +10,27 @@ Hub PCの起動操作、または管理を許可されたPCのDesktopから開�
 .\moyai-hub.exe --launch
 ```
 
-初回の管理URLは `http://127.0.0.1:9080/admin/` です。起動ticketは60秒・一度限りで、URLのfragmentから管理cookieへ交換した後、アドレスから除きます。期限切れ・使用済み・通信結果不明の場合は同じ起動入口で開き直してください。「この画面の利用を終了」はブラウザーの資格だけを失効し、Hubや仕事を止めません。
+初回の管理URLは `http://127.0.0.1:9080/admin/` です。保存済みのWeb設定がない場合は、実行ファイルと同じフォルダーに同梱した `web-management.json` を読み込みます。別の固定ポートを使う場合は、初回起動前にこのファイルの `settings.local_port` を変更してください。初期ファイルでは1以上のポート番号を指定し、0や省略はエラーにします。
+
+```json
+{
+  "schema": 1,
+  "settings": {
+    "local_port": 9080,
+    "remote": { "mode": "off" }
+  }
+}
+```
+
+起動に成功した設定は、保存先の `web-management.json` に保存されます。次回からは保存済みの設定を使い、同梱ファイルの変更は反映されません。実行ファイルだけを使い、隣に初期設定ファイルがない場合も、初回はポート9080・他端末向け公開OFFで起動します。指定ポートが使用中なら起動エラーになり、別のポートへ自動では切り替わりません。
+
+設定を変更する場合はHubを停止し、`--web-port PORT` または `--web-settings FILE` を指定して起動します。これらの明示指定は、保存済みの設定と同梱の初期設定より優先されます。例えば、ローカル管理ポートを9081に変更するコマンドは次のとおりです。成功した設定は保存され、次回も使います。現在のURLは `--status` で確認できます。
+
+```powershell
+.\moyai-hub.exe --launch --web-port 9081
+```
+
+起動ticketは60秒・一度限りで、URLのfragmentから管理cookieへ交換した後、アドレスから除きます。期限切れ・使用済み・通信結果不明の場合は同じ起動入口で開き直してください。「この画面の利用を終了」はブラウザーの資格だけを失効し、Hubや仕事を止めません。
 
 管理画面ではモデル、PC参加、プロジェクトの操作・実行PC、端末通信と保守を扱います。旧グループ・方向付き許可は通常画面の新規設定では使いません。「MCP履歴」は旧方式で各Desktopに保存された記録の閲覧です。
 
@@ -42,7 +62,7 @@ Hub PCの起動操作、または管理を許可されたPCのDesktopから開�
 
 ## 他のPCから使う
 
-他端末向けWeb公開は初回OFFです。公開する場合はJSONファイルを用意し、起動時に`--web-settings`で指定します。`--web-port`と同時には指定できません。どの方式でも、このPC専用のloopback HTTPを併設します。
+他端末向けWeb公開は初回OFFです。公開する場合はJSONファイルを用意し、起動時に`--web-settings`で指定します。このCLI用JSONは、下の例のように `local_port` と `remote` を直接記述します。同梱・保存用の `web-management.json` にある `schema` と `settings` のラッパーは付けません。`--web-port`と同時には指定できません。どの方式でも、このPC専用のloopback HTTPを併設します。
 
 ```powershell
 .\moyai-hub.exe --data-dir C:\moyai-hub-data --web-settings C:\moyai-hub-data\web-settings.json
@@ -119,7 +139,7 @@ Hubは`Forwarded`や`X-Forwarded-*`から公開先や権限を推測しません
 - ブラウザーは設定ファイルを直接変更せず、認証付きの管理commandを送ります。保存時はrevisionを照合し、周期更新で編集中の入力を置き換えません。
 - Web資格はHttpOnly・SameSite=Strict cookieを使い、HTTPSではSecureを付けます。管理要求はsession識別子、CSRF、Host・Originを確認し、別タブで資格が変わった旧画面の操作を拒否します。
 - CLIのprivate `/host/*`、端末のmTLS、ブラウザー管理は別入口です。Web管理者の資格に端末接続ファイルやHub CAを流用しません。
-- Web設定は `web-management.json` へ開始成功後に保存します。CLIのJSONには `local_port` と `remote` を指定し、保存用ラッパーは付けません。破損・未知schema・待受や証明書の不備では元設定を上書きしません。
+- Web設定は保存先の `web-management.json` へ開始成功後に保存します。同梱・保存用ファイルは `schema: 1` と `settings` を持つ形式です。破損・未知schema・待受や証明書の不備では元設定を上書きしません。
 - `--web-port` はこのPC専用の設定として保存し、他端末向け公開をOFFにします。ポート0は空きポートを選びます。公開設定は停止後、正しい引数で起動し直してください。
 - 配布する `hub-config.moyai-join` は公開URLとCAです。旧MCP履歴のダウンロードは明示取得した一時snapshotで、現行共有会話のHub保存とは別です。
 
