@@ -389,6 +389,9 @@ impl Drop for DescriptorOwner {
 }
 /// Start the foreground server and its browser UI using the same lifetime owner.
 pub async fn run_server(catalog_path: PathBuf, settings: Option<Value>) -> Result<(), String> {
+    let _profile_lease = crate::maintenance::ProfileLease::shared(
+        catalog_path.parent().ok_or("Hubの保存先が無効です。")?,
+    )?;
     let catalog_path = canonical_catalog(&catalog_path, true)?;
     let admin = Admin::open(catalog_path.clone())?;
     let listener = tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))

@@ -2,3 +2,5 @@
 /node_modules/
 /ui/dist/
 *.log
+__pycache__/
+*.py[cod]

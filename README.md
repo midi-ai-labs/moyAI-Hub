@@ -1,8 +1,8 @@
 # moyAI Hub
 
-[Hub 1.0.0をダウンロード](https://github.com/midi-ai-labs/moyAI-Hub/releases/tag/v1.0.0) · [moyAI Desktop](https://github.com/midi-ai-labs/moyAI) · [チームの準備](docs/team-preparation.md)
+[Hubのリリース](https://github.com/midi-ai-labs/moyAI-Hub/releases) · [moyAI Desktop](https://github.com/midi-ai-labs/moyAI) · [チームの準備](docs/team-preparation.md)
 
-moyAI DesktopのAI接続、PCの参加、共有プロジェクトを管理するRustサーバーです。管理画面は通常のWebブラウザーで開きます。Hub 1.0.0のWindows x64単体版は、起動・終了用ファイルと固定ポートの初期設定ファイルを同梱します。Hub自体にTauriやWebView2は不要です。[1.0.0の変更点](docs/release/v1.0.0.md)を参照してください。
+moyAI DesktopのAI接続、PCの参加、共有プロジェクトを管理するRustサーバーです。管理画面は通常のWebブラウザーで開きます。Hub 1.0.1のWindows x64単体版は、Program FilesへのSetupと、Hub専用の保存データ初期化を同梱します。Hub自体にTauriやWebView2は不要です。[1.0.1の変更点](docs/release/v1.0.1.md)・[Windowsへの導入と削除](docs/windows-setup.md)を参照してください。
 
 管理サーバーにはHubを、依頼を送る操作PCや仕事を実行するPCには[moyAI Desktop](https://github.com/midi-ai-labs/moyAI)を用意します。Desktopの導入は[Windowsへの導入と更新](https://github.com/midi-ai-labs/moyAI/blob/main/docs/user/windows-setup.md)を参照してください。DesktopとHubの配布物は、それぞれの[Desktopリリース](https://github.com/midi-ai-labs/moyAI/releases)・[Hubリリース](https://github.com/midi-ai-labs/moyAI-Hub/releases)から取得できます。
 
@@ -10,7 +10,7 @@ moyAI DesktopのAI接続、PCの参加、共有プロジェクトを管理する
 
 ## チームで使い始める
 
-1. インストール済みならスタートメニューの **moyAI Team Management**、Hub単体なら `Start-Hub.cmd` または `moyai-hub.exe --launch` で開きます。起動したWindowsユーザーに管理を許可します。IDやパスワードの入力は不要です。
+1. ZIP全体を展開し、`Setup-Hub.cmd`を通常の権限で実行します。配置時だけ管理者承認し、通常の権限で管理画面を開きます。次回からはスタートメニューの **moyAI Team Management** で開きます。起動したWindowsユーザーに管理を許可します。IDやパスワードの入力は不要です。
 2. Hub PCの管理画面でAIの接続先とモデルを登録し、「最初に使う共有モデル」を選びます。AIサーバーの起動・モデルロードはホスト側で行います。
 3. **PCの接続** でLAN側のIP・ポートを設定して接続受付を開始し、Windowsの受信許可を確認します。必要時は確認した範囲をUACで設定するか、管理者向けスクリプトを保存します。
 4. **接続ファイルの配布** から `hub-config.moyai-join` を保存して各PCへ渡し、届いた参加申請を許可します。同じファイルを複数PCへ配れます。
@@ -29,7 +29,7 @@ PCごとにIDと鍵を持ち、同じWindowsユーザー名でも別PCを自動�
 | 状態を見る | `moyai-hub.exe --status` |
 | HubとGatewayを終了する | `Stop-Hub.cmd` / `moyai-hub.exe --stop` |
 
-初回のローカル管理URLは `http://127.0.0.1:9080/admin/` です。初回は実行ファイルと同じフォルダーに同梱した `web-management.json` を使います。別の固定ポートを使う場合は、初回起動前にこのファイルの `settings.local_port` を変更してください。指定ポートが使用中なら起動エラーになり、別のポートへ自動では切り替わりません。
+初回のローカル管理URLは `http://127.0.0.1:9080/admin/` です。初回は実行ファイルと同じフォルダーの `web-management.json` を使います。別の固定ポートは `Setup-Hub.cmd -WebPort 9081` のように指定できます。Program Files内のテンプレートを編集する必要はありません。指定ポートが使用中なら起動エラーになり、別のポートへ自動では切り替わりません。更新時にポートを指定しなければ保存済み設定を使います。
 
 起動に成功した設定は保存先の `web-management.json` に保存され、次回からはこちらを使います。同梱ファイルの変更は、保存済みの設定へ反映されません。設定を変更する場合はHubを停止し、`--web-port PORT` または `--web-settings FILE` を指定して起動します。形式と手順は[Web管理](docs/web-management.md)を参照してください。
 
@@ -37,7 +37,7 @@ PCごとにIDと鍵を持ち、同じWindowsユーザー名でも別PCを自動�
 
 `--launch` は成功した接続設定を再開し、起動済みなら同じHubを使います。ネットワークの再開に失敗した場合はWeb画面から修正できます。直接 `moyai-hub.exe` を実行するコンソール起動では、端末通信を画面から開始します。
 
-保存先は `--data-dir`、`MOYAI_HUB_DATA_DIR`、Windows既定の `%APPDATA%\ai.midi.moyai.hub` の順で決まります。指定した保存先は状態確認・終了にも同じものを使います。ログオン時の自動起動はローカル管理画面から設定できます。OSサービスやサインアウト後の稼働ではありません。
+実行ファイルは `%ProgramFiles%\moyAI\Hub`、利用者ごとの保存先は `--data-dir`、`MOYAI_HUB_DATA_DIR`、Windows既定の `%LOCALAPPDATA%\midi-ai-labs\moyai-data\hub` の順で決まります。旧既定の `%APPDATA%\ai.midi.moyai.hub` は、停止を確認して初回起動時に移動します。新旧両方にデータがある場合は自動統合しません。指定した保存先は状態確認・終了にも同じものを使います。ログオン時の自動起動はローカル管理画面から設定できます。OSサービスやサインアウト後の稼働ではありません。
 
 別PCからの管理には、管理を許可されたDesktopとHTTPS管理URLが必要です。[Web管理](docs/web-management.md)を参照してください。Desktopへ渡す端末接続URLと管理画面のURLは別です。
 

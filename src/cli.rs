@@ -151,36 +151,11 @@ pub fn parse(args: Vec<OsString>) -> Result<Action, String> {
 }
 
 fn catalog(data: Option<PathBuf>) -> Result<PathBuf, String> {
-    let directory = data
-        .or_else(|| std::env::var_os("MOYAI_HUB_DATA_DIR").map(PathBuf::from))
-        .map(Ok)
-        .unwrap_or_else(default_data)?;
-    if directory.as_os_str().is_empty() {
-        return Err("Hub data directory must not be empty".into());
-    }
-    let directory = if directory.is_absolute() {
-        directory
-    } else {
-        std::env::current_dir()
-            .map_err(|e| e.to_string())?
-            .join(directory)
-    };
-    Ok(directory.join("catalog.json"))
+    Ok(moyai_hub::data_paths::resolve(data, false)?.join("catalog.json"))
 }
 
-fn default_data() -> Result<PathBuf, String> {
-    // Keep the installed Hub profile location stable across upgrades.
-    let base = if cfg!(windows) {
-        std::env::var_os("APPDATA").map(PathBuf::from)
-    } else if cfg!(target_os = "macos") {
-        std::env::var_os("HOME").map(|v| PathBuf::from(v).join("Library/Application Support"))
-    } else {
-        std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|v| PathBuf::from(v).join(".local/share")))
-    };
-    base.map(|v| v.join("ai.midi.moyai.hub"))
-        .ok_or_else(|| "Specify --data-dir or MOYAI_HUB_DATA_DIR".into())
+fn starting_catalog(data: Option<PathBuf>) -> Result<PathBuf, String> {
+    Ok(moyai_hub::data_paths::resolve(data, true)?.join("catalog.json"))
 }
 
 fn web_settings(port: Option<u16>, settings: Option<PathBuf>) -> Result<Option<Value>, String> {
@@ -249,7 +224,7 @@ pub async fn run(action: Action) -> Result<(), String> {
             data,
             port,
             settings,
-        } => host_process::run_server(catalog(data)?, web_settings(port, settings)?).await,
+        } => host_process::run_server(starting_catalog(data)?, web_settings(port, settings)?).await,
         Action::Launch {
             data,
             port,
@@ -266,7 +241,7 @@ pub async fn run(action: Action) -> Result<(), String> {
             if let Some(settings) = settings {
                 web_args.extend(["--web-settings".into(), settings.into_os_string()]);
             }
-            let catalog_path = catalog(data)?;
+            let catalog_path = starting_catalog(data)?;
             let report = host_process::launch::launch_server(
                 &std::env::current_exe().map_err(|e| e.to_string())?,
                 &catalog_path,

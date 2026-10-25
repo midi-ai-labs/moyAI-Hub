@@ -57,6 +57,151 @@ struct Saved {
     settings: WebSettings,
 }
 
+/// Only the two typed HTTPS file references move with an owned Hub profile.
+pub(crate) struct SavedPathRelocation {
+    original: Vec<u8>,
+    relocated: Vec<u8>,
+}
+
+impl SavedPathRelocation {
+    pub(crate) fn apply(&self, directory: &Path) -> Result<(), String> {
+        self.replace_expected(directory, &self.original, &self.relocated)
+    }
+    pub(crate) fn restore(&self, directory: &Path) -> Result<(), String> {
+        let path = directory.join("web-management.json");
+        if read_saved_bytes(&path)? == self.original {
+            return Ok(());
+        }
+        self.replace_expected(directory, &self.relocated, &self.original)
+    }
+    fn replace_expected(
+        &self,
+        directory: &Path,
+        expected: &[u8],
+        replacement: &[u8],
+    ) -> Result<(), String> {
+        let path = directory.join("web-management.json");
+        if read_saved_bytes(&path)? != expected {
+            return Err("移行中にWeb管理設定が変更されました。別の内容を上書きせず、移行中の記録と保存先を保持しました。".into());
+        }
+        let mut temporary =
+            tempfile::NamedTempFile::new_in(directory).map_err(|e| e.to_string())?;
+        temporary
+            .write_all(replacement)
+            .and_then(|_| temporary.as_file().sync_all())
+            .map_err(|e| e.to_string())?;
+        temporary
+            .persist(path)
+            .map_err(|e| format!("Web管理の証明書パスを保存できません: {e}"))?;
+        Ok(())
+    }
+}
+
+fn read_saved_bytes(path: &Path) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .map_err(|e| e.to_string())?
+        .take(32 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > 32 * 1024 {
+        return Err("Web管理設定がサイズ上限を超えています。".into());
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn prepare_profile_relocation(
+    source: &Path,
+    destination: &Path,
+) -> Result<Option<SavedPathRelocation>, String> {
+    let path = source.join("web-management.json");
+    if !path.try_exists().map_err(|e| e.to_string())? {
+        return Ok(None);
+    }
+    let original = read_saved_bytes(&path)?;
+    let mut saved: Saved = serde_json::from_slice(&original)
+        .map_err(|_| "Web管理設定の形式を確認できないため、保存先を移動しません。")?;
+    if saved.schema != 1 {
+        return Err("Web管理設定のバージョンに対応していないため、保存先を移動しません。".into());
+    }
+    saved.settings.clone().validated()?;
+    let mut changed = false;
+    if let Remote::Https {
+        certificate_path,
+        private_key_path,
+        ..
+    } = &mut saved.settings.remote
+    {
+        for path in [certificate_path, private_key_path] {
+            if let Some(rebased) = owned_path_relocation(path, source, destination) {
+                *path = rebased;
+                changed = true;
+            }
+        }
+    }
+    if !changed {
+        return Ok(None);
+    }
+    let mut relocated = serde_json::to_vec_pretty(&saved).map_err(|e| e.to_string())?;
+    relocated.push(b'\n');
+    Ok(Some(SavedPathRelocation {
+        original,
+        relocated,
+    }))
+}
+
+fn owned_path_relocation(path: &Path, source: &Path, destination: &Path) -> Option<PathBuf> {
+    fn lexical(path: &Path) -> PathBuf {
+        #[cfg(windows)]
+        let path = PathBuf::from(
+            path.to_string_lossy()
+                .replace('/', "\\")
+                .trim_start_matches("\\\\?\\"),
+        );
+        #[cfg(not(windows))]
+        let path = path.to_path_buf();
+        let mut result = PathBuf::new();
+        for component in path.components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    result.pop();
+                }
+                _ => result.push(component.as_os_str()),
+            }
+        }
+        result
+    }
+    if !path.is_absolute() {
+        return None;
+    }
+    let path = lexical(path);
+    let source = lexical(source);
+    let path_components = path.components().collect::<Vec<_>>();
+    let source_components = source.components().collect::<Vec<_>>();
+    if path_components.len() <= source_components.len() {
+        return None;
+    }
+    for (left, right) in path_components.iter().zip(&source_components) {
+        #[cfg(windows)]
+        if left.as_os_str().to_string_lossy().to_lowercase()
+            != right.as_os_str().to_string_lossy().to_lowercase()
+        {
+            return None;
+        }
+        #[cfg(not(windows))]
+        if left != right {
+            return None;
+        }
+    }
+    let mut result = destination.to_path_buf();
+    for component in &path_components[source_components.len()..] {
+        result.push(component.as_os_str());
+    }
+    Some(result)
+}
+
 fn canonical_origin(value: &str, scheme: &str) -> Result<String, String> {
     let url = reqwest::Url::parse(value).map_err(|_| "公開先のURLを確認してください。")?;
     if value.len() > 2048

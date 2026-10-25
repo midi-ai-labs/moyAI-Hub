@@ -32,8 +32,10 @@ class PackageReleaseTests(unittest.TestCase):
             (self.repo / directory).mkdir(parents=True)
         seed = {"schema": 1, "settings": {"local_port": 9080, "remote": {"mode": "off"}}}
         (self.repo / "web-management.json").write_bytes(package.json_bytes(seed))
-        for name in ("Start-Hub.cmd", "Stop-Hub.cmd"):
+        for name in ("Start-Hub.cmd", "Stop-Hub.cmd", "Setup-Hub.cmd", "Uninstall-Hub.cmd"):
             (self.repo / "scripts" / name).write_bytes(b"@echo off\r\n")
+        for name in ("Setup-Hub.ps1", "component-install.ps1", "Setup-Component.ps1", "sandbox-service.ps1"):
+            (self.repo / "scripts" / name).write_text("# product installer fixture\n", encoding="utf-8")
         (self.repo / "LICENSE").write_text("product license", encoding="utf-8")
         (self.repo / "README.md").write_text(
             "[Guide](docs/guide.md)\n![Management](logo/moyai-hub-screenshot.jpg)", encoding="utf-8",
@@ -50,6 +52,7 @@ class PackageReleaseTests(unittest.TestCase):
         pe[64:68] = b"PE\0\0"
         struct.pack_into("<H", pe, 68, 0x8664)
         self.exe.write_bytes(pe)
+        self.exe.with_name("moyai-cleanup-hub.exe").write_bytes(pe)
         self.notices = self.root / "notices.txt"
         self.notices.write_text("existing dependency notices", encoding="utf-8")
 
@@ -60,6 +63,9 @@ class PackageReleaseTests(unittest.TestCase):
         files, rewrites = self.files()
         self.assertIn("web-management.json", files)
         self.assertIn("Start-Hub.cmd", files)
+        self.assertIn("Setup-Hub.cmd", files)
+        self.assertIn("Uninstall-Hub.cmd", files)
+        self.assertEqual(files["moyai-cleanup-hub.exe"], self.exe.with_name("moyai-cleanup-hub.exe").read_bytes())
         self.assertEqual(files["logo/moyai-hub-screenshot.jpg"], b"screenshot fixture")
         self.assertIn(b"](logo/moyai-hub-screenshot.jpg)", files["README.md"])
         self.assertEqual(files["THIRD_PARTY_NOTICES.txt"], self.notices.read_bytes())
@@ -70,6 +76,12 @@ class PackageReleaseTests(unittest.TestCase):
         result = package.write_package(self.root / "out", "1.0.0", files, identity, rewrites)
         folder = Path(result["directory"])
         manifest = json.loads((folder / "manifest.json").read_bytes())
+        deployment = json.loads((folder / "deployment.json").read_bytes())
+        self.assertEqual(deployment["components"], {"Hub": {"version": "1.0.0"}})
+        self.assertEqual(deployment["product"], "moyai-hub-windows")
+        for item in deployment["files"]:
+            self.assertEqual(item["component"], "Hub")
+            self.assertEqual(package.digest((folder / item["path"]).read_bytes()), item["sha256"])
         self.assertFalse(manifest["prerelease"])
         for item in manifest["files"]:
             body = (folder / item["path"]).read_bytes()
@@ -91,6 +103,37 @@ class PackageReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "fixed port 9080"):
             self.files()
         seed.unlink()
+        with self.assertRaises(FileNotFoundError):
+            self.files()
+
+    def test_desktop_links_use_pinned_commit_without_a_sibling_checkout(self):
+        desktop = self.root / "moyAI"
+        self.assertFalse(desktop.exists())
+        (self.repo / "docs/guide.md").write_text(
+            "[Desktop guide](../../moyAI/docs/user/windows-setup.md#uninstall)\n"
+            "[Desktop directory](../../moyAI/docs/design/)\n"
+            "[Desktop license](../../moyAI/LICENSE)\n"
+            "[Desktop root](../../moyAI/)\n",
+            encoding="utf-8",
+        )
+        files, rewrites = self.files()
+        guide = files["docs/guide.md"].decode("utf-8")
+        self.assertIn(f"{package.DESKTOP_URL}/blob/{DESKTOP_COMMIT}/docs/user/windows-setup.md#uninstall)", guide)
+        self.assertIn(f"{package.DESKTOP_URL}/tree/{DESKTOP_COMMIT}/docs/design)", guide)
+        self.assertIn(f"{package.DESKTOP_URL}/blob/{DESKTOP_COMMIT}/LICENSE)", guide)
+        self.assertIn(f"{package.DESKTOP_URL}/tree/{DESKTOP_COMMIT})", guide)
+        self.assertEqual(sum(item["file"] == "docs/guide.md" for item in rewrites), 4)
+        self.assertFalse(desktop.exists())
+        (self.repo / "docs/guide.md").write_text("[Missing Hub source](../src/missing.rs)", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "Missing documentation target"):
+            self.files()
+
+    def test_cleanup_and_component_installer_are_required_package_inputs(self):
+        self.exe.with_name("moyai-cleanup-hub.exe").unlink()
+        with self.assertRaises(FileNotFoundError):
+            self.files()
+        self.exe.with_name("moyai-cleanup-hub.exe").write_bytes(self.exe.read_bytes())
+        (self.repo / "scripts/component-install.ps1").unlink()
         with self.assertRaises(FileNotFoundError):
             self.files()
 

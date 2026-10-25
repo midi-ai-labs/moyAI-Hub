@@ -1,15 +1,17 @@
 @echo off
 setlocal
 chcp 65001 >nul
-if not exist "%~dp0moyai-hub.exe" (
-  echo moyai-hub.exe was not found beside this launcher.
+set "hubExecutable=%~dp0moyai-hub.exe"
+if not exist "%hubExecutable%" set "hubExecutable=%~dp0bin\moyai-hub.exe"
+if not exist "%hubExecutable%" (
+  echo Hubの実行ファイルがありません。ZIP全体を展開してください。
   pause
   exit /b 1
 )
-"%~dp0moyai-hub.exe" --stop %*
+"%hubExecutable%" --stop %*
 if errorlevel 1 (
   echo.
-  echo Hub could not confirm shutdown. See the message above.
+  echo Hubの終了を確認できませんでした。上の表示を確認してください。
   pause
   exit /b 1
 )

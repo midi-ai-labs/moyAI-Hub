@@ -1,16 +1,17 @@
 @echo off
 setlocal
 chcp 65001 >nul
-if not exist "%~dp0moyai-hub.exe" (
-  echo moyai-hub.exe was not found beside this launcher.
-  echo Keep Start-Hub.cmd and moyai-hub.exe in the same folder.
+set "hubExecutable=%~dp0moyai-hub.exe"
+if not exist "%hubExecutable%" set "hubExecutable=%~dp0bin\moyai-hub.exe"
+if not exist "%hubExecutable%" (
+  echo Hubの実行ファイルがありません。ZIP全体を展開し、Setup-Hub.cmdを実行してください。
   pause
   exit /b 1
 )
-"%~dp0moyai-hub.exe" --launch %*
+"%hubExecutable%" --launch %*
 if errorlevel 1 (
   echo.
-  echo Hub could not finish starting. See the message above.
+  echo Hubを起動できませんでした。上の表示と起動ログを確認してください。
   pause
   exit /b 1
 )

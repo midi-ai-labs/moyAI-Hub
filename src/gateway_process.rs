@@ -348,6 +348,8 @@ pub async fn run_companion() -> Result<(), io::Error> {
     }
     let init: Init = serde_json::from_str(&input)
         .map_err(|_| io::Error::other("invalid gateway initialization"))?;
+    let _profile_lease =
+        crate::maintenance::ProfileLease::shared(&init.data_directory).map_err(io::Error::other)?;
     let _lock: File = OpenOptions::new()
         .create(true)
         .truncate(false)

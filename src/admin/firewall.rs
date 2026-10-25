@@ -326,6 +326,36 @@ struct Inventory {
     other: Vec<Observed>,
 }
 
+fn profile_has_rule(directory: &Path, rows: &[Observed]) -> bool {
+    rows.iter()
+        .any(|row| row.spec.name == rule_name(&row.spec.program, &directory.to_string_lossy()))
+}
+
+/// Data relocation/reset must not orphan a rule whose identity includes the old profile path.
+pub fn require_profile_firewall_removed(directory: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let directory =
+            std::fs::canonicalize(directory).map_err(|_| "Hubの保存先を確認できません。")?;
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
+            runtime.block_on(async {
+                let script = format!("{HELPER}\n[Console]::OutputEncoding=[Text.UTF8Encoding]::new(); $names=@(Get-NetFirewallRule -PolicyStore PersistentStore | Where-Object {{ $_.Group -ceq 'moyAI Hub managed inbound v1' }} | Select-Object -First 65 -ExpandProperty Name); if ($names.Count -gt 64) {{ throw 'Too many managed rules' }}; $rows=@($names | ForEach-Object {{ Get-MoyaiRule $_ }}); ConvertTo-Json -InputObject $rows -Depth 8 -Compress");
+                let result = run_script(&script, 15).await?;
+                if !result.status.success() || result.stdout.len() > 256 * 1024 { return Err("Hubの受信許可を確認できません。保存先の移動・初期化は行っていません。PC管理者へ確認してください。".into()); }
+                let rows: Vec<Observed> = serde_json::from_slice(&result.stdout).map_err(|_| "Hubの受信許可を照合できません。保存データは保持しています。")?;
+                if profile_has_rule(&directory, &rows) { return Err("このHub保存先のWindows受信許可が残っています。元のHubを起動し、管理画面で「表示中の既存ルールを解除」を実行してからHubを停止し、もう一度操作してください。保存先の移動・初期化は行っていません。".into()); }
+                Ok(())
+            })
+        }).join().map_err(|_| "Hub受信許可の確認処理を完了できません。")?
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = directory;
+        Ok(())
+    }
+}
+
 fn status_value(
     program: &str,
     local_address: Ipv4Addr,

@@ -4,7 +4,7 @@ HubはAI接続、PCの参加、プロジェクトを管理します。仕事は�
 
 ## 1. HubとAIを準備する
 
-インストール済みなら **moyAI Team Management**、Hub単体なら `Start-Hub.cmd` または `moyai-hub.exe --launch` で管理画面を開きます。管理者ID・パスワードを作る必要はありません。管理画面のURLをDesktopの接続先へ入力しないでください。
+初回は[Setup-Hub.cmdで導入](windows-setup.md)し、次回からは **moyAI Team Management** で管理画面を開きます。配置先の`Start-Hub.cmd`または`moyai-hub.exe --launch`でも開けます。管理者ID・パスワードを作る必要はありません。管理画面のURLをDesktopの接続先へ入力しないでください。
 
 「チームの初期設定」の案内からAIの接続方式・URLを入力します。接続先がAPIキーを要求する場合は **APIキー（必要な場合）** に入力して「モデルを取得」を押します。モデルを登録し、ツール利用を確認したものを「最初に使う共有モデル」に指定します。Hubが接続先とキーを管理するため、各PCでAIのURLやキーを入力する必要はありません。メインとサイドでは別の登録済みモデルも選べます。
 

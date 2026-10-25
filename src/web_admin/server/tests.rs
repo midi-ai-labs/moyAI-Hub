@@ -1,5 +1,43 @@
 use super::*;
 
+#[test]
+fn owned_https_file_relocation_respects_components_and_external_paths() {
+    let (source, destination) = if cfg!(windows) {
+        (
+            PathBuf::from("C:/Users/test/old-hub"),
+            PathBuf::from("C:/Users/test/new-hub"),
+        )
+    } else {
+        (PathBuf::from("/tmp/old-hub"), PathBuf::from("/tmp/new-hub"))
+    };
+    assert_eq!(
+        owned_path_relocation(&source.join("tls/cert.pem"), &source, &destination),
+        Some(destination.join("tls/cert.pem"))
+    );
+    assert!(
+        owned_path_relocation(
+            &source.with_file_name("old-hub-other").join("key.pem"),
+            &source,
+            &destination
+        )
+        .is_none()
+    );
+    assert!(
+        owned_path_relocation(&source.join("../workspace/key.pem"), &source, &destination)
+            .is_none()
+    );
+    assert!(owned_path_relocation(Path::new("relative/key.pem"), &source, &destination).is_none());
+    #[cfg(windows)]
+    assert_eq!(
+        owned_path_relocation(
+            Path::new(r"\\?\C:\USERS\TEST\OLD-HUB\tls\key.pem"),
+            &source,
+            &destination
+        ),
+        Some(destination.join("tls/key.pem"))
+    );
+}
+
 fn client() -> reqwest::Client {
     reqwest::Client::builder()
         .no_proxy()

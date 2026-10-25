@@ -183,6 +183,103 @@ pub(super) fn set(admin: &Admin, enabled: bool, expected_command: String) -> Res
     self::snapshot(admin)
 }
 
+/// Remove only this user's exact profile registration. Foreign/edited commands are retained.
+pub struct RetiredProfileAutostart {
+    name: String,
+    command: String,
+}
+
+pub fn retire_profile_autostart(
+    directory: &Path,
+) -> Result<Option<RetiredProfileAutostart>, String> {
+    #[cfg(windows)]
+    {
+        let directory =
+            std::fs::canonicalize(directory).map_err(|_| "自動起動の保存先を確認できません。")?;
+        let (name, _) = registration(Path::new("moyai-hub.exe"), &directory)?;
+        if let Some(command) = registry::read(&name)? {
+            if !profile_command(&command, &directory) {
+                return Err("このHub保存先の自動起動が変更されています。登録は解除せず、保存データも削除しません。Windowsの自動起動設定を確認してください。".into());
+            }
+            if registry::read(&name)?.as_deref() != Some(&command) {
+                return Err("自動起動登録が変わりました。保存データは削除していません。".into());
+            }
+            registry::write(&name, None)?;
+            return Ok(Some(RetiredProfileAutostart { name, command }));
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = directory;
+    Ok(None)
+}
+
+pub fn restore_profile_autostart(retired: &RetiredProfileAutostart) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        if let Some(current) = registry::read(&retired.name)? {
+            if current != retired.command {
+                return Err(
+                    "自動起動登録が変更されているため、元の登録を上書きしませんでした。".into(),
+                );
+            }
+            return Ok(());
+        }
+        registry::write(&retired.name, Some(&retired.command))?;
+    }
+    #[cfg(not(windows))]
+    let _ = retired;
+    Ok(())
+}
+
+pub fn enable_profile_autostart(directory: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let executable =
+            std::env::current_exe().map_err(|_| "Hubの自動起動先を確認できません。")?;
+        let (name, command) = registration(&executable, directory)?;
+        if registry::read(&name)?.is_some() {
+            return Err(
+                "移行先のHub自動起動登録が既にあります。Hubの管理画面で確認してください。".into(),
+            );
+        }
+        registry::write(&name, Some(&command))?;
+    }
+    #[cfg(not(windows))]
+    let _ = directory;
+    Ok(())
+}
+
+fn profile_command(command: &str, directory: &Path) -> bool {
+    let Some(command) = command.strip_prefix('"') else {
+        return false;
+    };
+    let Some((executable, arguments)) = command.split_once('"') else {
+        return false;
+    };
+    let name = executable
+        .replace('\\', "/")
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .to_owned();
+    if !name.eq_ignore_ascii_case("moyai-hub.exe") {
+        return false;
+    }
+    let Some(profile) = arguments
+        .strip_prefix(" --launch --no-browser --data-dir \"")
+        .and_then(|v| v.strip_suffix('"'))
+    else {
+        return false;
+    };
+    let normalized = |value: &str| {
+        value
+            .replace('/', "\\")
+            .trim_start_matches("\\\\?\\")
+            .to_lowercase()
+    };
+    normalized(profile) == normalized(&directory.to_string_lossy())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +292,21 @@ mod tests {
             registration(Path::new("C:/Hub/moyai-hub.exe"), Path::new("C:/Other")).unwrap();
         assert_ne!(a, b);
         assert!(registration(Path::new("bad\"path"), Path::new("data")).is_err());
+    }
+    #[test]
+    fn cleanup_matches_only_a_hub_command_for_the_selected_profile() {
+        let selected = Path::new("C:/Users/test/Hub");
+        assert!(profile_command(
+            "\"C:\\Program Files\\moyAI\\Hub\\moyai-hub.exe\" --launch --no-browser --data-dir \"C:\\Users\\test\\Hub\"",
+            selected
+        ));
+        assert!(!profile_command(
+            "\"C:/Other/moyai-hub.exe\" --launch --no-browser --data-dir \"C:/Other Profile\"",
+            selected
+        ));
+        assert!(!profile_command(
+            "\"C:/Other/program.exe\" --launch --no-browser --data-dir \"C:/Users/test/Hub\"",
+            selected
+        ));
     }
 }

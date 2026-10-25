@@ -320,7 +320,24 @@ fn same_hash(left: &str, right: &str) -> bool {
 
 impl DeviceNetwork {
     pub fn open(path: &Path, hub_id: &str) -> Result<Self> {
-        let store = if path.exists() {
+        Self::open_profile(path, hub_id, true)
+    }
+    pub(crate) fn inspect_existing(path: &Path, hub_id: &str) -> Result<Self> {
+        Self::open_profile(path, hub_id, false)
+    }
+    pub(crate) fn has_unsettled_saved_work(&self) -> bool {
+        self.store
+            .authority
+            .authorities
+            .values()
+            .any(|authority| authority.job_id.is_some() && authority.terminal.is_none())
+    }
+    fn open_profile(path: &Path, hub_id: &str, create_if_missing: bool) -> Result<Self> {
+        let existed = path.try_exists().map_err(|_| NetworkError::Unavailable)?;
+        if !existed && !create_if_missing {
+            return Err(NetworkError::InvalidRequest);
+        }
+        let store = if existed {
             let mut bytes = Vec::new();
             std::fs::File::open(path)
                 .map_err(|_| NetworkError::Unavailable)?
@@ -454,7 +471,7 @@ impl DeviceNetwork {
             grants: BTreeMap::new(),
             history: history::HistoryBroker::default(),
         };
-        if !path.exists() {
+        if !existed {
             owner.save(&owner.store)?;
         }
         Ok(owner)

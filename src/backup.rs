@@ -201,6 +201,7 @@ fn copy_handle_new(input: &mut File, target: &Path) -> Result<(), String> {
     output.sync_all().map_err(err)
 }
 pub fn backup(source: &Path, destination: &Path) -> Result<Manifest, String> {
+    let _profile_lease = crate::maintenance::ProfileLease::shared(source)?;
     let source = fs::canonicalize(source).map_err(err)?;
     let _lock = lock(&source)?;
     let destination = new_directory(destination)?;
@@ -291,6 +292,7 @@ pub fn restore(
     if !acknowledge_runners_stopped {
         return Err("Restore requires --acknowledge-runners-stopped after all affected Runners and their managed processes are stopped".into());
     }
+    let _profile_lease = crate::maintenance::ProfileLease::shared(destination)?;
     let source = fs::canonicalize(source).map_err(err)?;
     let mut bytes = Vec::new();
     checked_file(&source.join("manifest.json"))?

@@ -4,13 +4,13 @@ Hub PCの起動操作、または管理を許可されたPCのDesktopから開�
 
 ## このPCで使う
 
-スタートメニューの **moyAI Team Management**、Hub単体配布の `Start-Hub.cmd`、または次のコマンドで開きます。
+初回は[Setup-Hub.cmdで導入](windows-setup.md)し、次回からはスタートメニューの **moyAI Team Management** で開きます。配置先の`Start-Hub.cmd`、または次のコマンドでも開けます。
 
 ```powershell
 .\moyai-hub.exe --launch
 ```
 
-初回の管理URLは `http://127.0.0.1:9080/admin/` です。保存済みのWeb設定がない場合は、実行ファイルと同じフォルダーに同梱した `web-management.json` を読み込みます。別の固定ポートを使う場合は、初回起動前にこのファイルの `settings.local_port` を変更してください。初期ファイルでは1以上のポート番号を指定し、0や省略はエラーにします。
+初回の管理URLは `http://127.0.0.1:9080/admin/` です。保存済みのWeb設定がない場合は、実行ファイルと同じフォルダーの初期`web-management.json`を読み込みます。別の固定ポートは`Setup-Hub.cmd -WebPort 9081`で指定できます。Program Files内の初期ファイルを編集する必要はありません。初期ファイルでは1以上のポート番号を指定し、0や省略はエラーにします。
 
 ```json
 {
@@ -40,7 +40,7 @@ Hub PCの起動操作、または管理を許可されたPCのDesktopから開�
 
 ## 保存先・状態確認・終了
 
-保存先は `--data-dir`、`MOYAI_HUB_DATA_DIR`、Windows既定の `%APPDATA%\ai.midi.moyai.hub` の順です。同じ保存先は一つのHubだけが所有します。
+保存先は `--data-dir`、`MOYAI_HUB_DATA_DIR`、Windows既定の `%LOCALAPPDATA%\midi-ai-labs\moyai-data\hub` の順です。同じ保存先は一つのHubだけが所有します。旧既定からの移行・停止条件・初期化は[Windowsへの導入と削除](windows-setup.md)を参照してください。
 
 ```powershell
 .\moyai-hub.exe --launch --data-dir C:\moyai-hub-data

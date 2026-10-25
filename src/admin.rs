@@ -22,7 +22,12 @@ use std::{
     },
 };
 mod autostart;
+pub use autostart::{
+    RetiredProfileAutostart, enable_profile_autostart, restore_profile_autostart,
+    retire_profile_autostart,
+};
 mod firewall;
+pub use firewall::require_profile_firewall_removed;
 mod hosting_options;
 mod network_admin;
 pub(crate) use network_admin::dispatch_network_locked;
@@ -61,6 +66,7 @@ pub struct Admin {
     core: SharedCore,
     path: PathBuf,
     _lock: File,
+    _profile_lease: crate::maintenance::ProfileLease,
     server: tokio::sync::Mutex<Option<Server>>,
     evidence: Mutex<BTreeMap<String, Evidence>>,
     discovery_generation: AtomicU64,
@@ -78,6 +84,7 @@ impl Admin {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .ok_or("カタログの保存先を確認してください。")?;
+        let profile_lease = crate::maintenance::ProfileLease::shared(directory)?;
         std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
         let lock = OpenOptions::new()
             .read(true)
@@ -134,6 +141,7 @@ impl Admin {
             )),
             path,
             _lock: lock,
+            _profile_lease: profile_lease,
             server: tokio::sync::Mutex::new(None),
             evidence: Mutex::new(BTreeMap::new()),
             discovery_generation: AtomicU64::new(0),

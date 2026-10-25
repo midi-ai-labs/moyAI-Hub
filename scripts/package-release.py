@@ -48,7 +48,7 @@ def source_version(repo):
     return version
 
 
-def release_artifact(log, repo, version):
+def release_artifact(log, repo, version, target_name="moyai-hub"):
     messages = []
     for line in log.read_text(encoding="utf-8-sig").splitlines():
         try:
@@ -58,11 +58,11 @@ def release_artifact(log, repo, version):
     if not any(m.get("reason") == "build-finished" and m.get("success") is True for m in messages):
         raise ValueError("Cargo log does not contain a successful completed build")
     artifacts = [m for m in messages if m.get("reason") == "compiler-artifact"
-                 and m.get("target", {}).get("name") == "moyai-hub"
+                 and m.get("target", {}).get("name") == target_name
                  and "bin" in m.get("target", {}).get("kind", [])
                  and m.get("executable")]
     if len(artifacts) != 1:
-        raise ValueError("Cargo log must identify exactly one Hub executable")
+        raise ValueError(f"Cargo log must identify exactly one {target_name} executable")
     artifact = artifacts[0]
     if (Path(artifact["manifest_path"]).resolve() != (repo / "Cargo.toml").resolve()
             or not artifact["package_id"].endswith("@" + version)
@@ -85,27 +85,38 @@ def x64_executable(path):
 
 
 def document_bytes(source, destination, documents, repo, commit, desktop, desktop_commit, rewrites):
+    desktop_root = Path(os.path.abspath(desktop))
+
     def replace(match):
         target = match.group(1)
         url = urlsplit(target)
         if url.scheme or url.netloc or not url.path:
             return match.group(0)
-        resolved = (source.parent / unquote(url.path)).resolve()
-        if not resolved.exists():
-            raise ValueError(f"Missing documentation target: {source.name}: {target}")
-        if resolved in documents:
-            replacement = Path(os.path.relpath(documents[resolved], destination.parent)).as_posix()
+        decoded_path = unquote(url.path)
+        lexical = Path(os.path.abspath(source.parent / decoded_path))
+        if lexical.is_relative_to(desktop_root):
+            # Desktop is a pinned remote source; directory links must end in /.
+            relative = lexical.relative_to(desktop_root)
+            view = "tree" if decoded_path.endswith("/") or relative == Path(".") else "blob"
+            replacement = f"{DESKTOP_URL}/{view}/{desktop_commit}"
+            if relative != Path("."):
+                replacement += "/" + relative.as_posix()
             if url.query:
                 replacement += "?" + url.query
         else:
-            if resolved.is_relative_to(repo.resolve()):
-                relative, base, revision = resolved.relative_to(repo.resolve()), HUB_URL, commit
-            elif resolved.is_relative_to(desktop.resolve()):
-                relative, base, revision = resolved.relative_to(desktop.resolve()), DESKTOP_URL, desktop_commit
+            resolved = (source.parent / decoded_path).resolve()
+            if not resolved.exists():
+                raise ValueError(f"Missing documentation target: {source.name}: {target}")
+            if resolved in documents:
+                replacement = Path(os.path.relpath(documents[resolved], destination.parent)).as_posix()
+                if url.query:
+                    replacement += "?" + url.query
+            elif resolved.is_relative_to(repo.resolve()):
+                relative = resolved.relative_to(repo.resolve())
+                view = "tree" if resolved.is_dir() else "blob"
+                replacement = f"{HUB_URL}/{view}/{commit}/{relative.as_posix()}"
             else:
                 raise ValueError(f"Documentation link leaves product repositories: {source.name}: {target}")
-            view = "tree" if resolved.is_dir() else "blob"
-            replacement = f"{base}/{view}/{revision}/{relative.as_posix()}"
         if url.fragment:
             replacement += "#" + url.fragment
         if replacement != target:
@@ -115,14 +126,18 @@ def document_bytes(source, destination, documents, repo, commit, desktop, deskto
     return re.sub(r"\]\(([^)]+)\)", replace, source.read_text(encoding="utf-8-sig")).encode("utf-8")
 
 
-def payload(repo, executable, notices, version, commit, desktop_commit):
+def payload(repo, executable, notices, version, commit, desktop_commit, cleanup=None):
     seed = (repo / "web-management.json").read_bytes()
     initial = json.loads(seed)
     if initial != {"schema": 1, "settings": {"local_port": 9080, "remote": {"mode": "off"}}}:
         raise ValueError("Release initial Web settings must use fixed port 9080 and remote off")
-    files = {"moyai-hub.exe": x64_executable(executable), "web-management.json": seed}
-    for source in (repo / "scripts/Start-Hub.cmd", repo / "scripts/Stop-Hub.cmd", repo / "LICENSE"):
+    cleanup = cleanup or executable.with_name("moyai-cleanup-hub.exe")
+    files = {"moyai-hub.exe": x64_executable(executable),
+             "moyai-cleanup-hub.exe": x64_executable(cleanup), "web-management.json": seed}
+    for source in (repo / "scripts/Start-Hub.cmd", repo / "scripts/Stop-Hub.cmd", repo / "scripts/Setup-Hub.cmd", repo / "scripts/Uninstall-Hub.cmd", repo / "LICENSE"):
         files[source.name] = source.read_bytes()
+    for name in ("Setup-Hub.ps1", "component-install.ps1", "Setup-Component.ps1", "sandbox-service.ps1"):
+        files["scripts/" + name] = (repo / "scripts" / name).read_bytes()
     files["THIRD_PARTY_NOTICES.txt"] = notices.read_bytes()
     if not files["THIRD_PARTY_NOTICES.txt"].strip():
         raise ValueError("Third-party notices must not be empty")
@@ -154,6 +169,13 @@ def write_package(output, version, files, identity, rewrites, prerelease=False):
         raise ValueError("Release output already exists; select a new output directory")
     files = dict(files)
     files["build-identity.json"] = json_bytes(identity)
+    files["deployment.json"] = json_bytes({
+        "schema": 1, "product": "moyai-hub-windows", "target": "windows-x86_64", "version": version,
+        "components": {"Hub": {"version": version}},
+        "runtime": {"visual_cpp": "system-installed", "webview2": "system-installed"},
+        "files": [{"path": path, "sha256": digest(body), "component": "Hub"}
+                  for path, body in sorted(files.items())],
+    })
     manifest = {"schema": "moyai-hub.standalone-release.v1", "name": name, **identity,
                 "prerelease": prerelease,
                 "files": [{"path": path, "sha256": digest(body), "size_bytes": len(body)}
@@ -198,10 +220,14 @@ def main():
     if args.version and args.version != version:
         raise ValueError("Requested version does not match the source")
     artifact = release_artifact(args.build_log, REPO, version)
-    files, rewrites = payload(REPO, Path(artifact["executable"]), args.notices, version, commit, args.desktop_source_commit)
+    cleanup_artifact = release_artifact(args.build_log, REPO, version, "moyai-cleanup-hub")
+    files, rewrites = payload(REPO, Path(artifact["executable"]), args.notices, version, commit, args.desktop_source_commit, Path(cleanup_artifact["executable"]))
     identity = {"version": version, "git_commit": commit, "source_clean": True,
                 "target": "windows-x86_64", "sha256": digest(files["moyai-hub.exe"]),
                 "size_bytes": len(files["moyai-hub.exe"]), "source_branch": git("branch", "--show-current"),
+                "cleanup_sha256": digest(files["moyai-cleanup-hub.exe"]),
+                "cleanup_size_bytes": len(files["moyai-cleanup-hub.exe"]),
+                "cleanup_compiler_profile": cleanup_artifact["profile"],
                 "compiler_profile": artifact["profile"], "compiler_features": artifact["features"],
                 "compiler_artifact_log_sha256": digest(args.build_log.read_bytes()),
                 "built_from_current_source": True, "frontend_embedded_in_executable": True,

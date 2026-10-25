@@ -252,6 +252,9 @@ pub async fn launch_server(
     catalog_path: &Path,
     web_args: &[OsString],
 ) -> Result<LaunchReport, String> {
+    let _profile_lease = crate::maintenance::ProfileLease::shared(
+        catalog_path.parent().ok_or("Hubの保存先が無効です。")?,
+    )?;
     let catalog = canonical_catalog(catalog_path, true)?;
     let directory = catalog.parent().ok_or("Hub の保存先が無効です。")?;
     let _launch_lock = launch_lock(directory).await?;
