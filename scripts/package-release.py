@@ -134,8 +134,10 @@ def payload(repo, executable, notices, version, commit, desktop_commit, cleanup=
     cleanup = cleanup or executable.with_name("moyai-cleanup-hub.exe")
     files = {"moyai-hub.exe": x64_executable(executable),
              "moyai-cleanup-hub.exe": x64_executable(cleanup), "web-management.json": seed}
-    for source in (repo / "scripts/Start-Hub.cmd", repo / "scripts/Stop-Hub.cmd", repo / "scripts/Setup-Hub.cmd", repo / "scripts/Uninstall-Hub.cmd", repo / "LICENSE"):
-        files[source.name] = source.read_bytes()
+    for source in (repo / "scripts/Start-Hub.cmd", repo / "scripts/Stop-Hub.cmd", repo / "scripts/Setup-Hub.cmd", repo / "scripts/Uninstall-Hub.cmd"):
+        # cmd.exe can misinterpret UTF-8 batch files with LF-only line endings.
+        files[source.name] = source.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+    files["LICENSE"] = (repo / "LICENSE").read_bytes()
     for name in ("Setup-Hub.ps1", "component-install.ps1", "Setup-Component.ps1", "sandbox-service.ps1"):
         files["scripts/" + name] = (repo / "scripts" / name).read_bytes()
     files["THIRD_PARTY_NOTICES.txt"] = notices.read_bytes()
