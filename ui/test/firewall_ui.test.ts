@@ -39,6 +39,40 @@ test("scope has no automatic profile and request summary contains the exact rest
   assert.deepEqual(firewallScope("10.0.0.1",true,true).profiles,["Domain","Private"]);
   const summary=firewallSummary(rule); assert.match(summary,/9471, 9472/); assert.match(summary,/192.168.1.0\/24/); assert.match(summary,/Private/); assert.doesNotMatch(summary,/Public/);
 });
+
+test("old deployment rules can be reviewed and removed without running network listeners", async () => {
+  await fixture(false, (command, args) => {
+    if (command === "hub_firewall_retired") return [{spec:rule,profile_directory:"C:\\OldData",removable:true,fingerprint:"old-reviewed"}];
+    assert.equal(command,"hub_firewall_remove_retired");
+    assert.deepEqual(args,{expectedFingerprint:"old-reviewed"});
+    return {status:"verified"};
+  }, async (host,calls) => {
+    const n=(suffix:string)=>host.nodes.get(`hub-firewall-retired-${suffix}`)!;
+    await n("remove").fire("click"); assert.equal(calls.length,0);
+    await n("review").fire("click");
+    assert.match(n("target").textContent,/C:\\OldData/);
+    assert.equal(n("remove").disabled,true);
+    n("confirm").checked=true; await n("confirm").fire("change");
+    assert.equal(n("remove").disabled,false);
+    await n("remove").fire("click");
+    assert.match(n("status").textContent,/解除を確認/);
+    assert.equal(n("confirm").checked,false);
+    assert.equal(calls.filter(value=>value === "hub_firewall_remove_retired").length,1);
+  });
+});
+
+test("manually edited old rules cannot be removed", async () => {
+  await fixture(false, command => {
+    assert.equal(command,"hub_firewall_retired");
+    return [{spec:rule,profile_directory:"C:\\OldData",removable:false,fingerprint:"foreign"}];
+  }, async host => {
+    const n=(suffix:string)=>host.nodes.get(`hub-firewall-retired-${suffix}`)!;
+    await n("review").fire("click");
+    n("confirm").checked=true; await n("confirm").fire("change");
+    assert.equal(n("remove").disabled,true); await n("remove").fire("click");
+    assert.match(n("target").textContent,/手動変更/);
+  });
+});
 test("remote browser does not invoke local firewall APIs or lose its management session",async()=>{
   await fixture(true,()=>({ready:true}),async(host,calls)=>{
     await host.nodes.get("hub-firewall-review")!.fire("click");

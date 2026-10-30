@@ -433,6 +433,9 @@ fn response_cookie(response: &reqwest::Response, secure: bool) -> String {
     assert!(attributes.contains(&"HttpOnly"));
     assert!(attributes.contains(&"SameSite=Strict"));
     assert!(attributes.contains(&"Path=/admin"));
+    if !attributes[0].ends_with('=') {
+        assert!(attributes.contains(&"Max-Age=34560000"));
+    }
     assert_eq!(attributes.contains(&"Secure"), secure);
     assert!(attributes[0].starts_with("moyai_admin="));
     attributes[0].to_owned()
@@ -870,6 +873,8 @@ async fn tls_browser_management_uses_shared_revision_owner_and_rejects_local_onl
         "hub_autostart_set",
         "hub_firewall_preview",
         "hub_firewall_status",
+        "hub_firewall_retired",
+        "hub_firewall_remove_retired",
         "hub_firewall_export",
         "hub_firewall_apply",
         "hub_firewall_remove",

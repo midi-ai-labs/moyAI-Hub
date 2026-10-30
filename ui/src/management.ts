@@ -19,6 +19,7 @@ let sessionRequest: Promise<WebSession> | null = null;
 let currentSession: WebSession | null = null;
 let authenticationGeneration = 0;
 let authenticationRequired = false;
+let authenticationRequest = Promise.resolve();
 const authenticationListeners = new Set<(session: WebSession | null) => void>();
 const staleAuthentication = "管理画面の利用許可が変わりました。Hub PCから管理画面を開き直してください。";
 
@@ -87,17 +88,24 @@ export async function managementSession(refresh = false): Promise<WebSession> {
 export async function authenticate(
     action: "access" | "logout", args: Record<string, string> = {},
 ): Promise<WebSession> {
-    const priorSession = currentSession;
-    // Retain only the CSRF value needed to revoke the cookie. Old management
-    // requests must lose their owner before logout is sent or another login starts.
+    // Old management requests lose their owner before logout or another login.
     invalidateAuthentication();
     const expectedGeneration = authenticationGeneration;
+    // Generation checks protect JS state, but cannot undo a Set-Cookie header.
+    // Finish the preceding exchange before a newer ticket replaces its cookie.
+    const preceding = authenticationRequest;
+    let release!: () => void;
+    authenticationRequest = new Promise<void>(resolve => { release = resolve; });
+    await preceding;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 35_000);
     try {
+        if (expectedGeneration !== authenticationGeneration) throw staleAuthentication;
         // A CSRF refresh during sign-in must not briefly restore a previous user
         // whose cookie may still exist after an uncertain logout.
-        const session = priorSession ?? await fetchSession();
+        // A launcher can reopen this tab after a Hub restart. Its cached CSRF
+        // belongs to the previous process even when the cookie is still valid.
+        const session = await fetchSession();
         if (expectedGeneration !== authenticationGeneration) throw staleAuthentication;
         if (action !== "logout" && !session.authentication.login_allowed) {
             throw "Hub PCの「moyAI Team Management」から管理画面を開いてください。";
@@ -114,7 +122,7 @@ export async function authenticate(
         return accepted;
     } catch (error) {
         throw typeof error === "string" ? error : "管理画面の利用許可を確認できません。Hub PCから管理画面を開き直してください。";
-    } finally { clearTimeout(timer); }
+    } finally { clearTimeout(timer); release(); }
 }
 export class ManagementFailure extends Error {
     readonly status: number;
@@ -128,7 +136,7 @@ async function browserInvoke<T>(command: string, args: Record<string, unknown>, 
     if (expectedGeneration !== authenticationGeneration) throw staleAuthentication;
     if (!session.authentication.login_allowed || !session.authentication.user?.administrator) throw "Hub PCから管理画面を開いてください。";
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), command === "hub_firewall_apply" || command === "hub_firewall_remove" ? 130_000 : 35_000);
+    const timer = setTimeout(() => controller.abort(), ["hub_firewall_apply", "hub_firewall_remove", "hub_firewall_remove_retired"].includes(command) ? 130_000 : 35_000);
     try {
         const response = await fetch("/admin/command", {
             method: "POST", credentials: "same-origin", cache: "no-store", signal: controller.signal,

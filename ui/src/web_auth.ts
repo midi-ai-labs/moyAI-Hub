@@ -63,9 +63,9 @@ export function attachWebAuthentication(
         } else {
             root.innerHTML = `<section class="web-auth-card" aria-labelledby="web-auth-title">
                 <p class="eyebrow">moyAI Hub</p><h1 id="web-auth-title">${checking ? "管理画面を開いています" : "Hub PCから管理画面を開いてください"}</h1>
-                <p class="subtle" id="web-auth-help">${checking ? "この画面の利用許可を確認しています。" : "管理を許可されたPCのDesktopで「Hubの管理画面を開く」を押してください。Hubを設置したPCでは、スタートメニューの「moyAI Team Management」からも開けます。IDやパスワードの入力は不要です。"}</p>
+                <p class="subtle" id="web-auth-help">${checking ? "この画面の利用許可を確認しています。" : "管理を許可されたPCのDesktopで「Hubの管理画面を開く」を押してください。Hubを設置したPCでは、Start-Hub.cmdをダブルクリックするか、スタートメニューの「moyAI Team Management」を開いてください。起動済みのHubに接続し、この画面の利用許可を取り直します。IDやパスワードの入力は不要です。"}</p>
                 <p id="web-auth-error" class="web-auth-error" role="alert" hidden></p>
-                <button id="web-auth-refresh" type="button" class="secondary" ${busy || checking ? "disabled" : ""}>利用許可を再確認</button>
+                <button id="web-auth-refresh" type="button" class="secondary" ${busy || checking ? "disabled" : ""}>接続状態を再確認</button>
                 <p class="web-auth-footnote">ブラウザーを閉じてもHubは動作を続けます。</p>
             </section>`;
             node("web-auth-refresh").addEventListener("click", () => { void refresh(); });

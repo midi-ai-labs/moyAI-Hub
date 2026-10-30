@@ -122,6 +122,26 @@ Invoke-MoyaiFirewall (Request $spec $current 'remove')
 Assert ($null -eq (Get-MoyaiRule $spec.name)) 'Exact removal verified'
 $before=$script:mutations; Invoke-MoyaiFirewall (Request $spec $null 'remove')
 Assert ($before -eq $script:mutations) 'Repeated absence removal is idempotent'
+# The reviewer is the new executable. The removed old executable need not exist.
+Invoke-MoyaiFirewall (Request $spec)
+$old=Spec; $old.program='C:\Deleted\moyai-hub.exe'
+$profile='C:\OldData'
+$sha=[Security.Cryptography.SHA256]::Create()
+try { $old.name='moyai-hub-inbound-v1-'+([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($old.program.ToLowerInvariant()+"`n"+$profile.ToLowerInvariant())))).Replace('-','').ToLowerInvariant().Substring(0,24) } finally { $sha.Dispose() }
+$script:rule.Program=$old.program; $script:rule.Name=$old.name
+$script:rule.DisplayName='moyAI Hub TCP '+$old.name.Substring(21); $script:rule.Description=Get-MoyaiDescription $old
+function RetiredRequest { $request=Request $old $old 'remove_retired'; $request | Add-Member profile_directory $profile; $request | Add-Member reviewer_program 'C:\Hub\moyai-hub.exe'; $request }
+$bad=RetiredRequest; $bad.profile_directory='C:\OtherProfile'
+Reject { Invoke-MoyaiFirewall $bad } 'Retired removal cannot target another profile'
+$bad=RetiredRequest; $bad.binary_sha256='b'*64
+Reject { Invoke-MoyaiFirewall $bad } 'Retired removal checks the new executable'
+$bad=RetiredRequest; $bad.expires_at_ms=1
+Reject { Invoke-MoyaiFirewall $bad } 'Retired removal expires'
+$script:rule.RemoteAddress=@('10.0.0.1/32')
+Reject { Invoke-MoyaiFirewall (RetiredRequest) } 'Retired removal preserves manual edits'
+$script:rule.RemoteAddress=$old.remote_addresses
+Invoke-MoyaiFirewall (RetiredRequest)
+Assert ($null -eq $script:rule) 'Retired removal does not need the deleted executable'
 . (Join-Path $PSScriptRoot '../src/admin/firewall_export.ps1')
 $script:machine='11111111-1111-1111-1111-111111111111'
 $script:hosting=[pscustomobject]@{schema_version=1;bind='0.0.0.0:9471';advertise_ip='192.168.1.2'}

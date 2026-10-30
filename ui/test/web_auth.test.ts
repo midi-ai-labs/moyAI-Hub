@@ -50,6 +50,7 @@ test("a new fragment ticket opens the existing tab and supersedes an older pendi
   const oldResponse = new Promise<Response>(resolve => { releaseOld=resolve; });
   const response = (id: string | null) => ({csrf:"csrf",epoch:"epoch",authentication:{configured:true,bootstrap_allowed:false,login_allowed:true,session_id:id,user:id ? {user_id:id,display_name:id,administrator:true}:null}});
   const received: string[] = [];
+  let cookie: string | null = null;
   let starts=0;
   Object.defineProperty(globalThis,"window",{configurable:true,value:{location,history,addEventListener:(name:string,callback:()=>void)=>callbacks.set(name,callback)}});
   globalThis.fetch=async (path, options) => {
@@ -57,7 +58,9 @@ test("a new fragment ticket opens the existing tab and supersedes an older pendi
     assert.equal(path,"/admin/access");
     assert.equal(location.hash, "", "the ticket is removed before the request");
     const {ticket}=JSON.parse(String(options?.body)); received.push(ticket);
-    return ticket==="old" ? oldResponse : Response.json(response(ticket));
+    const result = ticket==="old" ? await oldResponse : Response.json(response(ticket));
+    cookie=ticket; // Set-Cookie is applied by the browser before JS sees the body.
+    return result;
   };
   try {
     const root=new NodeFixture(), management=new NodeFixture();
@@ -67,12 +70,14 @@ test("a new fragment ticket opens the existing tab and supersedes an older pendi
     await new Promise(resolve=>setImmediate(resolve));
     location.hash="#access=new"; callbacks.get("hashchange")!();
     await new Promise(resolve=>setImmediate(resolve));
-    assert.deepEqual(received,["old","new"]);
-    assert.equal(management.hidden,false); assert.equal(starts,1);
+    assert.deepEqual(received,["old"]);
+    assert.equal(management.hidden,true); assert.equal(starts,0);
     releaseOld(Response.json(response("old")));
     await new Promise(resolve=>setImmediate(resolve));
+    assert.deepEqual(received,["old","new"]);
     assert.equal(management.hidden,false); assert.equal(starts,1);
     assert.equal(root.nodes.get("web-auth-user")?.textContent,"new");
+    assert.equal(cookie,"new", "the old exchange must not overwrite the accepted cookie");
   } finally {
     globalThis.fetch=originalFetch;
     if (originalWindow) Object.defineProperty(globalThis,"window",originalWindow);

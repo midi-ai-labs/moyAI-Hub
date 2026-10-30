@@ -33,13 +33,7 @@ try {
     $arguments = @('--launch')
     if ($null -ne $WebPort) { $arguments += @('--web-port', [string]$WebPort) }
     if ($HubDataDir) { if ($HubDataDir.Contains('"')) { throw 'Hub保存先に引用符は指定できません。' }; $arguments += @('--data-dir', ('"' + [IO.Path]::GetFullPath($HubDataDir) + '"')) }
-    $process = Start-Process -FilePath $executable -ArgumentList $arguments -WorkingDirectory (Split-Path -Parent $executable) -WindowStyle Hidden -PassThru
-    try {
-      $null = $process.Handle
-      $process.WaitForExit()
-      $exitCode = $process.ExitCode
-      if ($null -eq $exitCode -or $exitCode -ne 0) { throw "Hubを起動できませんでした。Hubの保存先とログを確認してください。終了コード: $exitCode" }
-    } finally { $process.Dispose() }
+    Start-MoyaiHub $executable $arguments
   } else {
     $invoke = @{ SourceRoot=$packageRoot; Components=@('Hub'); Uninstall=$Uninstall; CheckOnly=$CheckOnly; NoShortcuts=$NoShortcuts; SkipStartupCheck=$SkipStartupCheck; ResetHubData=$ResetHubData; Interactive=$Interactive; HubDataDir=$HubDataDir }
     if ($null -ne $WebPort) { $invoke.WebPort = $WebPort }
@@ -47,6 +41,11 @@ try {
   }
   exit 0
 } catch {
-  Write-Host ('Hubの操作を完了できませんでした。' + [Environment]::NewLine + $_.Exception.Message)
+  $message='Hubの操作を完了できませんでした。' + [Environment]::NewLine + $_.Exception.Message
+  Write-Host $message
+  if ($LaunchOnly) {
+    Add-Type -AssemblyName System.Windows.Forms
+    [void][Windows.Forms.MessageBox]::Show($message, 'moyAI Hub', 'OK', 'Error')
+  }
   exit 1
 }

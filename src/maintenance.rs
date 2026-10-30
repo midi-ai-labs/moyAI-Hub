@@ -48,6 +48,17 @@ pub fn check_regular_file(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+pub fn check_regular_directory(path: &Path) -> Result<(), String> {
+    check_ancestors(path)?;
+    if !regular_metadata(path)?.is_dir() {
+        return Err(format!(
+            "通常のフォルダーではありません: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 pub fn check_regular_tree(path: &Path) -> Result<(), String> {
     check_ancestors(path)?;
     let mut pending = vec![(path.to_path_buf(), 0usize)];

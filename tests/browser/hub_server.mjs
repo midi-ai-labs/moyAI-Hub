@@ -93,13 +93,14 @@ export async function startHubServer({ dataDirectory, binary: explicitBinary = p
             remote: { mode: "http", bind: new URL(remoteOrigin).host, public_origin: remoteOrigin } }), { flag: "wx" });
         args.push("--web-settings", settingsFile);
     } else args.push("--web-port", "0");
-    const started = Date.now();
-    const child = spawn(binary, args, { windowsHide: true, stdio: "ignore" });
+    let started = Date.now();
+    let child = spawn(binary, args, { windowsHide: true, stdio: "ignore" });
     let spawnError, descriptor, verifiedHost = false, closePromise;
-    const exited = new Promise(resolve => {
+    const trackExit = () => new Promise(resolve => {
         child.once("exit", code => resolve(code));
         child.once("error", error => { spawnError = error; resolve(null); });
     });
+    let exited = trackExit();
     const listeners = new Map();
     const privateNetworkAddresses = new Set();
     const rememberListener = (name, address) => {
@@ -171,7 +172,7 @@ export async function startHubServer({ dataDirectory, binary: explicitBinary = p
         await record("hub-lifecycle", result);
         return result;
     })();
-    try {
+    const connectStarted = async () => {
         descriptor = await poll("descriptor", async () => {
             if (spawnError) throw new Error("Hub fixture process could not start");
             if (child.exitCode !== null) throw new Error(`Hub fixture exited: ${child.exitCode}`);
@@ -186,12 +187,30 @@ export async function startHubServer({ dataDirectory, binary: explicitBinary = p
         validateHubHealth(await request("health"), descriptor, catalog);
         verifiedHost = true;
         rememberListener("host control", `http://127.0.0.1:${descriptor.port}`);
+    };
+    try {
+        await connectStarted();
         const web = await poll("Web listener", () => command("hub_web_status"), value => value.enabled === true);
         const url = new URL(web.local_url);
         requireValue(url.protocol === "http:" && url.hostname === "127.0.0.1" && url.pathname === "/admin/"
             && web.remote_url === (remoteOrigin ? `${remoteOrigin}/admin/` : null), "Hub fixture Web listener is not isolated loopback HTTP");
         rememberListener("web", web.local_url);
         if (web.remote_url) rememberListener("remote web", web.remote_url);
+        const restart = async () => {
+            requireValue(!remoteWeb, "Restart fixture currently supports the local listener only");
+            const oldPid = child.pid;
+            requireValue((await close()).pass, "Previous Hub must close cleanly before restart");
+            closePromise = undefined; verifiedHost = false; spawnError = undefined; descriptor = undefined;
+            listeners.clear(); started = Date.now();
+            // Retain the browser origin while replacing the real Rust process.
+            child = spawn(binary, ["--data-dir", data, "--web-port", url.port], {windowsHide:true,stdio:"ignore"});
+            exited = trackExit();
+            await connectStarted();
+            const resumed = await command("hub_web_status");
+            requireValue(resumed.local_url === web.local_url, "Restart must preserve the browser origin");
+            rememberListener("web", resumed.local_url);
+            await record("hub-restart", {old_pid:oldPid,pid:child.pid,local_url:resumed.local_url});
+        };
         const networkPort = await freePort();
         const network = await observeNetwork();
         requireValue(network.server.running === false, "Hub fixture must not implicitly start the device network");
@@ -199,7 +218,7 @@ export async function startHubServer({ dataDirectory, binary: explicitBinary = p
         while (gatewayPort === networkPort) gatewayPort = await freePort();
         await command("hub_network_settings", { expectedRevision: network.revision, gatewayPort });
         await record("hub-build", { binary, sha256: await binaryHash(binary), pid: child.pid, local_url: web.local_url, remote_url: web.remote_url });
-        return Object.freeze({ binary, dataDirectory: data, pid: child.pid, url: web.local_url, remoteUrl: web.remote_url, command, networkPort, gatewayPort, observeNetwork, allowPrivateNetworkAddress, close });
+        return Object.freeze({ binary, dataDirectory: data, get pid() { return child.pid; }, url: web.local_url, remoteUrl: web.remote_url, command, networkPort, gatewayPort, observeNetwork, allowPrivateNetworkAddress, restart, close });
     } catch (error) {
         try { await close(); } catch (cleanupError) { throw new AggregateError([error, cleanupError], "Hub fixture setup and cleanup failed"); }
         throw error;

@@ -191,6 +191,10 @@ impl Admin {
             "hub_network_snapshot" => network_admin::hub_network_snapshot(self).await,
             "hub_hosting_options" => hosting_options::snapshot().await,
             "hub_firewall_status" => firewall::status(self).await,
+            "hub_firewall_retired" => firewall::retired(self).await,
+            "hub_firewall_remove_retired" => {
+                firewall::remove_retired(self, argument(&args, "expectedFingerprint")?).await
+            }
             "hub_firewall_preview" => firewall::preview(self, argument(&args, "scope")?).await,
             "hub_firewall_export" => {
                 firewall::export(

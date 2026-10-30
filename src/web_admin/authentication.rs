@@ -44,7 +44,7 @@ fn error_response(error: IdentityError) -> Response {
     let code = status(&error);
     let message = match code {
         StatusCode::UNAUTHORIZED => {
-            "管理画面を開くための認証が期限切れです。Hub PC または管理権限のあるPCから開き直してください。"
+            "管理画面の利用許可を確認できません。Hub PCのStart-Hub.cmd、または管理権限のあるDesktopの「Hubの管理画面を開く」から開き直してください。"
         }
         StatusCode::BAD_REQUEST => "管理画面を開くための認証を確認できません。開き直してください。",
         StatusCode::CONFLICT => "管理画面の設定が変わりました。開き直してください。",
@@ -179,7 +179,9 @@ fn session_response_sync(
 fn set_cookie(response: &mut Response, state: &WebState, token: &str, remove: bool) {
     let value = format!(
         "{COOKIE}={token}; Path=/admin; HttpOnly; SameSite=Strict; Max-Age={}{}",
-        if remove { 0 } else { 8 * 60 * 60 },
+        // Persistent across browser/PC restarts. Browsers can still clear or
+        // cap cookie retention; the server no longer imposes an eight-hour TTL.
+        if remove { 0 } else { 400 * 24 * 60 * 60 },
         if state.policy.secure { "; Secure" } else { "" }
     );
     if let Ok(value) = HeaderValue::from_str(&value) {

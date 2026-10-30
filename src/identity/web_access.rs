@@ -95,7 +95,7 @@ pub(crate) fn issue(
             [now],
         )?;
         // Reopening a browser must remain possible without another credential.
-        conn.execute("DELETE FROM identity_sessions WHERE user_id=?1 AND audience='web_admin' AND token_hash NOT IN (SELECT token_hash FROM identity_sessions WHERE user_id=?1 AND audience='web_admin' ORDER BY expires_at_ms DESC,token_hash LIMIT 15)",[user])?;
+        conn.execute("DELETE FROM identity_sessions WHERE user_id=?1 AND audience='web_admin' AND token_hash NOT IN (SELECT token_hash FROM identity_sessions WHERE user_id=?1 AND audience='web_admin' ORDER BY rowid DESC LIMIT 15)",[user])?;
         if conn.query_row("SELECT COUNT(*) FROM identity_sessions", [], |r| {
             r.get::<_, i64>(0)
         })? >= MAX_SESSIONS
@@ -108,9 +108,9 @@ pub(crate) fn issue(
             |r| r.get(0),
         )?;
         let token = hex(&random_bytes::<32>()?);
-        let expires_at_ms = (now as u64)
-            .checked_add(SESSION_TTL_MS)
-            .ok_or(IdentityError::Invalid("time"))?;
+        // Browser administration ends by explicit logout or authority/device
+        // revocation. Shared-work credentials retain their own deadlines.
+        let expires_at_ms = i64::MAX as u64;
         conn.execute("INSERT INTO identity_sessions(token_hash,user_id,audience,credential_generation,expires_at_ms) VALUES(?1,?2,'web_admin',?3,?4)",params![token_hash(&token),user,generation,timestamp(expires_at_ms)?])?;
         if let Some(proof) = proof {
             conn.execute("INSERT INTO identity_web_session_devices(token_hash,device_id,certificate_sha256,binding_generation) VALUES(?1,?2,?3,?4)",params![token_hash(&token),proof.device_id,proof.certificate_sha256,proof.binding_generation])?;

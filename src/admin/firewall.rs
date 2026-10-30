@@ -6,6 +6,8 @@ use std::net::Ipv4Addr;
 
 const HELPER: &str = include_str!("firewall_helper.ps1");
 const EXPORT_HELPER: &str = include_str!("firewall_export.ps1");
+mod retired;
+pub(super) use retired::{list as retired, remove as remove_retired};
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -331,12 +333,11 @@ fn profile_has_rule(directory: &Path, rows: &[Observed]) -> bool {
         .any(|row| row.spec.name == rule_name(&row.spec.program, &directory.to_string_lossy()))
 }
 
-/// Data relocation/reset must not orphan a rule whose identity includes the old profile path.
+/// Reset must not orphan rules for either the current or migrated profile.
 pub fn require_profile_firewall_removed(directory: &Path) -> Result<(), String> {
     #[cfg(windows)]
     {
-        let directory =
-            std::fs::canonicalize(directory).map_err(|_| "Hubの保存先を確認できません。")?;
+        let directories = crate::data_paths::firewall_profiles(directory)?;
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
             runtime.block_on(async {
@@ -344,7 +345,7 @@ pub fn require_profile_firewall_removed(directory: &Path) -> Result<(), String> 
                 let result = run_script(&script, 15).await?;
                 if !result.status.success() || result.stdout.len() > 256 * 1024 { return Err("Hubの受信許可を確認できません。保存先の移動・初期化は行っていません。PC管理者へ確認してください。".into()); }
                 let rows: Vec<Observed> = serde_json::from_slice(&result.stdout).map_err(|_| "Hubの受信許可を照合できません。保存データは保持しています。")?;
-                if profile_has_rule(&directory, &rows) { return Err("このHub保存先のWindows受信許可が残っています。元のHubを起動し、管理画面で「表示中の既存ルールを解除」を実行してからHubを停止し、もう一度操作してください。保存先の移動・初期化は行っていません。".into()); }
+                if directories.iter().any(|directory| profile_has_rule(directory, &rows)) { return Err("このHub保存先のWindows受信許可が残っています。新版Hubの管理画面で「以前の配置の受信許可」と「表示中の既存ルールを解除」を確認し、解除後にHubを停止して初期化してください。保存データは保持しています。".into()); }
                 Ok(())
             })
         }).join().map_err(|_| "Hub受信許可の確認処理を完了できません。")?
@@ -918,7 +919,7 @@ mod tests {
             .is_err()
         );
     }
-    fn spec() -> RuleSpec {
+    pub(super) fn spec() -> RuleSpec {
         RuleSpec {
             name: rule_name("C:\\Hub\\moyai-hub.exe", "C:\\Data"),
             program: "C:\\Hub\\moyai-hub.exe".into(),

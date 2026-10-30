@@ -72,8 +72,18 @@ function Test-MoyaiSame($a,$b) {
 function Assert-MoyaiFirewallRequest($request) {
     Assert-MoyaiSpec $request.spec
     $now=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-    if ($request.action -notin @('apply','remove') -or $request.binary_sha256 -cnotmatch '^[0-9a-f]{64}$' -or $now -ge $request.expires_at_ms -or $request.expires_at_ms -gt $now+60000) { throw 'Expired or invalid request' }
-    if ((Get-FileHash -LiteralPath $request.spec.program -Algorithm SHA256).Hash.ToLowerInvariant() -cne $request.binary_sha256) { throw 'Executable changed' }
+    if ($request.action -notin @('apply','remove','remove_retired') -or $request.binary_sha256 -cnotmatch '^[0-9a-f]{64}$' -or $now -ge $request.expires_at_ms -or $request.expires_at_ms -gt $now+60000) { throw 'Expired or invalid request' }
+    $reviewer=$request.spec.program
+    if ($request.action -eq 'remove_retired') {
+        $directory=[string]$request.profile_directory
+        if ($directory -notmatch '^(\\\\\?\\)?[A-Za-z]:\\' -or $null -eq $request.previous) { throw 'Invalid profile' }
+        $identity=$request.spec.program.ToLowerInvariant()+"`n"+$directory.Replace('/','\').Replace('\\?\','').ToLowerInvariant()
+        $sha=[Security.Cryptography.SHA256]::Create()
+        try { $name='moyai-hub-inbound-v1-'+([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($identity)))).Replace('-','').ToLowerInvariant().Substring(0,24) } finally { $sha.Dispose() }
+        if ($name -cne $request.spec.name) { throw 'Different profile' }
+        $reviewer=$request.reviewer_program
+    }
+    if ((Get-FileHash -LiteralPath $reviewer -Algorithm SHA256).Hash.ToLowerInvariant() -cne $request.binary_sha256) { throw 'Executable changed' }
     if ($null -ne $request.previous) { Assert-MoyaiSpec $request.previous; if ($request.previous.name -cne $request.spec.name -or $request.previous.program -ine $request.spec.program) { throw 'Owner changed' } }
     $actual=Get-MoyaiRule $request.spec.name
     if (($null -ne $actual -and -not $actual.owned) -or -not (Test-MoyaiSame $actual.spec $request.previous)) { throw 'Rule changed' }
@@ -82,7 +92,7 @@ function Assert-MoyaiFirewallRequest($request) {
 }
 function Invoke-MoyaiFirewall($request) {
     $actual=Assert-MoyaiFirewallRequest $request
-    if ($request.action -eq 'remove') {
+    if ($request.action -in @('remove','remove_retired')) {
         if ($null -ne $actual) { Remove-NetFirewallRule -PolicyStore PersistentStore -Name $request.spec.name -Confirm:$false }
     } elseif (-not (Test-MoyaiSame $actual.spec $request.spec)) {
         $s=$request.spec
@@ -91,6 +101,6 @@ function Invoke-MoyaiFirewall($request) {
         else { Set-NetFirewallRule @parameters | Out-Null }
     }
     $after=Get-MoyaiRule $request.spec.name
-    if ($request.action -eq 'remove') { if ($null -ne $after) { throw 'Removal not verified' } }
+    if ($request.action -in @('remove','remove_retired')) { if ($null -ne $after) { throw 'Removal not verified' } }
     elseif ($null -eq $after -or -not $after.owned -or -not (Test-MoyaiSame $after.spec $request.spec)) { throw 'Apply not verified' }
 }

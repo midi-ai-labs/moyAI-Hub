@@ -4,6 +4,7 @@ interface Scope { remote_addresses: string[]; profiles: string[] }
 interface Rule { name: string; program: string; local_address: string; local_ports: number[]; remote_addresses: string[]; profile_mask: number }
 interface Preview { spec: Rule; binary_sha256: string; previous: Rule | null; conflict: boolean; matching: boolean; fingerprint: string }
 interface Receipt { status: "verified" | "unchanged" | "cancelled" | "unconfirmed"; preview: Preview | null }
+interface RetiredRule { spec: Rule; profile_directory: string; removable: boolean; fingerprint: string }
 export interface FirewallStatus { state: "missing" | "matching" | "mismatch" | "conflict"; program: string; local_address: string; local_ports: number[]; active_profile?: string | null; current: Rule | null; other_programs: string[]; suggestion: Scope | null; suggestion_source: "existing" | "lan" }
 
 export function firewallStatusMessage(value: FirewallStatus): string {
@@ -22,6 +23,7 @@ export function firewallSummary(rule: Rule): string {
 export function attachFirewall(host: HTMLElement, onStatus: (state: FirewallStatus["state"] | null) => void = () => {}, onConfigured: () => void = () => {}) {
     host.innerHTML = `<details id="hub-firewall"><summary>このHub PCで受信許可を設定する</summary><p>HubとGatewayを開始した後、社内の接続元IPv4範囲と信頼するプロファイルを指定します。Public、すべての接続元、Web管理画面、外向き通信の許可は追加しません。</p><label>許可する接続元PCまたはサブネット（最大16件）<textarea id="hub-firewall-addresses" rows="2" placeholder="192.168.10.0/24 または 192.168.10.21" spellcheck="false"></textarea></label><div class="network-memberships"><label class="network-check"><input id="hub-firewall-domain" type="checkbox"><span>Domain（社内ドメイン）</span></label><label class="network-check"><input id="hub-firewall-private" type="checkbox"><span>Private（信頼する社内LAN）</span></label></div><button id="hub-firewall-review" type="button" class="secondary">変更内容と現在のルールを確認</button><p id="hub-firewall-status" role="status">設定はHub PC上のローカル管理画面で行います。</p><div id="hub-firewall-preview" hidden><h4>今回の受信許可</h4><pre id="hub-firewall-target"></pre><h4>現在のこのHubのルール</h4><pre id="hub-firewall-previous"></pre><label class="network-check"><input id="hub-firewall-confirm" type="checkbox"><span>上の実行ファイル・接続元・ポート・プロファイルと変更前の内容を確認した</span></label><div class="network-actions"><button id="hub-firewall-apply" type="button" class="primary" disabled>接続を許可して続ける</button><button id="hub-firewall-remove" type="button" class="danger" disabled>表示中の既存ルールを解除</button><button id="hub-firewall-copy-request" type="button" class="secondary">PC管理者への依頼をコピー</button><button id="hub-firewall-export" type="button" class="secondary" disabled>管理者に渡す設定スクリプトを保存 (.ps1)</button></div></div><p class="footnote">Windowsの管理者確認（UAC）が表示されます。60秒以内に確認できなければ再確認してください。確認中は接続の開始・停止を待ちます。会社の管理ポリシーや他の拒否ルールは変更しません。登録後も参加Desktopから接続を診断してください。設置先を移す前は、このHubを開始した状態で既存ルールを解除します。</p></details>`;
     host.innerHTML = `<p id="hub-firewall-health" role="status">Hubを開始すると、現在の受信許可を確認します。</p><p>通常はSetupで導入した同じ場所からHubを起動してください。更新で設置先を変えると受信許可が引き継がれません。</p><button id="hub-firewall-health-refresh" class="secondary" type="button">受信許可を再確認</button><p id="hub-firewall-suggestion-text"></p><button id="hub-firewall-suggestion" class="secondary" type="button" hidden>このLANの設定を入力する</button>` + host.innerHTML;
+    host.innerHTML += `<details id="hub-firewall-retired"><summary>以前の配置の受信許可</summary><p>更新前の実行ファイルや保存先を指すルールを確認・解除できます。HubとGatewayの接続が停止中でも利用できます。旧実行ファイルは不要です。</p><button id="hub-firewall-retired-review" type="button" class="secondary">以前の配置を確認</button><p id="hub-firewall-retired-status" role="status"></p><div id="hub-firewall-retired-preview" hidden><label>解除するルール<select id="hub-firewall-retired-choice"></select></label><pre id="hub-firewall-retired-target"></pre><label class="network-check"><input id="hub-firewall-retired-confirm" type="checkbox"><span>表示された旧配置のルールを解除する</span></label><button id="hub-firewall-retired-remove" type="button" class="danger" disabled>選択した旧ルールを解除</button></div><p class="footnote">解除にはWindowsの管理者確認（UAC）が必要です。手動変更されたルールは解除せず、PC管理者へ確認してください。</p></details>`;
     const node = <T extends HTMLElement = HTMLElement>(id: string) => host.querySelector<T>(`#${id}`)!;
     const addresses = node<HTMLTextAreaElement>("hub-firewall-addresses");
     const domain = node<HTMLInputElement>("hub-firewall-domain"), privateNetwork = node<HTMLInputElement>("hub-firewall-private");
@@ -32,8 +34,14 @@ export function attachFirewall(host: HTMLElement, onStatus: (state: FirewallStat
     let current: Preview | null = null, reviewedScope: Scope | null = null, busy = false, serial = 0, disposed = false;
     let lastTarget = "", running = false, healthSerial = 0, healthBusy = false, observed: FirewallStatus | null = null;
     let preparedTarget: string | null = null;
+    let retiredRows: RetiredRule[] = [];
+    const retiredChoice = node<HTMLSelectElement>("hub-firewall-retired-choice");
+    const retiredConfirm = node<HTMLInputElement>("hub-firewall-retired-confirm");
+    const selectedRetired = () => retiredRows[Number(retiredChoice.value)];
     const scope = () => firewallScope(addresses.value, domain.checked, privateNetwork.checked);
     function lock() {
+        for (const id of ["hub-firewall-retired-review", "hub-firewall-retired-choice", "hub-firewall-retired-confirm"]) node<HTMLInputElement>(id).disabled = busy || disposed;
+        node<HTMLButtonElement>("hub-firewall-retired-remove").disabled = busy || disposed || !retiredConfirm.checked || !selectedRetired()?.removable;
         for (const input of [addresses, domain, privateNetwork, confirm, review]) input.disabled = busy || disposed;
         apply.disabled = busy || disposed || !current || current.conflict || current.matching || !confirm.checked;
         remove.disabled = busy || disposed || !current?.previous || current.conflict || !confirm.checked;
@@ -150,6 +158,44 @@ export function attachFirewall(host: HTMLElement, onStatus: (state: FirewallStat
     node("hub-firewall-copy-request").addEventListener("click", () => {
         if (!current || busy) return;
         void copyText(`moyAI Hub 受信TCP許可の依頼\n${firewallSummary(current.spec)}\n設定後は参加Desktopで到達を確認してください。`).then(() => { status.textContent = "設定依頼をコピーしました。"; }).catch(() => { status.textContent = "コピーできません。表示内容を選択してPC管理者へ渡してください。"; });
+    });
+    function showRetired() {
+        retiredConfirm.checked = false;
+        const row = selectedRetired();
+        node("hub-firewall-retired-preview").hidden = !row;
+        node("hub-firewall-retired-target").textContent = row ? `保存先: ${row.profile_directory}\n${firewallSummary(row.spec)}${row.removable ? "" : "\n手動変更されています。PC管理者へ確認してください。"}` : "";
+        lock();
+    }
+    retiredChoice.addEventListener("change", showRetired);
+    retiredConfirm.addEventListener("change", lock);
+    node("hub-firewall-retired-review").addEventListener("click", async () => {
+        if (busy || disposed) return;
+        const expected = ++serial; busy = true; retiredRows = []; showRetired();
+        const message = node("hub-firewall-retired-status"); message.textContent = "以前の受信許可を確認しています…";
+        try {
+            const web = await invoke<{local_url: string|null}>("hub_web_status");
+            if (disposed || expected !== serial) return;
+            if (!web.local_url || new URL(web.local_url).origin !== window.location.origin) throw "Hub PC上のローカル管理画面で確認してください。";
+            const rows = await invoke<RetiredRule[]>("hub_firewall_retired");
+            if (disposed || expected !== serial) return;
+            retiredRows = rows;
+            retiredChoice.innerHTML = rows.map((_, index) => `<option value="${index}">ルール ${index + 1}</option>`).join("");
+            retiredChoice.value = "0"; showRetired();
+            message.textContent = rows.length ? "解除するルールを選び、実行ファイル・保存先・許可範囲を確認してください。" : "この保存先に紐づく以前の配置のルールはありません。";
+        } catch (error) { if (!disposed && expected === serial) message.textContent = typeof error === "string" ? error : "以前の受信許可を確認できません。"; }
+        finally { busy = false; lock(); }
+    });
+    node("hub-firewall-retired-remove").addEventListener("click", async () => {
+        const row = selectedRetired();
+        if (busy || disposed || !row?.removable || !retiredConfirm.checked) return;
+        const expected = ++serial; busy = true; lock();
+        const message = node("hub-firewall-retired-status"); message.textContent = "Windowsの管理者確認を待っています。60秒以内に承認してください。";
+        try {
+            const receipt = await invoke<{status: Receipt["status"]}>("hub_firewall_remove_retired", {expectedFingerprint: row.fingerprint});
+            if (disposed || expected !== serial) return;
+            message.textContent = receipt.status === "verified" ? "選択した旧ルールの解除を確認しました。" : receipt.status === "cancelled" ? "Windowsの管理者確認が取り消されました。以前の配置を再確認してください。" : "解除の完了を確認できません。自動で再実行せず、以前の配置を再確認してください。";
+        } catch (error) { if (!disposed && expected === serial) message.textContent = typeof error === "string" ? error : "解除の結果を確認できません。"; }
+        finally { if (!disposed && expected === serial) { retiredRows = []; showRetired(); } busy = false; lock(); }
     });
     onAuthenticationChange(session => { if (!session?.authentication.user) { disposed = true; ++serial; ++healthSerial; current = null; reviewedScope = null; host.replaceChildren(); } });
     return { refresh(target: string, active: boolean) {

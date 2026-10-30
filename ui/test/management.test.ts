@@ -161,9 +161,9 @@ test("launch access sends its ticket only to the access endpoint and retains no 
         await reconnect();
         const credentials = { ticket: "one-use-launch-ticket" };
         const accepted = await authenticate("access", credentials);
-        assert.equal(calls[1].path, "/admin/access");
-        assert.equal(new Headers(calls[1].options?.headers).get("x-moyai-csrf"), "session-csrf");
-        assert.deepEqual(JSON.parse(String(calls[1].options?.body)), credentials);
+        assert.equal(calls[2].path, "/admin/access");
+        assert.equal(new Headers(calls[2].options?.headers).get("x-moyai-csrf"), "session-csrf");
+        assert.deepEqual(JSON.parse(String(calls[2].options?.body)), credentials);
         assert.equal(accepted.authentication.user?.administrator, true);
         assert.equal(JSON.stringify(await managementSession()).includes(credentials.ticket), false);
     });
@@ -201,7 +201,7 @@ test("a listener that disallows access receives no ticket or management commands
         await assert.rejects(invoke("hub_snapshot"));
         await assert.rejects(authenticate("access", { ticket: "sensitive-ticket" }),
             error => typeof error === "string" && error.includes("Hub PC"));
-        assert.deepEqual(paths, ["/admin/session"]);
+        assert.deepEqual(paths, ["/admin/session", "/admin/session"]);
     });
 });
 
@@ -220,6 +220,25 @@ test("CSRF preparation for launch access never re-admits the preceding cookie se
             await assert.rejects(authenticate("access", { ticket: "expired-ticket" }));
             assert.deepEqual(changes, [null]);
             await assert.rejects(invoke("hub_snapshot"));
+        });
+    } finally { dispose(); }
+});
+
+test("reopening a tab after Hub restart uses the new process CSRF", async () => {
+    let restarted = false;
+    const changes: (WebSession | null)[] = [];
+    const dispose = onAuthenticationChange(value => changes.push(value));
+    try {
+        await withFetch(async (input, options) => {
+            const value = { ...session(true, restarted ? "new-csrf" : "old-csrf"), epoch: restarted ? "new" : "old" };
+            if (input === "/admin/session") return Response.json(value);
+            assert.equal(new Headers(options?.headers).get("x-moyai-csrf"), "new-csrf");
+            return Response.json(value);
+        }, async () => {
+            await reconnect(); restarted = true; changes.length = 0;
+            const result = await authenticate("access", { ticket: "new-process-ticket" });
+            assert.equal(result.epoch, "new");
+            assert.deepEqual(changes.map(value => value?.epoch ?? null), [null, "new"]);
         });
     } finally { dispose(); }
 });

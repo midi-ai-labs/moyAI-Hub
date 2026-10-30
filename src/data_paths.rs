@@ -94,7 +94,9 @@ fn nonempty(path: &Path) -> Result<bool, String> {
     if !path.try_exists().map_err(|e| e.to_string())? {
         return Ok(false);
     }
-    crate::maintenance::check_regular_tree(path)?;
+    // Resolution runs while Hub may be saving or collecting assets. Inspect
+    // only the root here; offline migration/cleanup own the locked tree audit.
+    crate::maintenance::check_regular_directory(path)?;
     for entry in fs::read_dir(path).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
         if !matches!(
@@ -130,6 +132,20 @@ fn retired(paths: &DefaultPaths) -> Result<bool, String> {
         Some(MigrationState::Retired) => Ok(true),
         None => Ok(false),
     }
+}
+
+/// Rules retain their original profile identity after the one-time default move.
+pub(crate) fn firewall_profiles(directory: &Path) -> Result<Vec<PathBuf>, String> {
+    let directory = fs::canonicalize(directory).map_err(|e| e.to_string())?;
+    let mut profiles = vec![directory.clone()];
+    #[cfg(windows)]
+    {
+        let paths = default_paths()?;
+        if same_path(&directory, &paths.current) && retired(&paths)? && !nonempty(&paths.legacy)? {
+            profiles.push(paths.legacy);
+        }
+    }
+    Ok(profiles)
 }
 
 fn moving_message(paths: &DefaultPaths) -> String {
@@ -261,6 +277,10 @@ pub fn migrate_default(paths: &DefaultPaths) -> Result<(), String> {
     if paths.current == paths.legacy {
         return Ok(());
     }
+    // The ordinary launch lock is inside the destination profile, which must
+    // not be created/populated before deciding whether to move the old one.
+    // Serialize that decision outside both profiles, including its marker.
+    let _migration_lock = migration_lock(paths)?;
     let selected = locate(paths)?;
     if selected != paths.legacy {
         // Mark an established current profile too: deleting it must never resurrect a later old profile.
@@ -275,9 +295,8 @@ pub fn migrate_default(paths: &DefaultPaths) -> Result<(), String> {
         return Err("Hub保存先が変更されました。やり直してください。".into());
     }
     new_guard.ensure_directory(&paths.current)?;
-    if paths.legacy.join("catalog.json").exists() {
-        crate::admin::require_profile_firewall_removed(&paths.legacy)?;
-    }
+    // Old executable/profile rules are retained for explicit removal from the
+    // new local management UI. They must not prevent access to that UI.
     let mut movement = ProfileMove::inventory(&paths.legacy, &paths.current)?;
     let web_paths =
         crate::web_admin::server::prepare_profile_relocation(&paths.legacy, &paths.current)?;
@@ -346,6 +365,46 @@ pub fn migrate_default(paths: &DefaultPaths) -> Result<(), String> {
         crate::admin::enable_profile_autostart(&paths.current).map_err(|e| format!("Hubデータの移行は {} へ完了しましたが、自動起動は再登録できませんでした。旧自動起動は解除済みです。新しいHub管理画面で自動起動を設定してください。{e}", paths.current.display()))?;
     }
     Ok(())
+}
+
+fn migration_lock(paths: &DefaultPaths) -> Result<File, String> {
+    let parent = paths
+        .marker
+        .parent()
+        .ok_or("Hub移行記録の場所が不正です。")?;
+    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    crate::maintenance::check_regular_directory(parent)?;
+    let path = paths.marker.with_extension("lock");
+    if path.try_exists().map_err(|e| e.to_string())? {
+        crate::maintenance::check_regular_file(&path)?;
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x00200000);
+    }
+    let file = options.open(path).map_err(|e| e.to_string())?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+    loop {
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => return Ok(file),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+            {
+                if std::time::Instant::now() >= deadline {
+                    return Err(
+                        "別のHubが保存先の移行を処理中です。少し待ってから開き直してください。"
+                            .into(),
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(error) => return Err(format!("Hub保存先の移行を待ち合わせできません: {error}")),
+        }
+    }
 }
 
 fn restore_autostart(registration: Option<&crate::admin::RetiredProfileAutostart>) -> String {
@@ -617,6 +676,30 @@ mod tests {
         assert!(!paths.current.exists());
     }
     #[test]
+    fn locating_a_live_profile_does_not_traverse_changing_assets() {
+        let (_temp, paths) = fixture();
+        let mut nested = paths.current.join("shared-work.assets");
+        // Traversal depth restrictions belong to offline destructive operations,
+        // not opening the management screen of an already running Hub.
+        for _ in 0..66 {
+            nested = nested.join("a");
+        }
+        fs::create_dir_all(&nested).unwrap();
+        assert_eq!(locate(&paths).unwrap(), paths.current);
+        assert!(crate::maintenance::check_regular_tree(&paths.current).is_err());
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..200 {
+                    let file = tempfile::NamedTempFile::new_in(&paths.current).unwrap();
+                    file.persist(paths.current.join("saved.json")).unwrap();
+                }
+            });
+            for _ in 0..200 {
+                assert_eq!(locate(&paths).unwrap(), paths.current);
+            }
+        });
+    }
+    #[test]
     fn two_nonempty_profiles_are_never_merged() {
         let (_temp, paths) = fixture();
         for path in [&paths.legacy, &paths.current] {
@@ -644,7 +727,7 @@ mod tests {
         assert!(paths.legacy.join("catalog.json").exists());
     }
     #[test]
-    fn a_marker_write_failure_moves_credentials_back_to_the_original_profile() {
+    fn a_post_inventory_conflict_rolls_back_credentials_and_the_moving_marker() {
         let (_temp, mut paths) = fixture();
         fs::create_dir_all(&paths.legacy).unwrap();
         fs::write(
@@ -654,8 +737,26 @@ mod tests {
         .unwrap();
         fs::write(paths.legacy.join("not-a-directory"), b"keep").unwrap();
         paths.marker = paths.current.join("not-a-directory/hub.json");
-        let error = migrate_default(&paths).unwrap_err();
-        assert!(error.contains("戻しました"));
+        let mut old_guard =
+            crate::maintenance::OfflineGuard::acquire(&paths.legacy, false).unwrap();
+        let mut new_guard =
+            crate::maintenance::OfflineGuard::acquire(&paths.current, false).unwrap();
+        new_guard.ensure_directory(&paths.current).unwrap();
+        let mut movement = ProfileMove::inventory(&paths.legacy, &paths.current).unwrap();
+        // Inject the conflict after inventory. Default resolution now takes its
+        // migration lock before inventory and rejects this artificial layout.
+        write_migration(&paths, MigrationState::Moving).unwrap();
+        assert!(movement.execute().is_err());
+        assert!(paths.current.join("device-network.json").exists());
+        let rollback = rollback_move(
+            &paths,
+            &mut movement,
+            &mut old_guard,
+            &mut new_guard,
+            None,
+            None,
+        );
+        assert!(rollback.contains("戻しました"));
         assert_eq!(
             fs::read(paths.legacy.join("device-network.json")).unwrap(),
             b"credential fixture"

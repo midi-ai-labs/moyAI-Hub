@@ -64,6 +64,7 @@ struct LaunchReply {
 struct Profile {
     directory: tempfile::TempDir,
     executable: PathBuf,
+    default_profile: bool,
 }
 
 impl Profile {
@@ -75,6 +76,7 @@ impl Profile {
         std::fs::create_dir_all(&parent).unwrap();
         Self {
             executable: executable().to_path_buf(),
+            default_profile: false,
             directory: tempfile::Builder::new()
                 .prefix("launch-")
                 .tempdir_in(parent)
@@ -103,7 +105,19 @@ impl Profile {
     }
 
     fn catalog(&self) -> PathBuf {
-        self.directory.path().join("catalog.json")
+        self.data_directory().join("catalog.json")
+    }
+
+    fn data_directory(&self) -> PathBuf {
+        if self.default_profile {
+            moyai_hub::data_paths::windows_paths(
+                &self.directory.path().join("local"),
+                &self.directory.path().join("roaming"),
+            )
+            .current
+        } else {
+            self.directory.path().to_path_buf()
+        }
     }
 
     fn hosting_path(&self) -> PathBuf {
@@ -112,12 +126,15 @@ impl Profile {
 
     async fn command(&self, args: &[&str]) -> Output {
         let mut command = tokio::process::Command::new(&self.executable);
-        command
-            .args(args)
-            .arg("--data-dir")
-            .arg(self.directory.path())
-            .stdin(Stdio::null())
-            .kill_on_drop(true);
+        command.args(args).stdin(Stdio::null()).kill_on_drop(true);
+        if self.default_profile {
+            command
+                .env_remove("MOYAI_HUB_DATA_DIR")
+                .env("LOCALAPPDATA", self.directory.path().join("local"))
+                .env("APPDATA", self.directory.path().join("roaming"));
+        } else {
+            command.arg("--data-dir").arg(self.directory.path());
+        }
         #[cfg(windows)]
         command.creation_flags(0x08000000);
         tokio::time::timeout(Duration::from_secs(25), command.output())
@@ -153,7 +170,7 @@ impl Profile {
         assert!(output.status.success());
         tokio::time::timeout(Duration::from_secs(8), async {
             loop {
-                let mut closed = !self.directory.path().join("host-control.json").exists();
+                let mut closed = !self.data_directory().join("host-control.json").exists();
                 for endpoint in endpoints {
                     if TcpStream::connect(endpoint).await.is_ok() {
                         closed = false;
@@ -176,14 +193,14 @@ impl Drop for Profile {
     fn drop(&mut self) {
         // Match the existing host-process test cleanup: authenticated control for
         // this exact disposable profile only, never a PID/name-based host kill.
-        if !self.directory.path().join("host-control.json").exists() {
+        if !self.data_directory().join("host-control.json").exists() {
             return;
         }
         let mut command = std::process::Command::new(&self.executable);
         command
             .arg("--stop")
             .arg("--data-dir")
-            .arg(self.directory.path())
+            .arg(self.data_directory())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -321,6 +338,67 @@ async fn launch_first_profile_reports_setup_and_keeps_web_running() {
         false
     );
     profile.stop(&client, &[web]).await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn default_migration_and_repeated_launches_keep_one_host() {
+    let mut profile = Profile::new();
+    let first = profile.launch(true, true).await;
+    let client = profile.connect().await;
+    let web = assert_web(&client, &first).await;
+    profile.stop(&client, &[web]).await;
+    let entries: Vec<_> = std::fs::read_dir(profile.directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    let paths = moyai_hub::data_paths::windows_paths(
+        &profile.directory.path().join("local"),
+        &profile.directory.path().join("roaming"),
+    );
+    std::fs::create_dir_all(&paths.legacy).unwrap();
+    for entry in entries {
+        std::fs::rename(&entry, paths.legacy.join(entry.file_name().unwrap())).unwrap();
+    }
+    profile.default_profile = true;
+    for _ in 0..3 {
+        let args = ["--launch", "--no-browser"];
+        let (a, b, c, d) = tokio::join!(
+            profile.command(&args),
+            profile.command(&args),
+            profile.command(&args),
+            profile.command(&args)
+        );
+        let outputs = [a, b, c, d];
+        let replies: Vec<LaunchReply> = outputs
+            .iter()
+            .filter_map(|value| serde_json::from_slice(&value.stdout).ok())
+            .collect();
+        let client = profile.connect().await;
+        // Stop before asserting so a failure never strands a test-owned host.
+        profile.stop(&client, &[]).await;
+        for output in &outputs {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert_eq!(replies.len(), 4);
+        assert_eq!(
+            replies
+                .iter()
+                .filter(|value| !value.already_running)
+                .count(),
+            1
+        );
+        assert!(
+            replies
+                .iter()
+                .all(|value| value.pid == replies[0].pid && value.web_url == replies[0].web_url)
+        );
+    }
+    assert!(!paths.legacy.exists());
 }
 
 #[tokio::test]

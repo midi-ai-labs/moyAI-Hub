@@ -4,6 +4,84 @@ const PASSWORD: &str = "correct horse battery staple";
 const OTHER_PASSWORD: &str = "different horse battery staple";
 const NOW: u64 = 1_000_000;
 
+#[test]
+fn browser_sessions_survive_elapsed_time_but_logout_and_revocation_still_apply() {
+    let conn = database();
+    let owner = web_access::local_owner(&conn, NOW).unwrap();
+    let session = web_access::issue(&conn, &owner.user_id, None, NOW).unwrap();
+    let later = NOW + 500 * 24 * 60 * 60 * 1000;
+    assert_eq!(
+        authenticate(
+            &conn,
+            &session.token,
+            SessionAudience::WebAdmin,
+            None,
+            later
+        )
+        .unwrap(),
+        owner
+    );
+    assert!(
+        authenticate(
+            &conn,
+            &session.token,
+            SessionAudience::SharedWork,
+            None,
+            later
+        )
+        .is_err()
+    );
+    logout(&conn, &session.token, SessionAudience::WebAdmin, None).unwrap();
+    assert!(
+        authenticate(
+            &conn,
+            &session.token,
+            SessionAudience::WebAdmin,
+            None,
+            later
+        )
+        .is_err()
+    );
+    let session = web_access::issue(&conn, &owner.user_id, None, later).unwrap();
+    conn.execute(
+        "UPDATE identity_users SET credential_generation=credential_generation+1 WHERE id=?1",
+        [&owner.user_id],
+    )
+    .unwrap();
+    assert!(
+        authenticate(
+            &conn,
+            &session.token,
+            SessionAudience::WebAdmin,
+            None,
+            later
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn browser_session_limit_keeps_the_most_recent_logins() {
+    let conn = database();
+    let owner = web_access::local_owner(&conn, NOW).unwrap();
+    let sessions: Vec<_> = (0..18)
+        .map(|i| web_access::issue(&conn, &owner.user_id, None, NOW + i).unwrap())
+        .collect();
+    for (index, session) in sessions.iter().enumerate() {
+        assert_eq!(
+            authenticate(
+                &conn,
+                &session.token,
+                SessionAudience::WebAdmin,
+                None,
+                NOW + SESSION_TTL_MS + 1
+            )
+            .is_ok(),
+            index >= 2
+        );
+    }
+}
+
 fn database() -> Connection {
     let conn = crate::shared_work::SharedWork::open(std::path::Path::new(":memory:"))
         .unwrap()

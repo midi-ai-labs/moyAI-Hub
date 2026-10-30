@@ -2,7 +2,7 @@
 
 [Hubのリリース](https://github.com/midi-ai-labs/moyAI-Hub/releases) · [moyAI Desktop](https://github.com/midi-ai-labs/moyAI) · [チームの準備](docs/team-preparation.md)
 
-moyAI DesktopのAI接続、PCの参加、共有プロジェクトを管理するRustサーバーです。管理画面は通常のWebブラウザーで開きます。Hub 1.0.2のWindows x64単体版は、Program FilesへのSetupと、Hub専用の保存データ初期化を同梱します。Hub自体にTauriやWebView2は不要です。[1.0.2の変更点](docs/release/v1.0.2.md)・[Windowsへの導入と削除](docs/windows-setup.md)を参照してください。
+moyAI DesktopのAI接続、PCの参加、共有プロジェクトを管理するRustサーバーです。管理画面は通常のWebブラウザーで開きます。Hub 1.0.3のWindows x64単体版は、Program FilesへのSetupと、Hub専用の保存データ初期化を同梱します。Hub自体にTauriやWebView2は不要です。[1.0.3の変更点](docs/release/v1.0.3.md)・[Windowsへの導入と削除](docs/windows-setup.md)を参照してください。
 
 管理サーバーにはHubを、依頼を送る操作PCや仕事を実行するPCには[moyAI Desktop](https://github.com/midi-ai-labs/moyAI)を用意します。Desktopの導入は[Windowsへの導入と更新](https://github.com/midi-ai-labs/moyAI/blob/main/docs/user/windows-setup.md)を参照してください。DesktopとHubの配布物は、それぞれの[Desktopリリース](https://github.com/midi-ai-labs/moyAI/releases)・[Hubリリース](https://github.com/midi-ai-labs/moyAI-Hub/releases)から取得できます。
 

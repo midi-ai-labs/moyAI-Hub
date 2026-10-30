@@ -32,6 +32,7 @@ test("Hub launch, close and reopen require no password and reject a used ticket"
     await expect(page).toHaveURL(hub.url);
     const cookie = (await page.context().cookies(hub.url)).find(value => value.name === "moyai_admin");
     expect(cookie).toMatchObject({ httpOnly:true, sameSite:"Strict", path:"/admin" });
+    expect(cookie.expires - Date.now()/1000).toBeGreaterThan(300 * 24 * 60 * 60);
     expect(await page.evaluate(() => document.cookie)).toBe("");
     await testInfo.attach("passwordless-management", { body:await page.screenshot(), contentType:"image/png" });
     await page.locator("#web-auth-logout").click();
@@ -81,6 +82,27 @@ test("logout hides a delayed management result and revokes another open tab", as
         await expect(other.locator("#web-auth-title")).toBeVisible();
         await expect(page.locator("#management-app")).toBeHidden();
     } finally { await other.close(); await provider.close(); }
+});
+
+test("browser permission survives Hub restart and an existing tab accepts a fresh launch ticket", async ({page,context,hub},testInfo) => {
+    await bootstrap(page,hub);
+    const before = (await context.cookies(hub.url)).find(value=>value.name === "moyai_admin");
+    // Hold polling during restart so the original document retains its cached
+    // process CSRF until the launcher navigates by fragment alone.
+    await page.route("**/admin/command", route=>route.abort());
+    await hub.restart();
+    const reopened = await context.newPage();
+    await reopened.goto(hub.url);
+    await expect(reopened.locator("#management-app")).toBeVisible();
+    expect((await context.cookies(hub.url)).find(value=>value.name === "moyai_admin").value).toBe(before.value);
+    await reopened.close();
+    const grant=await hub.command("hub_web_open");
+    await page.unroute("**/admin/command");
+    await page.goto(grant.url);
+    await expect(page.locator("#management-app")).toBeVisible();
+    await expect(page).toHaveURL(hub.url);
+    await expect.poll(async()=>(await context.cookies(hub.url)).find(value=>value.name === "moyai_admin").value).not.toBe(before.value);
+    await testInfo.attach("permission-after-restart", {body:await page.screenshot(),contentType:"image/png"});
 });
 
 test("a cookie session replaced in another tab cannot execute the old document's commands", async ({ page, context, hub }) => {

@@ -348,6 +348,8 @@ fn browser_command(command: &str) -> bool {
             | "hub_autostart_set"
             | "hub_firewall_preview"
             | "hub_firewall_status"
+            | "hub_firewall_retired"
+            | "hub_firewall_remove_retired"
             | "hub_firewall_export"
             | "hub_firewall_apply"
             | "hub_firewall_remove"
@@ -424,6 +426,8 @@ async fn command(
             | "hub_autostart_set"
             | "hub_firewall_preview"
             | "hub_firewall_status"
+            | "hub_firewall_retired"
+            | "hub_firewall_remove_retired"
             | "hub_firewall_export"
             | "hub_firewall_apply"
             | "hub_firewall_remove"
@@ -438,7 +442,7 @@ async fn command(
     // release its concurrency slot while that actual work is still running.
     let timeout_seconds = if matches!(
         input.command.as_str(),
-        "hub_firewall_apply" | "hub_firewall_remove"
+        "hub_firewall_apply" | "hub_firewall_remove" | "hub_firewall_remove_retired"
     ) {
         125
     } else {
