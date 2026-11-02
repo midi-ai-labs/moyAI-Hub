@@ -1,5 +1,7 @@
 # Hubのブラウザー試験
 
+操作・状態の一覧は [coverage.md](coverage.md)、Desktop/Runnerへ結果が伝わる境界は [HubとDesktopの結合監査](../../../moyAI/tests/desktop_e2e/HUB_DESKTOP_COVERAGE.md) を参照してください。browser全ケースの成功と結合全体の合格は区別します。公開管理操作とspec一覧の参照漏れは `tests/gui_coverage.test.mjs` が検査します。
+
 Playwrightで実際のHubサーバーとブラウザーを起動します。共有fixtureは隔離したHubのnative Hostで一度限りの起動ticketを発行し、実際の `/admin/access` で管理cookieへ交換します。認証専用ケースはこの準備を無効にし、起動URL・利用終了・再起動ticket・旧sessionの失効を画面から操作します。管理APIのmock、保存データの直接編集、証明書の検証無効化は行いません。モデルホストのメタデータと参加端末の応答は、明示した試験用provider・participantを使います。
 
 ## 準備と実行

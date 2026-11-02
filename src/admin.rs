@@ -667,6 +667,9 @@ struct Edit {
     revision: String,
     deployment_id: String,
     label: String,
+    /// Omitted preserves the shared name, including requests from older management pages.
+    #[serde(default)]
+    model_label: Option<String>,
     capacity: u32,
     enabled: bool,
     remove: bool,
@@ -724,13 +727,16 @@ fn hub_edit(admin: &Admin, request: Edit) -> Result<(), String> {
                 .ok_or("配置がありません。")?;
             target.label = request.label.trim().to_owned();
             target.enabled = request.enabled;
+            let model = catalog
+                .models
+                .iter_mut()
+                .find(|model| model.id == row.logical_model_id)
+                .ok_or("論理モデルがありません。")?;
+            if let Some(label) = &request.model_label {
+                model.label = label.trim().to_owned();
+            }
             if let Some(prompt) = &request.system_prompt {
-                catalog
-                    .models
-                    .iter_mut()
-                    .find(|model| model.id == row.logical_model_id)
-                    .ok_or("論理モデルがありません。")?
-                    .system_prompt = crate::catalog::normalize_model_system_prompt(prompt)
+                model.system_prompt = crate::catalog::normalize_model_system_prompt(prompt)
                     .map_err(|error| error.to_string())?;
             }
             catalog
@@ -950,6 +956,96 @@ async fn hub_start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn model_name_edits_update_the_shared_catalog_without_renaming_other_deployments() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("catalog.json");
+        let admin = Admin::open(path.clone()).unwrap();
+        edit_catalog(&admin, 1, |catalog| {
+            catalog.models = ["shared", "other"]
+                .map(|id| LogicalModel {
+                    id: id.into(),
+                    label: id.into(),
+                    capabilities: Default::default(),
+                    system_prompt: String::new(),
+                })
+                .into();
+            catalog.capacity_pools.push(CapacityPool {
+                id: "pool".into(),
+                label: "Pool".into(),
+                max_concurrent: 2,
+            });
+            catalog.deployments = ["one", "two"]
+                .map(|id| Deployment {
+                    id: id.into(),
+                    label: id.into(),
+                    logical_model_id: "shared".into(),
+                    capacity_pool_id: "pool".into(),
+                    endpoint: "http://localhost:1234/v1".into(),
+                    provider_model: "shared".into(),
+                    provider_profile: "openai_compatible_chat".into(),
+                    upstream_credential_id: None,
+                    enabled: true,
+                })
+                .into();
+            Ok(())
+        })
+        .unwrap();
+        let request = json!({"revision":"2","deployment_id":"one","label":"host one","model_label":"  共通の新しい名前  ","capacity":2,"enabled":true,"remove":false});
+        admin
+            .dispatch("hub_edit", json!({"request":request}))
+            .await
+            .unwrap();
+        let saved = admin.dispatch("hub_snapshot", json!({})).await.unwrap()["store"].clone();
+        assert_eq!(saved["revision"], "3");
+        assert_eq!(saved["catalog"]["models"][0]["label"], "共通の新しい名前");
+        assert_eq!(saved["catalog"]["models"][1]["label"], "other");
+        assert_eq!(saved["catalog"]["deployments"][0]["label"], "host one");
+        assert_eq!(saved["catalog"]["deployments"][1]["label"], "two");
+        assert!(
+            admin
+                .dispatch("hub_edit", json!({"request":request}))
+                .await
+                .is_err()
+        );
+        let mut invalid = request.clone();
+        invalid["revision"] = json!("3");
+        invalid["model_label"] = json!("   ");
+        assert!(
+            admin
+                .dispatch("hub_edit", json!({"request":invalid}))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            admin.dispatch("hub_snapshot", json!({})).await.unwrap()["store"],
+            saved
+        );
+        drop(admin);
+        let reopened = Admin::open(path).unwrap();
+        assert_eq!(
+            reopened.dispatch("hub_snapshot", json!({})).await.unwrap()["store"],
+            saved
+        );
+        let mut legacy = request;
+        legacy["revision"] = json!("3");
+        legacy["label"] = json!("legacy host name");
+        legacy.as_object_mut().unwrap().remove("model_label");
+        reopened
+            .dispatch("hub_edit", json!({"request":legacy}))
+            .await
+            .unwrap();
+        let legacy_saved = reopened.dispatch("hub_snapshot", json!({})).await.unwrap();
+        assert_eq!(
+            legacy_saved["store"]["catalog"]["models"][0]["label"],
+            "共通の新しい名前"
+        );
+        assert_eq!(
+            legacy_saved["store"]["catalog"]["deployments"][0]["label"],
+            "legacy host name"
+        );
+    }
 
     #[test]
     fn oversized_catalog_edit_preserves_saved_and_live_store() {

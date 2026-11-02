@@ -435,7 +435,8 @@ el("model-rows").addEventListener("click", event => {
         row,
         revision: snapshot.store.revision
     };
-    input("edit-label").value = row.deployment.label;
+    input("edit-label").value = snapshot.store.catalog.models.find(model => model.id === row.deployment.logical_model_id)?.label ?? "";
+    input("edit-registration-label").value = row.deployment.label;
     el<HTMLTextAreaElement>("edit-system-prompt").value = snapshot.store.catalog.models.find(model => model.id === row.deployment.logical_model_id)?.system_prompt ?? "";
     input("edit-api-key").value = "";
     input("edit-api-key").disabled = false;
@@ -478,7 +479,8 @@ async function saveEdit(remove: boolean) {
             request: {
                 revision: editTarget.revision,
                 deployment_id: editTarget.row.deployment.id,
-                label: input("edit-label").value,
+                label: input("edit-registration-label").value,
+                model_label: remove ? null : input("edit-label").value,
                 system_prompt: remove ? null : el<HTMLTextAreaElement>("edit-system-prompt").value,
                 capacity: Number(input("edit-capacity").value),
                 enabled: input("edit-enabled").checked,

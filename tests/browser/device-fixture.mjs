@@ -90,6 +90,8 @@ export async function createDeviceParticipant(network, label, windowsUsername = 
             if (!certificate || ![approvalId, attemptId].every(id => typeof id === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(id)) || !Number.isSafeInteger(generation) || generation < 1) throw new Error("Approval consumption requires an enrolled Runner and exact approval/attempt identities");
             return request(`runner/approvals/${approvalId}/consume`, { attempt_id: attemptId, generation }, true, null, "shared");
         },
+        sharedUploadInput: (projectId, upload) => request(`projects/${encodeURIComponent(projectId)}/assets`, upload, true, humanToken, "shared"),
+        sharedAsset: id => request(`assets/${encodeURIComponent(id)}`, undefined, true, humanToken, "shared"),
         sharedTemplates: templates => request("runner/templates", { templates }, true, null, "shared"),
         sharedProvisioning: () => request("runner/provisioning", undefined, true, null, "shared"),
         sharedProvisionReceipt: receipt => request("runner/provisioning", receipt, true, null, "shared"),

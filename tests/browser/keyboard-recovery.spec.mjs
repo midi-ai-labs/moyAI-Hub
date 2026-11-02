@@ -91,7 +91,7 @@ test("Keyboard model dialog keeps focus, validates edits and cancels with Escape
             }
         }
         await testInfo.attach("keyboard-modal-traversal", { contentType: "application/json", body: Buffer.from(JSON.stringify(traversal, null, 2)) });
-        for (const id of ["close-edit", "edit-label", "edit-capacity", "edit-enabled", "remove-model", "save-edit"]) expect(visited.has(id), `${id} is keyboard reachable`).toBe(true);
+        for (const id of ["close-edit", "edit-label", "edit-registration-label", "edit-capacity", "edit-enabled", "remove-model", "save-edit"]) expect(visited.has(id), `${id} is keyboard reachable`).toBe(true);
         await tabTo(page, page.locator("#edit-label"), { dialog });
         await replaceFocusedText(page, "Unsaved keyboard draft");
         await screenshot(page, testInfo, "keyboard-dialog-draft");
@@ -130,9 +130,10 @@ test("Keyboard model dialog keeps focus, validates edits and cancels with Escape
         await expect(page.locator("#model-rows")).toContainText("メンテナンス");
         expect(editRequests).toHaveLength(1);
         expect(editRequests[0].request).toMatchObject({ deployment_id: deployment.id, revision: before.store.revision,
-            label: "Keyboard model saved", capacity: 3, enabled: false, remove: false });
+            label: "Keyboard model", model_label: "Keyboard model saved", capacity: 3, enabled: false, remove: false });
         const saved = await hub.command("hub_snapshot");
-        expect(saved.deployments[0].deployment).toMatchObject({ id: deployment.id, label: "Keyboard model saved", enabled: false });
+        expect(saved.deployments[0].deployment).toMatchObject({ id: deployment.id, label: "Keyboard model", enabled: false });
+        expect(saved.store.catalog.models.find(model => model.id === deployment.logical_model_id).label).toBe("Keyboard model saved");
         expect(saved.store.catalog.capacity_pools.find(pool => pool.id === deployment.capacity_pool_id).max_concurrent).toBe(3);
         await screenshot(page, testInfo, "keyboard-model-saved");
         expect(errors).toEqual([]);

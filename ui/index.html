@@ -480,8 +480,13 @@
         </p>
         <label>
           表示名
-          <input id="edit-label" required maxlength="160"/>
+          <input id="edit-label" required maxlength="160" aria-describedby="edit-label-help"/>
         </label>
+        <p id="edit-label-help" class="footnote">Desktopのモデル選択にも表示される名前です。同じモデルを使うすべての登録先で共通です。</p>
+        <label>登録先の名前
+          <input id="edit-registration-label" required maxlength="160"/>
+        </label>
+        <p class="footnote">この接続先をHub内で識別する名前です。ほかの登録先の名前は変更しません。</p>
         <label>システムプロンプト（任意）
           <textarea id="edit-system-prompt" rows="5" spellcheck="false"></textarea>
         </label>

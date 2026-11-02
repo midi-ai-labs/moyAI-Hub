@@ -2,7 +2,7 @@
 
 [Hubのリリース](https://github.com/midi-ai-labs/moyAI-Hub/releases) · [moyAI Desktop](https://github.com/midi-ai-labs/moyAI) · [チームの準備](docs/team-preparation.md)
 
-moyAI DesktopのAI接続、PCの参加、共有プロジェクトを管理するRustサーバーです。管理画面は通常のWebブラウザーで開きます。Hub 1.0.4のWindows x64単体版は、Program FilesへのSetupと、Hub専用の保存データ初期化を同梱します。Hub自体にTauriやWebView2は不要です。[1.0.4の変更点](docs/release/v1.0.4.md)・[Windowsへの導入と削除](docs/windows-setup.md)を参照してください。
+moyAI DesktopのAI接続、PCの参加、共有プロジェクトを管理するRustサーバーです。管理画面は通常のWebブラウザーで開きます。Hub 1.0.5では、モデルの表示名をDesktopへ反映する処理を修正しました。Windows x64単体版にはProgram FilesへのSetupと、Hub専用の保存データ初期化を同梱します。Hub自体にTauriやWebView2は不要です。[1.0.5の変更点](docs/release/v1.0.5.md)・[Windowsへの導入と削除](docs/windows-setup.md)を参照してください。
 
 管理サーバーにはHubを、依頼を送る操作PCや仕事を実行するPCには[moyAI Desktop](https://github.com/midi-ai-labs/moyAI)を用意します。Desktopの導入は[Windowsへの導入と更新](https://github.com/midi-ai-labs/moyAI/blob/main/docs/user/windows-setup.md)を参照してください。DesktopとHubの配布物は、それぞれの[Desktopリリース](https://github.com/midi-ai-labs/moyAI/releases)・[Hubリリース](https://github.com/midi-ai-labs/moyAI-Hub/releases)から取得できます。
 
@@ -61,11 +61,15 @@ PCごとにIDと鍵を持ち、同じWindowsユーザー名でも別PCを自動�
 
 Hubはモデルの登録先ごとにAPIキーを保存し、モデル一覧の確認と生成に使います。各Desktopへの入力は不要です。登録先の「編集」で、空欄のまま保存すると現在のキーを保持し、新しいキーを入力すると変更します。削除する場合は **保存時にAPIキーを削除する** を選びます。
 
+編集画面の **表示名** はDesktopのモデル選択にも反映され、同じモデルを使うすべての登録先で共通です。**登録先の名前** はホストや接続先を区別するための名前で、その登録先だけに保存します。
+
 Hubの **最初に使う共有モデル** ではMain、Sub（サイドチャット）、Approve（承認判定）の標準モデルをまとめて保存します。同じ登録モデルを複数の用途で使えます。Mainにはツール利用対応モデルを選び、SubとApproveには通常のチャットモデルも選べます。SubとApproveの未指定値をMainで補完しません。
 
 モデルには任意の指示を16,384 Unicode文字まで保存できます。Hubのcatalog保存ファイル全体は4 MiBまでで、登録数・指示・変更履歴を含めたJSONのバイト数で検査します。超過する変更は拒否し、現在の設定を保持します。指示を短くするか、不要なモデル登録を削除してください。
 
 Hub設定済みのDesktopは共通の **AIの接続** で用途ごとに標準または登録済みモデルを選びます。Main、Sub、Approveは別選択で、Runnerは実行PCのMainを使います。Approveの選択は既存のGuardian判定に使うモデルを指定します。Hub停止中は手入力先へ自動では切り替わりません。Desktopの接続リセットはHub応答なしで使えます。
+
+Hubでモデル設定を変更すると、接続済みDesktopは更新を自動取得し、用途ごとに再確認を求めます。個別の選択や入力中の内容は保持します。開始済みのAI応答は開始時のモデルで完了しますが、次のAI要求（ツール実行後や承認後の続行も含む）は確認・保存まで停止します。実行済みの処理は元に戻りません。設定で **最新情報を取得** し、使用する用途の **モデル選択を保存** を押してから続きを依頼してください。
 
 モデル通信は別プロセスのGatewayが中継し、そのHTTP同時接続数を制限します。モデルのロード・GPU容量・生成の終了はAIホストが管理します。[Gateway](docs/gateway.md)、[要求の待ち順序](docs/request-queue.md)、[子エージェントのモデル経路](docs/delegated-execution.md)に境界を記載しています。
 

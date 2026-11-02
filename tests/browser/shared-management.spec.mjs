@@ -1,6 +1,8 @@
 import { test, expect } from "./fixture.mjs";
 import { createDeviceParticipant } from "./device-fixture.mjs";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { DatabaseSync } from "node:sqlite";
+import path from "node:path";
 
 
 async function sharedSnapshot(page,hub) {
@@ -33,6 +35,66 @@ async function enroll(page,hub,label) {
   await page.locator("#network-clients-refresh").click();
   return {participant,deviceId};
 }
+
+test("maintenance releases only the confirmed attempt and retention preserves queued input",async({page,hub},info)=>{
+  test.setTimeout(120_000);
+  await open(page,hub);
+  await page.locator('nav a[href="#device-network"]').click();
+  await page.locator("#network-ip").fill("127.0.0.1"); await page.locator("#network-port").fill(String(hub.networkPort));
+  await page.locator("#network-start").click(); await page.locator("#network-stop").waitFor();
+  const {participant,deviceId}=await enroll(page,hub,"保守試験PC");
+  await participant.sharedDeviceSession();
+  await page.locator('nav a[href="#shared-administration"]').click();
+  await operation(page,"save_project"); await page.locator("#shared-admin-label").fill("保守の対象");
+  await page.getByLabel("保守試験PCを操作に使う",{exact:true}).check();
+  await page.getByLabel("保守試験PCで仕事を実行する",{exact:true}).check(); await save(page);
+  const provision=(await participant.sharedProvisioning())[0];
+  await participant.sharedProvisionReceipt({environment_id:provision.environment_id,template_id:provision.template_id,generation:provision.generation,success:true,error:null});
+  const snapshot=await sharedSnapshot(page,hub), projectId=snapshot.projects[0].id;
+  const submit=refs=>participant.sharedCall("submit",{request_id:randomUUID(),project_id:projectId,environment_id:provision.environment_id,
+    title:"保守試験",input:{version:2,prompt:"protocol fixture; no process is started",input_refs:refs},descendant_budget:0});
+  const first=await submit([]), second=await submit([]);
+  const claim=()=>participant.sharedCall("claim",{environment_ids:[provision.environment_id]});
+  const held=await claim(); expect(held.job.id).toBe(first.id);
+  const stillHeld=async()=>{const value=await claim(); expect(value===null || value.attempt_id===held.attempt_id).toBe(true);};
+  await stillHeld();
+  await participant.sharedCall("report",{event_id:randomUUID(),attempt_id:held.attempt_id,generation:held.generation,outcome:{kind:"uncertain",reason:"Fixture has no process; hold the resource until explicit operator confirmation"}});
+  await page.locator('[data-sa-tab="maintenance"]').click(); await page.locator("#shared-admin-refresh").click();
+  await operation(page,"settle_attempt",held.attempt_id);
+  await page.locator("#shared-admin-reason").fill("試験用protocol応答だけで、実プロセスは起動していないことを確認");
+  await page.locator("#shared-admin-save").click();
+  await expect(page.locator("#shared-admin-form")).toBeVisible(); await stillHeld();
+  await page.locator('input[name="acknowledge_stopped"]').check(); await save(page);
+  const resumed=await claim(); expect(resumed.job.id).toBe(second.id); expect(resumed.attempt_id).not.toBe(held.attempt_id);
+  await expect(participant.sharedCall("report",{event_id:randomUUID(),attempt_id:held.attempt_id,generation:held.generation,outcome:{kind:"started"}})).rejects.toThrow();
+  await participant.sharedCall("report",{event_id:randomUUID(),attempt_id:resumed.attempt_id,generation:resumed.generation,outcome:{kind:"finished",success:false,result:{fixture:true},resources_released:true}});
+  await info.attach("maintenance-confirmed-attempt",{body:await page.locator("#shared-administration").screenshot(),contentType:"image/png"});
+  const bytes=Buffer.from("retention fixture bytes"), upload=name=>({request_id:randomUUID(),name,content_base64:bytes.toString("base64"),sha256:createHash("sha256").update(bytes).digest("hex")});
+  const unused=await participant.sharedUploadInput(projectId,upload("unused.txt"));
+  const retained=await participant.sharedUploadInput(projectId,upload("queued-input.txt"));
+  await submit([retained.id]);
+  // Only test timestamps are aged while the Hub is stopped. The records and
+  // actual bytes came through its public authenticated API, not seeded SQL rows.
+  expect((await hub.close()).pass).toBe(true);
+  const db=new DatabaseSync(path.join(hub.dataDirectory,"shared-work.sqlite3"));
+  try { expect(db.prepare("UPDATE shared_assets SET created_at_ms=? WHERE id IN (?,?)").run(Date.UTC(2020,0,1),unused.id,retained.id).changes).toBe(2); }
+  finally { db.close(); }
+  await info.attach("retention-time-fixture",{body:Buffer.from(JSON.stringify({aged_asset_ids:[unused.id,retained.id],created_at_ms:Date.UTC(2020,0,1),real_time_wait:false,runner_process:false,device_id:deviceId})),contentType:"application/json"});
+  await hub.restart(); await open(page,hub);
+  await page.locator('[data-sa-tab="storage"]').click(); await operation(page,"prune_shared_data");
+  await page.locator("#shared-admin-cutoff").fill("2021-01-01"); await page.locator("#shared-admin-preview").click();
+  await expect(page.locator("#shared-admin-preview-result")).toContainText(`1件 / ${bytes.length} bytes`);
+  await page.locator('input[name="preview_confirmed"]').check(); await save(page);
+  const pruned=await sharedSnapshot(page,hub);
+  expect(pruned.storage.purged_asset_count).toBe(1); expect(pruned.storage.retained_bytes).toBe(bytes.length);
+  await page.locator('nav a[href="#device-network"]').click();
+  if(!(await hub.observeNetwork()).server.running) { await page.locator("#network-start").click(); await page.locator("#network-stop").waitFor(); }
+  await participant.sharedDeviceSession();
+  await expect(participant.sharedAsset(unused.id)).rejects.toThrow(/404/);
+  expect((await participant.sharedAsset(retained.id)).content_base64).toBe(bytes.toString("base64"));
+  await page.locator('nav a[href="#shared-administration"]').click();
+  await info.attach("retention-nonempty-result",{body:await page.locator("#shared-administration").screenshot(),contentType:"image/png"});
+});
 
 test("one project form assigns both PC purposes and waits for the execution PC to choose its local folder", async ({page,hub},info)=>{
   test.setTimeout(120_000);

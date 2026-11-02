@@ -90,6 +90,8 @@ test("Model registration, profile discovery, edit and deletion use the real cata
         await page.locator("#save-edit").click();
         await expect(page.locator("#edit-dialog")).not.toBeVisible();
         await expect(row).toContainText("Alpha maintained");
+        expect((await hub.command("hub_snapshot")).store.catalog.models[0].label).toBe("Alpha maintained");
+        await expect(page.locator("#team-standard-status")).toContainText("Main：Alpha maintained");
         expect((await hub.command("hub_snapshot")).store.catalog.models[0].system_prompt).toBe(editedPrompt);
         await expect(row).toContainText("メンテナンス");
         provider.setModels([]);
