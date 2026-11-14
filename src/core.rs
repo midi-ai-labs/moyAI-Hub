@@ -36,6 +36,7 @@ struct Client {
     activity: ClientActivity,
     contexts: BTreeMap<String, RouteContext>,
     closed_delegations: BTreeMap<String, String>,
+    retired_delegation_through: Option<String>,
 }
 
 #[derive(Clone)]
@@ -256,6 +257,19 @@ impl HubCore {
         observed_ip: &str,
         now_ms: u64,
     ) -> Result<(), HubError> {
+        self.register_client_in_registry(id, label, observed_ip, now_ms, std::iter::empty(), false)
+            .map(|_| ())
+    }
+
+    pub(crate) fn register_client_in_registry<'a>(
+        &mut self,
+        id: &str,
+        label: &str,
+        observed_ip: &str,
+        now_ms: u64,
+        registry_ids: impl Iterator<Item = &'a String>,
+        registry_full: bool,
+    ) -> Result<Option<String>, HubError> {
         check_token(id)?;
         check_text(label, 256)?;
         check_text(observed_ip, 128)?;
@@ -263,11 +277,20 @@ impl HubCore {
             client.label = label.to_owned();
             client.observed_ip = observed_ip.to_owned();
             client.last_seen_ms = now_ms;
-            return Ok(());
+            return Ok(None);
         }
-        if self.clients.len() >= MAX_CLIENTS {
-            return Err(HubError::RegistryFull);
-        }
+        let retired = if registry_full || self.clients.len() >= MAX_CLIENTS {
+            // A listener can retire only one of its own abandoned registrations.
+            let old = registry_ids
+                .filter_map(|id| self.stale_idle_since(id, now_ms).map(|seen| (seen, id)))
+                .min()
+                .map(|(_, id)| id.clone())
+                .ok_or(HubError::RegistryFull)?;
+            self.remove_client(&old)?;
+            Some(old)
+        } else {
+            None
+        };
         self.clients.insert(
             id.to_owned(),
             Client {
@@ -278,9 +301,10 @@ impl HubCore {
                 activity: ClientActivity::Idle,
                 contexts: BTreeMap::new(),
                 closed_delegations: BTreeMap::new(),
+                retired_delegation_through: None,
             },
         );
-        Ok(())
+        Ok(retired)
     }
 
     pub fn heartbeat(
@@ -366,6 +390,24 @@ impl HubCore {
         self.permits
             .retain(|_, permit| permit.permit.client_id != id);
         Ok(())
+    }
+
+    pub(crate) fn stale_idle_since(&self, id: &str, now_ms: u64) -> Option<u64> {
+        let client = self.clients.get(id)?;
+        // A missed heartbeat alone cannot tell us that a provider has finished.
+        let owns_work = client.contexts.values().any(|context| {
+            context.active_turn.is_some()
+                || context.waiting_turn.is_some()
+                || context.delegated.is_some()
+        }) || self
+            .permits
+            .values()
+            .any(|permit| permit.permit.client_id == id)
+            || self
+                .request_queue
+                .iter()
+                .any(|ticket| ticket.client_id == id);
+        (self.is_stale(client, now_ms) && !owns_work).then_some(client.last_seen_ms)
     }
 
     pub fn save_selection(

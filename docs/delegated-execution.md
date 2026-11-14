@@ -16,12 +16,14 @@ Desktop のローカル子エージェントは、Main / Subで確認済みの�
 
 finish/cancel は既存 `{id,context,turn_id}` に `delegated:true` を付けます。省略時は通常のMain/Sub/Approve context操作です。子を閉じる操作は exact 内部 context の queue / permit を取り除き、その Gateway 通信だけを閉じます。親の finish/cancel は子や兄弟の scope を暗黙に閉じません。親からの一括取消の対象と時期は Desktop の実行 owner が管理し、各子の取消を送ります。
 
-最初の prepare より先に取消が届いた場合も、当該 client / 親 / execution ID を終了済みとして保持します。遅れて到着した prepare は子を復活させません。同じ close は同じ親なら冪等です。終了済み ID や別の親に属する ID で子を再作成することはできません。
+最初の prepare より先に取消が届いた場合も、当該 client / 親 / execution ID を終了済みとして扱います。遅れて到着した prepare は子を復活させません。個別に保持している終了IDに同じ親から close が届くと成功を返します。別の親の実行を閉じることはできません。
 
 heartbeat の `active_turns` item にも `delegated:true` を付け、同じ親 context と子 turn ID を渡します。サーバーは既存の有効な子 lease だけを延長します。heartbeat で子 context を作成したり、終了済みの子や permit の期限を復活させたりしません。親の heartbeat と複数の子の heartbeat は、同じ model client の既存通信にまとめます。切断時はすべての context / queue / permit を既存 client owner と一緒に破棄します。
 
 終了通知だけが失敗した場合も、子の枠を残し続けません。同じ RouteContext にある子presenceの最終時刻は、その子の有効な prepare または `active_turns` で明示した heartbeat だけで更新します。通常の client heartbeat は子の生存証拠になりません。`heartbeat_stale_ms` を越えた子は次の heartbeat / prepare で期限退役し、core の待ち順序とadvisory permitを除去して終了済み ID に移します。期限後の明示heartbeatや遅いprepareでは復活しません。既に開始済みの Gateway HTTP通信や実際の中継枠はこの期限で終了扱いにせず、Gateway自身がEOF・通信切断・自身の予約期限を処理します。provider生成の終了確認や再送は行いません。
 
-同時に保持できる通常の子 context は1 clientにつきMain/Sub合計14件のままです。Approveの短い判定scopeは別に最大15件で、通常の3用途を含む全体は32 contextまでです。件数は同じcontext mapから数え、待ち順序と中継容量は全用途で共有します。終了済み ID は client の寿命中4096件まで保持します。active と終了済みの合計が4096件に達した場合、新しい実行を `registry_full` で拒否します。古い終了記録を追い出して同じ ID を再受付する方式にはしません。clientの切断・再登録やHub再起動では、旧client資格と共にこのruntime stateも終了します。
+同時に保持できる通常の子 context は1 clientにつきMain/Sub合計14件です。Approveは別に最大15件で、通常の3用途を含む全体は32 contextまでです。待ち順序と中継容量は全用途で共有します。
+
+終了IDはULID順で新しい4,096件について親を記録します。件数を超えたら最小の終了IDまでを退役済みと記録し、新しい実行の受付を続けます。その境界以下で個別の記録がないIDの prepare と close は `turn_closed` になります。遅れて初めて届いたIDも対象です。すでに実行中のIDは境界を越えても元の親が継続・終了できます。clientを切断して登録し直すかHubを再起動すると、旧client資格と共にこの状態も終了します。
 
 Source は [core/delegated.rs](../src/core/delegated.rs)、[execution_api.rs](../src/service/execution_api.rs)、[service.rs](../src/service.rs)。focused regression は [core/delegated/tests.rs](../src/core/delegated/tests.rs) と [gateway_execution/delegated.rs](../tests/gateway_execution/delegated.rs) に置きます。物理端末間の MCP や実モデルによる子エージェント受入とは確認範囲を分けます。

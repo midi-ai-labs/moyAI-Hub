@@ -420,6 +420,67 @@ fn certificate(directory: &Path, names: Vec<String>, expired: bool) -> (PathBuf,
     (cert_path, key_path, cert)
 }
 #[tokio::test]
+async fn resuming_saved_expired_https_keeps_local_management_and_preserves_the_public_configuration()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let admin = open(&directory);
+    let port = free_port().await;
+    let (certificate_path, private_key_path, _) =
+        certificate(directory.path(), vec!["127.0.0.1".into()], false);
+    let settings = WebSettings {
+        local_port: 0,
+        remote: Remote::Https {
+            bind: format!("127.0.0.1:{port}"),
+            public_origin: format!("https://127.0.0.1:{port}"),
+            certificate_path,
+            private_key_path,
+        },
+    };
+    enable(&admin, settings.clone()).await.unwrap();
+    shutdown(&admin).await;
+    let path = directory.path().join("web-management.json");
+    let saved = std::fs::read(&path).unwrap();
+    certificate(directory.path(), vec!["127.0.0.1".into()], true);
+    assert!(enable(&admin, settings).await.is_err());
+    assert_eq!(status(&admin).await["enabled"], false);
+    let status = resume_saved(&admin).await.unwrap();
+    assert_eq!(
+        client()
+            .get(status["local_url"].as_str().unwrap())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert!(status["remote_url"].is_null());
+    assert!(
+        status["remote_error"]
+            .as_str()
+            .unwrap()
+            .contains("有効期間外")
+    );
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err()
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), saved);
+    shutdown(&admin).await;
+    certificate(directory.path(), vec!["127.0.0.1".into()], false);
+    let restored = resume_saved(&admin).await.unwrap();
+    assert!(restored["remote_url"].is_string());
+    assert!(restored["remote_error"].is_null());
+    assert!(
+        restored["remote_certificate_expires_at_ms"]
+            .as_i64()
+            .unwrap()
+            > time::OffsetDateTime::now_utc().unix_timestamp() * 1000
+    );
+    shutdown(&admin).await;
+}
+
+#[tokio::test]
 async fn external_https_requires_matching_current_certificate_but_no_client_certificate() {
     let directory = tempfile::tempdir().unwrap();
     let admin = open(&directory);

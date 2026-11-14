@@ -34,7 +34,7 @@ function setup() {
       { project_id: "project", device_id: "b", can_control: false, can_execute: true, environment_id: "env", preparation_state: "ready", error: null },
     ],
     environments: [], resources: [], templates: [], provisioning: [],
-    storage: { retained_bytes: 0, asset_count: 0, purged_asset_count: 0, limit_bytes: 1024 },
+    storage: { retained_bytes: 0, asset_count: 0, asset_limit: 100, job_count: 0, job_limit: 100, purged_asset_count: 0, limit_bytes: 1024 },
     maintenance: [], maintenance_next_before: null, maintenance_total: 0,
   };
   const network: NetworkSnapshot = {

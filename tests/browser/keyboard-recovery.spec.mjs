@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { createServer } from "node:net";
 import { test, expect } from "./fixture.mjs";
 import { createMetadataProvider } from "./provider-fixture.mjs";
 
@@ -9,6 +10,35 @@ async function ready(page, hub) {
     await expect(page.locator("#management-status")).toHaveText("Hub本体に接続中");
     return errors;
 }
+
+test("The operator can cancel a saved network retry while its listener is unavailable", async ({ page, hub }) => {
+    const errors = await ready(page, hub);
+    await hub.command("hub_network_start", { bind: `127.0.0.1:${hub.networkPort}`, advertiseIp: "127.0.0.1" });
+    await hub.restart();
+    const grant = await hub.command("hub_web_open");
+    await page.goto(grant.url);
+    await expect(page.locator("#management-app")).toBeVisible();
+    const occupied = createServer();
+    await new Promise((resolve, reject) => occupied.once("error", reject).listen(hub.networkPort, "127.0.0.1", resolve));
+    try {
+        await expect(hub.command("hub_network_start_saved")).rejects.toThrow();
+        await page.locator('nav a[href="#device-network"]').click();
+        await page.locator("#network-refresh").click();
+        await expect(page.locator("#network-server-status")).toHaveText("再試行待ち");
+        await expect(page.locator("#network-hosting-error")).toContainText("再試行します");
+        await page.getByRole("button", { name: "自動再試行を停止" }).click();
+        await expect(page.locator("#network-server-status")).toHaveText("停止中");
+        await expect(page.locator("#network-next-detail")).toContainText("Hubを起動し直しても停止を保ちます");
+        await expect(page.locator("#network-hosting-error")).toBeHidden();
+        expect((await hub.observeNetwork()).server.retry).toBeNull();
+        expect(errors).toEqual([]);
+    } finally {
+        await new Promise(resolve => occupied.close(resolve));
+    }
+    await page.getByRole("button", { name: "接続の受付を開始" }).click();
+    await expect(page.locator("#network-server-status")).toHaveText("稼働中");
+    expect((await hub.observeNetwork()).hosting.operator_paused).toBe(false);
+});
 
 // Use actual keyboard traversal; never focus an element with evaluate/Locator.focus.
 async function tabTo(page, target, { dialog = null, backwards = false, limit = 40 } = {}) {

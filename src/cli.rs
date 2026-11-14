@@ -284,6 +284,11 @@ pub async fn run(action: Action) -> Result<(), String> {
                     "Web管理が利用できます。初回だけ端末ネットワークのIP・ポートを設定して開始してください。次回から同じ設定で再開します。"
                 );
             }
+            if report.network_paused {
+                eprintln!(
+                    "接続受付は管理者の操作で停止しています。再開するには、管理画面で「接続の受付を開始」を押してください。"
+                );
+            }
             if report.firewall_status.requires_setup() {
                 eprintln!(
                     "Hub・Gatewayは起動しています。別のPCへ接続ファイルを渡す前に、管理画面の「Windowsで受信を許可」で設定を確認してください。Windowsの設定は自動変更していません。"

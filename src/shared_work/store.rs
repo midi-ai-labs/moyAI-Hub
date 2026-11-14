@@ -4,7 +4,7 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use std::path::Path;
 
 const MAX_INPUT_BYTES: usize = 64 * 1024;
-const MAX_RETAINED_JOBS: u64 = 100_000;
+pub(super) const MAX_RETAINED_JOBS: u64 = 100_000;
 const MAX_RESERVED_DESCENDANTS: u64 = 32_000;
 const MAX_ROOTS: u64 = 1_000;
 const MAX_RUNNER_ATTEMPTS: u32 = 128;

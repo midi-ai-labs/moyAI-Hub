@@ -7,6 +7,18 @@ import "./shared_admin.css";
 
 const esc = (value: unknown) => String(value ?? "").replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]!);
 const action = (kind: AdminOperation, label = operationLabels[kind], id = "") => `<button type="button" class="secondary" data-sa-operation="${kind}" data-sa-id="${esc(id)}">${esc(label)}</button>`;
+function storageUsage(storage: SharedAdminSnapshot["storage"]): string {
+  const rows: [string, number, number, string][] = [
+    ["仕事の登録数", storage.job_count, storage.job_limit, "件"],
+    ["成果ファイルの登録数", storage.asset_count, storage.asset_limit, "件"],
+    ["保存中の本文", storage.retained_bytes, storage.limit_bytes, "バイト"],
+  ];
+  return rows.map(([label, used, limit, unit]) => {
+    const warning = used >= limit ? "上限に達しました" : used >= limit * 0.9 ? "上限の90%以上を使用しています" : "";
+    return '<p>' + label + "　" + used.toLocaleString() + " / " + limit.toLocaleString() + " " + unit
+      + (warning ? ' <strong class="error">' + warning + '</strong>' : "") + '</p>';
+  }).join("");
+}
 function rowKey(node: Element): string | null {
   if (node.classList.contains("shared-admin-row")) {
     const action = node.querySelector(".shared-admin-actions > button");
@@ -75,7 +87,7 @@ export function attachSharedAdmin(host: HTMLElement, onSnapshot?: (value: Shared
           return card(row.label, `<p>${row.archived ? "保管中" : "利用中"}</p><p>操作に使うPC: ${esc(controls)}</p><div>仕事を実行するPC${executors}</div>`, action("save_project","設定を編集",row.id)+action("delete_project","削除",row.id));
         }).join("");
         case "maintenance": return `<p>実行を引き受けたPCと仕事を表示します。実行状態が不明な場合は、そのPCの処理と外部ジョブが止まったことを確認してから「停止確認を記録」を押してください。確認が済むまで、その仕事が使っている枠は再利用できません。</p>` + (s.maintenance.map(row => card(runner(row.runner_id), `<p>状態: ${esc(({assigned:"実行PCへの割り当て済み",running:"実行中",stop_requested:"停止要求中"} as Record<string,string>)[row.state] ?? row.state)}</p><p>${esc(row.uncertainty_reason ?? "")}</p><p class="shared-admin-mono">仕事 ${esc(row.job_id)}<br>試行 ${esc(row.attempt_id)}</p>`, action("settle_attempt", "停止確認を記録", row.attempt_id))).join("") || "<p>停止確認の対象はありません。</p>");
-        case "storage": return `<p>保存中: ${s.storage.retained_bytes.toLocaleString()} / ${s.storage.limit_bytes.toLocaleString()} バイト<br>ファイル ${s.storage.asset_count}件 · 内容削除済み ${s.storage.purged_asset_count}件</p><p>終了した仕事の保存期間を指定して、古いファイルを削除できます。利用中の入力と、まだ完了していない追加依頼に必要なファイルは残ります。削除は管理者が実行したときだけ行われます。</p>${action("prune_shared_data")}<h3>バックアップと復元</h3><p>Hubを停止し、Hubの端末上でバックアップを作成してください。バックアップには利用者情報・証明書・仕事の内容が含まれます。復元前に、関係する実行PCのRunnerと、そのRunnerが起動した処理を停止したことを各PCで確認してください。復元先には、まだ存在しない新しいフォルダーを指定します（親フォルダーは作成済みである必要があります）。復元後はPCの接続と新しい仕事の受付が停止します。実行状態が不明な仕事の停止確認を記録してから、接続と受付を再開してください。</p><pre>moyai-hub --backup-dir BACKUP --data-dir HUBDATA\nmoyai-hub --restore-from BACKUP --data-dir NEW_DIR --acknowledge-runners-stopped</pre>`;
+        case "storage": return `${storageUsage(s.storage)}<p>本文を整理したファイルも登録数に含みます。本文整理済み ${s.storage.purged_asset_count}件。</p><p>終了した仕事の保存期間を指定して、古いファイルを削除できます。利用中の入力と、まだ完了していない追加依頼に必要なファイルは残ります。削除は管理者が実行したときだけ行われます。</p>${action("prune_shared_data")}<h3>バックアップと復元</h3><p>Hubを停止し、Hubの端末上でバックアップを作成してください。バックアップには利用者情報・証明書・仕事の内容が含まれます。復元前に、関係する実行PCのRunnerと、そのRunnerが起動した処理を停止したことを各PCで確認してください。復元先には、まだ存在しない新しいフォルダーを指定します（親フォルダーは作成済みである必要があります）。復元後はPCの接続と新しい仕事の受付が停止します。実行状態が不明な仕事の停止確認を記録してから、接続と受付を再開してください。</p><pre>moyai-hub --backup-dir BACKUP --data-dir HUBDATA\nmoyai-hub --restore-from BACKUP --data-dir NEW_DIR --acknowledge-runners-stopped</pre>`;
       }
     })();
     if (tab === "maintenance") rows += `<p>対象: ${s.maintenance_total}件</p><div class="shared-admin-actions">${s.maintenance_next_before ? '<button type="button" id="shared-admin-maintenance-next" class="secondary">次の復旧対象</button>' : ""}${maintenanceBefore ? '<button type="button" id="shared-admin-maintenance-latest" class="secondary">先頭の復旧対象</button>' : ""}</div>`;

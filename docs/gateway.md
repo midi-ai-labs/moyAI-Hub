@@ -79,6 +79,8 @@ core の期限付き permit は予約計算です。Gateway は未使用予約�
 
 接続 timeout は 3 秒、headers / 各 response read の無通信 timeout は 300 秒です。**応答が継続している間の全体時間制限はありません。** body は 8 MiB、response は 64 MiB、SSE 行と Responses event data は各 1 MiB が上限です。redirect を追わず、入力 Authorization を provider に転送しません。下流への backpressure は有界キューで受けます。
 
+接続後、応答ヘッダーが届くまでにこの無通信期限を超えると、Gateway は HTTP 504 と `hub_upstream_inactivity_timeout` を返します。すでに本文の中継が始まっていれば、その応答を途中で終了します。
+
 管理画面は「Hub のモデル中継」に「中継中」「予約」の件数を表示します。中継中の件数は既存の Running record から導出し、接続が閉じてローカルの後始末中のものも終了まで含めます。互換 snapshot の `responding` / `draining` は response channel の有無による内訳で、provider の生成状態ではありません。`quarantined_pools` は互換用の空配列です。`uncertain` はローカル Gateway から状態を取得できなかった場合だけに使い、oMLX / LM Studio の生成を指しません。
 
 ## 停止・異常終了と回復
@@ -90,6 +92,10 @@ Gateway process は `gateway-execution.lock` を保持して同じ保存先か�
 Hub サーバーの明示停止や終了、サーバープロセスの消滅によって stdin が閉じると、Gateway は新規受付を閉じ、未使用予約を失効させ、自身の HTTP 処理へ取消を通知します。ブラウザーの消滅ではサーバーと Gateway のパイプは閉じません。後始末の待機は最大2秒です。サーバーは子の完了通知を最大3秒待ち、通常終了を確認できなければローカルの Gateway 子プロセスを終了させます。provider のプロセスは終了させません。ローカル終了の確認に失敗した場合はその状態を表示し、生存中の同じ子プロセスに重ねて起動しません。
 
 HTTP 接続を閉じた後に生成を取り消すか、完了まで続けるかは provider が決めます。Hub の再開始を provider 全体のアイドル確認に結び付けません。途中で切れた応答を成功に変えたり、停止・再起動後に自動再送したりすることもありません。MCP の受入済み仕事の永続台帳と取消・照合は別の責務で、以下の認可記録の契約を維持します。
+
+## モデル接続の登録枠
+
+モデル接続の一時登録は受付ごとに最大128件です。満杯で新しい接続が来ると、heartbeatが途絶え、処理・委任・待機・permitを保持していない登録のうち最も古い1件を解放します。該当する登録がなければ受付は `registry_full` を返します。端末の参加登録と証明書は別に管理します。
 
 <a id="証明書の期限と計画停止"></a>
 

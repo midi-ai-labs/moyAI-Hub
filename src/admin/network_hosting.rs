@@ -1,4 +1,4 @@
-//! The last successfully started endpoint, separate from device identity and rules.
+//! The saved endpoint and the operator's choice to keep its admission stopped.
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -13,25 +13,31 @@ pub(super) struct Settings {
     schema_version: u32,
     pub bind: SocketAddr,
     pub advertise_ip: IpAddr,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    operator_paused: Option<bool>,
 }
 
 impl Settings {
     pub fn new(bind: &str, advertise_ip: &str) -> Result<Self, String> {
         let settings = Self {
-            schema_version: 1,
+            schema_version: 2,
             bind: bind
                 .parse()
                 .map_err(|_| "待受先を IP:port で指定してください。")?,
             advertise_ip: advertise_ip
                 .parse()
                 .map_err(|_| "接続先へ案内する具体的な IP アドレスを指定してください。")?,
+            operator_paused: Some(false),
         };
         settings.validate()?;
         Ok(settings)
     }
 
     fn validate(&self) -> Result<(), String> {
-        if self.schema_version != 1 {
+        if !matches!(
+            (self.schema_version, self.operator_paused),
+            (1, None) | (2, Some(_))
+        ) {
             return Err("ネットワーク起動設定の形式に対応していません。".into());
         }
         if self.bind.port() == 0
@@ -42,6 +48,10 @@ impl Settings {
             return Err("待受先と案内する IP アドレスを確認してください。".into());
         }
         Ok(())
+    }
+
+    pub fn operator_paused(&self) -> bool {
+        self.operator_paused == Some(true)
     }
 }
 
@@ -80,10 +90,21 @@ impl Store {
     pub fn snapshot(&self) -> Value {
         match &self.loaded {
             Ok(Some(settings)) => json!({"configured":true,"bind":settings.bind,
-                "advertise_ip":settings.advertise_ip,"error":null}),
+                "advertise_ip":settings.advertise_ip,"operator_paused":settings.operator_paused(),"error":null}),
             Ok(None) => json!({"configured":false,"bind":null,"advertise_ip":null,"error":null}),
             Err(error) => json!({"configured":false,"bind":null,"advertise_ip":null,"error":error}),
         }
+    }
+
+    pub fn pause(&mut self) -> Result<(), String> {
+        if let Some(mut settings) = self.loaded.clone()?
+            && !settings.operator_paused()
+        {
+            settings.schema_version = 2;
+            settings.operator_paused = Some(true);
+            self.save(settings)?;
+        }
+        Ok(())
     }
 
     pub fn save(&mut self, settings: Settings) -> Result<(), String> {
@@ -123,11 +144,34 @@ mod tests {
         assert_eq!(Store::open(path.clone()).configured().unwrap(), settings);
         assert_eq!(
             serde_json::from_slice::<Value>(&std::fs::read(path).unwrap()).unwrap(),
-            json!({"schema_version":1,"bind":"0.0.0.0:9471","advertise_ip":"192.168.1.10"})
+            json!({"schema_version":2,"bind":"0.0.0.0:9471","advertise_ip":"192.168.1.10","operator_paused":false})
         );
         let ipv6 = Settings::new("[::1]:9471", "::1").unwrap();
         owner.save(ipv6.clone()).unwrap();
         assert_eq!(Store::open(owner.path.clone()).configured().unwrap(), ipv6);
+    }
+
+    #[test]
+    fn a_legacy_endpoint_resumes_until_the_operator_persists_a_stop() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("network-hosting.json");
+        let old = br#"{"schema_version":1,"bind":"127.0.0.1:9471","advertise_ip":"127.0.0.1"}"#;
+        std::fs::write(&path, old).unwrap();
+        let mut store = Store::open(path.clone());
+        assert!(!store.configured().unwrap().operator_paused());
+        assert_eq!(std::fs::read(&path).unwrap(), old);
+        store.pause().unwrap();
+        let mut reopened = Store::open(path.clone());
+        let stopped = reopened.configured().unwrap();
+        assert!(stopped.operator_paused());
+        assert_eq!(stopped.bind.port(), 9471);
+        let saved = std::fs::read(&path).unwrap();
+        reopened.pause().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), saved);
+        reopened
+            .save(Settings::new("127.0.0.1:9471", "127.0.0.1").unwrap())
+            .unwrap();
+        assert!(!Store::open(path).configured().unwrap().operator_paused());
     }
 
     #[test]
@@ -137,6 +181,8 @@ mod tests {
         for bytes in [
             b"not JSON".as_slice(),
             br#"{"schema_version":2,"bind":"127.0.0.1:9471","advertise_ip":"127.0.0.1"}"#,
+            br#"{"schema_version":3,"bind":"127.0.0.1:9471","advertise_ip":"127.0.0.1","operator_paused":false}"#,
+            br#"{"schema_version":1,"bind":"127.0.0.1:9471","advertise_ip":"127.0.0.1","operator_paused":true}"#,
             br#"{"schema_version":1,"bind":"127.0.0.1:0","advertise_ip":"127.0.0.1"}"#,
             br#"{"schema_version":1,"bind":"127.0.0.1:9471","advertise_ip":"192.168.1.10"}"#,
         ] {
@@ -166,6 +212,8 @@ mod tests {
         std::fs::rename(&path, &original).unwrap();
         std::fs::create_dir(&path).unwrap();
         let bytes = std::fs::read(&original).unwrap();
+        assert!(owner.pause().is_err());
+        assert!(!owner.configured().unwrap().operator_paused());
         assert!(
             owner
                 .save(Settings::new("127.0.0.1:9472", "127.0.0.1").unwrap())

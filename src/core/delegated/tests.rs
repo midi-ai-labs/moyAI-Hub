@@ -311,18 +311,43 @@ fn delegated_close_overtakes_prepare_and_both_active_and_retired_identity_sets_a
         .unwrap();
     child(&mut hub, &selection, 16);
     let (mut full, selection) = fixture();
-    for value in 1..=MAX_DELEGATIONS_PER_CLIENT {
+    child(&mut full, &selection, 1);
+    for value in 3..=(MAX_CLOSED_DELEGATIONS + 8) {
         full.close_delegated_context("client", "main", &id(value as u128), true)
             .unwrap();
     }
+    assert_eq!(
+        full.clients["client"].closed_delegations.len(),
+        MAX_CLOSED_DELEGATIONS
+    );
+    // Even after retirement passes its ID, active work can still refresh and close.
+    full.ensure_delegated_context("client", "main", &id(1), selection.clone(), 0)
+        .unwrap();
     assert!(matches!(
-        full.ensure_delegated_context("client", "main", &id(1), selection.clone(), 0),
-        Err(HubError::TurnClosed)
+        full.close_delegated_context("client", "side_chat", &id(1), true),
+        Err(HubError::WrongOwner)
     ));
+    full.close_delegated_context("client", "main", &id(1), false)
+        .unwrap();
+    // ID 2 never arrived. ID 5 arrived and was closed. Neither can be admitted below the boundary.
+    for old in [1, 2, 5] {
+        assert!(matches!(
+            full.ensure_delegated_context("client", "main", &id(old), selection.clone(), 0),
+            Err(HubError::TurnClosed)
+        ));
+        assert!(matches!(
+            full.close_delegated_context("client", "main", &id(old), true),
+            Err(HubError::TurnClosed)
+        ));
+    }
+    full.close_delegated_context("client", "main", &id(4000), false)
+        .unwrap();
     assert!(matches!(
-        full.ensure_delegated_context("client", "main", &id(5000), selection, 0),
-        Err(HubError::RegistryFull)
+        full.close_delegated_context("client", "side_chat", &id(4000), true),
+        Err(HubError::WrongOwner)
     ));
+    child(&mut full, &selection, 5001);
+    child(&mut full, &selection, 5000);
 }
 
 #[test]

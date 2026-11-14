@@ -25,7 +25,7 @@ export interface SharedAdminSnapshot {
   resources: { id: string; capacity: number }[];
   templates: { runner_id: string; id: string; label: string }[];
   provisioning: { environment_id: string; runner_id: string; template_id: string; generation: number; state: string; error: string | null }[];
-  storage: { retained_bytes: number; asset_count: number; purged_asset_count: number; limit_bytes: number };
+  storage: { retained_bytes: number; asset_count: number; asset_limit: number; job_count: number; job_limit: number; purged_asset_count: number; limit_bytes: number };
   maintenance: { attempt_id: string; generation: number; job_id: string; runner_id: string; state: string; uncertainty_reason: string | null; updated_at_ms: number }[];
   maintenance_next_before: string | null;
   maintenance_total: number;

@@ -97,6 +97,59 @@ fn review_body(client: &Value, context: &str) -> Value {
 }
 
 #[tokio::test]
+async fn full_registry_reclaims_abandoned_clients_without_displacing_live_clients() {
+    let server = Server::new().await;
+    let abandoned = server.register("old Desktop").await;
+    let active = server.register("live Desktop").await;
+    for _ in 2..128 {
+        server.register("Runner").await;
+    }
+    // Both listeners share the 256-entry core, but each owns a separate token registry.
+    {
+        let mut core = server.core.lock().unwrap();
+        for n in 0..128 {
+            core.register_client(&format!("other-listener-{n}"), "other", "127.0.0.1", 0)
+                .unwrap();
+        }
+    }
+    let register = json!({"label":"new Desktop"});
+    assert_eq!(
+        server
+            .post("/v1/clients/register", BOOTSTRAP, &register)
+            .await
+            .0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    let id = abandoned["id"].as_str().unwrap();
+    server
+        .core
+        .lock()
+        .unwrap()
+        .heartbeat(id, moyai_hub::protocol::ClientActivity::Idle, 0)
+        .unwrap();
+    assert_eq!(
+        server
+            .post("/v1/clients/register", BOOTSTRAP, &register)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    for (session, expected) in [
+        (&abandoned, StatusCode::UNAUTHORIZED),
+        (&active, StatusCode::OK),
+    ] {
+        let (status, _) = server
+            .post(
+                "/v1/clients/heartbeat",
+                session["client_token"].as_str().unwrap(),
+                &json!({"id":session["id"],"activity":"idle"}),
+            )
+            .await;
+        assert_eq!(status, expected);
+    }
+}
+
+#[tokio::test]
 async fn approve_review_is_independent_accepts_chat_only_model_and_requires_its_own_revision() {
     let server = Server::new().await;
     {

@@ -55,6 +55,7 @@ struct LaunchReply {
     already_running: bool,
     web_url: String,
     network_running: bool,
+    network_paused: bool,
     needs_setup: bool,
     network_error: Option<String>,
     firewall_status: String,
@@ -508,7 +509,7 @@ async fn launch_saved_network_restores_gateway_and_serializes_duplicate_callers(
     let saved = std::fs::read(profile.hosting_path()).unwrap();
     assert_eq!(
         serde_json::from_slice::<Value>(&saved).unwrap(),
-        json!({"schema_version":1,"bind":network.to_string(),"advertise_ip":"127.0.0.1"})
+        json!({"schema_version":2,"bind":network.to_string(),"advertise_ip":"127.0.0.1","operator_paused":false})
     );
     let old_instance = client.instance_id().to_owned();
     profile.stop(&client, &[web, network, gateway]).await;
@@ -556,6 +557,50 @@ async fn launch_saved_network_restores_gateway_and_serializes_duplicate_callers(
     );
     assert_eq!(std::fs::read(profile.hosting_path()).unwrap(), saved);
     profile.stop(&same, &[web, network, gateway]).await;
+}
+
+#[tokio::test]
+async fn launch_preserves_an_operator_stop_until_an_explicit_network_start() {
+    let profile = Profile::new();
+    let first = profile.launch(true, true).await;
+    let client = profile.connect().await;
+    let web = assert_web(&client, &first).await;
+    let (network, gateway) = configure_network(&client).await;
+    client
+        .dispatch("hub_network_stop", json!({}))
+        .await
+        .unwrap();
+    let paused = profile.launch(false, true).await;
+    assert!(paused.network_paused && !paused.network_running && !paused.needs_setup);
+    assert!(paused.network_error.is_none());
+    assert_eq!(paused.pid, first.pid);
+    profile.stop(&client, &[web, network, gateway]).await;
+
+    let restarted = profile.launch(false, true).await;
+    assert!(restarted.network_paused && !restarted.network_running);
+    assert!(restarted.network_error.is_none());
+    let client = profile.connect().await;
+    let web = assert_web(&client, &restarted).await;
+    client
+        .dispatch("hub_network_start_saved", json!({}))
+        .await
+        .unwrap();
+    assert!(TcpStream::connect(network).await.is_err());
+    assert!(TcpStream::connect(gateway).await.is_err());
+    client
+        .dispatch(
+            "hub_network_start",
+            json!({"bind": network.to_string(), "advertiseIp":"127.0.0.1"}),
+        )
+        .await
+        .unwrap();
+    assert_network(&client, network, gateway).await;
+    profile.stop(&client, &[web, network, gateway]).await;
+    let resumed = profile.launch(false, true).await;
+    assert!(resumed.network_running && !resumed.network_paused);
+    let client = profile.connect().await;
+    let web = assert_web(&client, &resumed).await;
+    profile.stop(&client, &[web, network, gateway]).await;
 }
 
 #[tokio::test]

@@ -72,7 +72,7 @@ pub struct Admin {
     discovery_generation: AtomicU64,
     refresh_running: std::sync::atomic::AtomicBool,
     pub(crate) network: crate::network::SharedNetwork,
-    network_server: tokio::sync::Mutex<Option<network_admin::NetworkServer>>,
+    network_server: tokio::sync::Mutex<network_admin::NetworkLifecycle>,
     network_hosting: Mutex<network_hosting::Store>,
 }
 
@@ -147,7 +147,7 @@ impl Admin {
             discovery_generation: AtomicU64::new(0),
             refresh_running: std::sync::atomic::AtomicBool::new(false),
             network: Arc::new(Mutex::new(network)),
-            network_server: tokio::sync::Mutex::new(None),
+            network_server: Default::default(),
             network_hosting: Mutex::new(network_hosting),
         }))
     }
@@ -334,6 +334,19 @@ impl Admin {
     pub async fn shutdown(&self) -> Result<(), String> {
         crate::web_admin::server::shutdown(self).await;
         hub_stop(self).await
+    }
+
+    pub(crate) async fn maintain_network(
+        self: &Arc<Self>,
+        mut stop: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        loop {
+            tokio::select! {
+                _ = &mut stop => return,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+            }
+            network_admin::maintain(self).await;
+        }
     }
 }
 

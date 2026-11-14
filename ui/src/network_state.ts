@@ -42,8 +42,9 @@ export interface NetworkSnapshot {
     ca_certificate_pem: string;
     ca_sha256: string;
     gateway_port: number;
-    hosting: { configured: boolean; bind: string | null; advertise_ip: string | null; error: string | null };
+    hosting: { configured: boolean; bind: string | null; advertise_ip: string | null; error: string | null; operator_paused?: boolean };
     server: { running: boolean; bind: string | null; gateway_bind: string | null;
+        retry?: { reason: string; delay_seconds: number } | null;
         certificate: { sha256: string; expires_at_ms: string; renew_after_ms: string; last_success_ms: string; last_error: string | null } | null };
     devices: NetworkDevice[];
     deleted_devices?: { device_id: string; label: string; deleted_at_ms: number }[];
@@ -68,6 +69,7 @@ export function networkCanDistribute(snapshot: NetworkSnapshot | null, firewall:
 
 /** Suggestions use observed Hub facts; an online PC is not proof of a usable LAN or AI. */
 export function networkSetupStep(snapshot: NetworkSnapshot, firewall: FirewallState = null, externallyManaged = false): { title: string; detail: string; anchor: string; action: string } {
+    if (!snapshot.server.running && snapshot.hosting.operator_paused) return { title: "管理者が接続受付を停止しています", detail: "Hubを起動し直しても停止を保ちます。再開するときは「接続の受付を開始」を押してください。", anchor: "network-step-start", action: "受付の設定を開く" };
     if (!snapshot.server.running) return { title: "1. Hubの接続先を設定して開始", detail: "参加するPCと通信できるLANとHubポートを選びます。モデル通信用ポートは必要な場合だけ変更してください。", anchor: "network-step-start", action: "接続先を設定する" };
     if (!networkCanDistribute(snapshot, firewall, externallyManaged)) return { title: "2. Windowsの受信許可を確認", detail: firewall === "missing" ? "現在のHubへの受信許可が未登録です。下の設定内容を確認して「接続を許可して続ける」を押してください。" : firewall === null ? "起動中のHubへの受信許可を確認しています。確認できない場合は下の案内に従ってください。" : "現在のHubと受信許可の内容が一致しません。下の確認結果に沿って見直してください。", anchor: "network-step-firewall", action: "受信許可を確認する" };
     const pending = snapshot.join_requests.filter(request => request.status === "pending").length;

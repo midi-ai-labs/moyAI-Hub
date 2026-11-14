@@ -99,6 +99,17 @@ fn waiting(decision: PermitDecision) {
 }
 
 #[test]
+fn only_stale_clients_without_running_or_queued_work_are_reclaimable() {
+    let mut hub = fixture();
+    admit(&mut hub, "running", "r", 0);
+    waiting(prepare(&mut hub, "older", "r", 1));
+    assert_eq!(hub.stale_idle_since("later", 9999), None);
+    assert_eq!(hub.stale_idle_since("later", 10_000), Some(0));
+    assert_eq!(hub.stale_idle_since("running", 10_000), None);
+    assert_eq!(hub.stale_idle_since("older", 10_000), None);
+}
+
+#[test]
 fn request_fifo_prevents_the_previous_poll_order_overtake() {
     let mut baseline = fixture();
     let running = admit(&mut baseline, "running", "r", 0);

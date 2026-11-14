@@ -744,6 +744,13 @@ footer span:nth-child(2) {
   color: #ab4652;
 }
 
+.notice:not([hidden]) {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
 .checkbox {
   display: flex;
   align-items: center;

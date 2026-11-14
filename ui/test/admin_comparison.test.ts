@@ -3,7 +3,7 @@ import test from "node:test";
 import { compareAdminEdit } from "../src/admin_comparison.ts";
 import type { SharedAdminSnapshot } from "../src/shared_admin_state.ts";
 
-const snapshot = (revision = "1"): SharedAdminSnapshot => ({ revision, users: [{user_id:"alice",username:"alice",display_name:"Alice",administrator:false,disabled:false}], groups: [], group_memberships: [], projects: [{id:"project",label:"元の名前",archived:false}], project_devices: [], project_memberships: [], group_project_roles: [], environments: [], resources: [], templates: [], provisioning: [], storage:{retained_bytes:0,asset_count:0,purged_asset_count:0,limit_bytes:100}, maintenance:[],maintenance_next_before:null,maintenance_total:0 });
+const snapshot = (revision = "1"): SharedAdminSnapshot => ({ revision, users: [{user_id:"alice",username:"alice",display_name:"Alice",administrator:false,disabled:false}], groups: [], group_memberships: [], projects: [{id:"project",label:"元の名前",archived:false}], project_devices: [], project_memberships: [], group_project_roles: [], environments: [], resources: [], templates: [], provisioning: [], storage:{retained_bytes:0,asset_count:0,asset_limit:100,job_count:0,job_limit:100,purged_asset_count:0,limit_bytes:100}, maintenance:[],maintenance_next_before:null,maintenance_total:0 });
 
 test("device association compares exact identities and keeps inputs across unrelated changes", () => {
   const initial=snapshot(), latest=snapshot("2");

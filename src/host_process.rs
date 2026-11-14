@@ -424,8 +424,15 @@ pub async fn run_server(catalog_path: PathBuf, settings: Option<Value>) -> Resul
             _ => None,
         },
     };
-    let args = settings.map_or_else(|| json!({}), |settings| json!({"settings":settings}));
-    let web = match admin.dispatch("hub_web_enable", args).await {
+    let started = match settings {
+        Some(settings) => {
+            admin
+                .dispatch("hub_web_enable", json!({"settings":settings}))
+                .await
+        }
+        None => crate::web_admin::server::resume_saved(&admin).await,
+    };
+    let web = match started {
         Ok(web) => web,
         Err(error) => {
             let _ = admin.shutdown().await;
@@ -434,6 +441,13 @@ pub async fn run_server(catalog_path: PathBuf, settings: Option<Value>) -> Resul
             ));
         }
     };
+    eprintln!("{} Hubを起動しました。", time::OffsetDateTime::now_utc());
+    if let Some(reason) = web["remote_error"].as_str() {
+        eprintln!(
+            "{} 別PCからのWeb管理を開始できません。{reason}",
+            time::OffsetDateTime::now_utc()
+        );
+    }
     println!("moyAI Hub: {}", web["local_url"].as_str().unwrap_or(""));
     if let Some(url) = web["remote_url"].as_str() {
         println!("Web public URL: {url}");
@@ -455,21 +469,32 @@ pub async fn run_server(catalog_path: PathBuf, settings: Option<Value>) -> Resul
     let _descriptor_owner = DescriptorOwner(descriptor);
     let app = router(state.clone());
     let mut server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let network_admin = state.admin.clone();
+    let (stop_maintenance, stopped) = tokio::sync::oneshot::channel();
+    let maintenance = tokio::spawn(async move { network_admin.maintain_network(stopped).await });
     let interrupt = async {
         tokio::signal::ctrl_c()
             .await
             .map_err(|error| format!("Ctrl+C handler failed: {error}"))
     };
-    let (listener_failed, interrupt_error) = tokio::select! {
-        _ = state.shutdown.notified() => (false, None),
-        _ = &mut server => (true, None),
-        result = interrupt => (false, result.err()),
+    let (listener_failed, interrupt_error, reason) = tokio::select! {
+        _ = state.shutdown.notified() => (false, None, "管理操作"),
+        _ = &mut server => (true, None, "ローカル管理待受の終了"),
+        result = interrupt => (false, result.err(), "Ctrl+C"),
     };
+    eprintln!(
+        "{} Hubを終了します。理由は{reason}です。",
+        time::OffsetDateTime::now_utc()
+    );
     // A browser close never changes server ownership. Only explicit stop/Ctrl+C does.
-    let result = tokio::time::timeout(Duration::from_secs(20), state.admin.shutdown())
-        .await
-        .map_err(|_| "Hub ホストの終了処理が期限切れです。".to_string())
-        .and_then(|result| result);
+    let _ = stop_maintenance.send(());
+    let result = tokio::time::timeout(Duration::from_secs(20), async {
+        let _ = maintenance.await;
+        state.admin.shutdown().await
+    })
+    .await
+    .map_err(|_| "Hub ホストの終了処理が期限切れです。".to_string())
+    .and_then(|result| result);
     if !listener_failed {
         server.abort();
         let _ = server.await;

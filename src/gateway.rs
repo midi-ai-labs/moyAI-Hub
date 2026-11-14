@@ -27,6 +27,19 @@ const RESPONSE_LIMIT: usize = 64 * 1024 * 1024;
 const UPSTREAM_INACTIVITY: Duration = Duration::from_secs(300);
 const DRAIN_DEADLINE: Duration = Duration::from_secs(2);
 
+fn upstream_header_failure(error: &reqwest::Error) -> (StatusCode, &'static str) {
+    if error.is_connect() {
+        (StatusCode::BAD_GATEWAY, "provider_unavailable")
+    } else if error.is_timeout() {
+        (
+            StatusCode::GATEWAY_TIMEOUT,
+            "hub_upstream_inactivity_timeout",
+        )
+    } else {
+        (StatusCode::BAD_GATEWAY, "upstream_uncertain")
+    }
+}
+
 fn upstream_client(inactivity: Duration) -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -740,14 +753,8 @@ async fn run_request(
             Ok(value) => value,
             Err(failure) => {
                 let uncertain = !failure.is_connect();
-                let _ = head.send(Err(error(
-                    StatusCode::BAD_GATEWAY,
-                    if uncertain {
-                        "upstream_uncertain"
-                    } else {
-                        "provider_unavailable"
-                    },
-                )));
+                let (status, code) = upstream_header_failure(&failure);
+                let _ = head.send(Err(error(status, code)));
                 return uncertain;
             }
         };
@@ -906,6 +913,23 @@ mod tests {
             (Some(0), Some(0), Some(0))
         );
     }
+    #[tokio::test]
+    async fn silent_provider_before_headers_reports_gateway_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = format!("http://{}", listener.local_addr().unwrap());
+        let client = upstream_client(Duration::from_millis(100)).unwrap();
+        let request = tokio::spawn(async move { client.get(target).send().await });
+        let (_silent_socket, _) = listener.accept().await.unwrap();
+        let failure = request.await.unwrap().unwrap_err();
+        assert_eq!(
+            upstream_header_failure(&failure),
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                "hub_upstream_inactivity_timeout"
+            )
+        );
+    }
+
     #[tokio::test]
     async fn upstream_progress_outlives_inactivity_window_but_silence_expires() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

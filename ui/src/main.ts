@@ -45,8 +45,10 @@ function notify(message: string, error = false) {
     const target = el("notice");
     target.hidden = false;
     target.classList.toggle("error", error);
-    target.textContent = message;
+    setText("notice-text", message);
 }
+button("dismiss-notice").addEventListener("click", () => { el("notice").hidden = true; });
+button("dismiss-poll-notice").addEventListener("click", () => { el("poll-notice").hidden = true; });
 function errorText(error: unknown): string {
     return typeof error === "string" ? error : "操作を完了できませんでした。もう一度確認してください。";
 }
@@ -188,6 +190,8 @@ async function poll() {
         await webManagement.refresh();
         await sharedAdministration.refresh();
         const next = await invoke<Snapshot>("hub_snapshot");
+        el("poll-notice").hidden = true;
+        setText("poll-notice-text", "");
         setText("header-status", "Hub本体は稼働中");
         el("header-dot").className = "dot green";
         setText("management-status", "Hub本体に接続中");
@@ -208,7 +212,11 @@ async function poll() {
         setText("header-status", "Hub本体の応答を確認できません");
         el("header-dot").className = "dot gray";
         setText("management-status", "Hub本体の応答を確認できません");
-        notify(errorText(error), true);
+        const message = errorText(error);
+        if (el("poll-notice-text").textContent !== message) {
+            setText("poll-notice-text", message);
+            el("poll-notice").hidden = false;
+        }
     }
     finally {
         pollInFlight = false;

@@ -1,6 +1,44 @@
 use super::*;
 use crate::network::{self, DeviceNetwork, Effect, NetworkError, Rule, Subject, Usage};
 use std::collections::BTreeSet;
+use std::time::{Duration, Instant};
+
+#[derive(Default)]
+pub(super) struct NetworkLifecycle {
+    server: Option<NetworkServer>,
+    retry: Option<NetworkRetry>,
+}
+
+struct NetworkRetry {
+    due: Instant,
+    delay: Duration,
+    reason: String,
+}
+
+impl NetworkLifecycle {
+    fn running(&self) -> bool {
+        self.server
+            .as_ref()
+            .is_some_and(|server| !server.task.is_finished())
+    }
+
+    fn retry_later(&mut self, reason: String) {
+        let delay = self.retry.as_ref().map_or(Duration::from_secs(2), |old| {
+            (old.delay * 2).min(Duration::from_secs(60))
+        });
+        if self.retry.as_ref().is_none_or(|old| old.reason != reason) {
+            eprintln!(
+                "{} 接続受付の再試行を待機します。{reason}",
+                time::OffsetDateTime::now_utc()
+            );
+        }
+        self.retry = Some(NetworkRetry {
+            due: Instant::now() + delay,
+            delay,
+            reason,
+        });
+    }
+}
 
 pub(super) struct NetworkServer {
     bind: String,
@@ -10,8 +48,9 @@ pub(super) struct NetworkServer {
     renewal: tokio::task::JoinHandle<()>,
 }
 
-pub(super) fn firewall_endpoints(server: &Option<NetworkServer>) -> Result<(&str, &str), String> {
-    let server = server
+pub(super) fn firewall_endpoints(lifecycle: &NetworkLifecycle) -> Result<(&str, &str), String> {
+    let server = lifecycle
+        .server
         .as_ref()
         .filter(|server| !server.task.is_finished())
         .ok_or("先に社内LANのHubとGatewayを開始してください。")?;
@@ -91,15 +130,16 @@ pub(super) fn hub_history_result(
 }
 
 pub(super) async fn hub_network_snapshot(admin: &Admin) -> Result<Value, String> {
-    let server = admin.network_server.lock().await;
+    let lifecycle = admin.network_server.lock().await;
+    let server = lifecycle.server.as_ref();
     let mut value = owner(admin)?.snapshot(now_ms());
     let certificate = server
-        .as_ref()
         .map(|server| server.runtime.certificate())
         .transpose()
         .map_err(message)?;
-    value["server"] = json!({"running":server.as_ref().is_some_and(|s|!s.task.is_finished()),"bind":server.as_ref().map(|s|&s.bind),
-        "gateway_bind":server.as_ref().and_then(|s|s.runtime.gateway_endpoint()),"certificate":certificate});
+    value["server"] = json!({"running":lifecycle.running(),"bind":server.map(|s|&s.bind),
+        "gateway_bind":server.and_then(|s|s.runtime.gateway_endpoint()),"certificate":certificate,
+        "retry":lifecycle.retry.as_ref().map(|retry| json!({"reason":retry.reason,"delay_seconds":retry.delay.as_secs()}))});
     value["hosting"] = admin
         .network_hosting
         .lock()
@@ -119,6 +159,7 @@ pub(super) fn hub_network_settings(
 pub(super) async fn hub_network_renew_certificate(admin: &Admin) -> Result<(), String> {
     let server = admin.network_server.lock().await;
     let server = server
+        .server
         .as_ref()
         .filter(|server| !server.task.is_finished())
         .ok_or("端末ネットワークを開始してください。")?;
@@ -132,6 +173,7 @@ pub(super) async fn hub_network_diagnostics(
 ) -> Result<network::server_runtime::NetworkDiagnostics, String> {
     let server = admin.network_server.lock().await;
     let server = server
+        .server
         .as_ref()
         .filter(|server| !server.task.is_finished())
         .ok_or("端末ネットワークを開始してください。")?;
@@ -303,32 +345,97 @@ pub(super) async fn hub_network_start(
     advertise_ip: String,
 ) -> Result<(), String> {
     let settings = network_hosting::Settings::new(&bind, &advertise_ip)?;
-    let mut network_server = admin.network_server.lock().await;
-    if network_server
-        .as_ref()
-        .is_some_and(|s| !s.task.is_finished())
-    {
+    let mut lifecycle = admin.network_server.lock().await;
+    if lifecycle.running() {
         return Err("端末ネットワークはすでに起動しています。".into());
     }
-    start_network(admin, &mut network_server, settings, true).await
+    lifecycle.retry = None;
+    start_network(admin, &mut lifecycle.server, settings, true)
+        .await
+        .map_err(gateway_process::StartError::into_message)
+        .inspect_err(|reason| {
+            eprintln!(
+                "{} 接続受付を開始できません。{reason}",
+                time::OffsetDateTime::now_utc()
+            )
+        })
 }
 
 pub(super) async fn hub_network_start_saved(admin: &Arc<Admin>) -> Result<(), String> {
     // Keep the existing lifetime owner locked through lookup and start. Parallel
     // launch clicks see the running instance rather than replace its listeners.
-    let mut network_server = admin.network_server.lock().await;
-    if network_server
-        .as_ref()
-        .is_some_and(|server| !server.task.is_finished())
-    {
+    let mut lifecycle = admin.network_server.lock().await;
+    if lifecycle.running() {
         return Ok(());
     }
+    resume_network(admin, &mut lifecycle).await
+}
+
+async fn resume_network(
+    admin: &Arc<Admin>,
+    lifecycle: &mut NetworkLifecycle,
+) -> Result<(), String> {
     let settings = admin
         .network_hosting
         .lock()
         .map_err(|_| "ネットワーク起動設定を開けません。")?
         .configured()?;
-    start_network(admin, &mut network_server, settings, false).await
+    // Check the saved intent under the listener lock, including launches already in flight.
+    if settings.operator_paused() {
+        lifecycle.retry = None;
+        return Ok(());
+    }
+    match start_network(admin, &mut lifecycle.server, settings, false).await {
+        Ok(()) => {
+            lifecycle.retry = None;
+            Ok(())
+        }
+        Err(gateway_process::StartError::EndpointUnavailable(reason)) => {
+            lifecycle.retry_later(reason.clone());
+            Err(reason)
+        }
+        Err(error) => {
+            lifecycle.retry = None;
+            Err(error.into_message())
+        }
+    }
+}
+
+pub(super) async fn maintain(admin: &Arc<Admin>) {
+    let mut lifecycle = admin.network_server.lock().await;
+    if lifecycle.server.is_some() {
+        let gateway_exited = admin
+            .server
+            .lock()
+            .await
+            .as_mut()
+            .and_then(|server| server.gateway.as_mut())
+            .is_some_and(GatewayProcess::has_exited);
+        if gateway_exited {
+            if let Err(reason) = stop_listeners(admin, &mut lifecycle).await {
+                eprintln!(
+                    "{} 接続受付を停止できません。{reason}",
+                    time::OffsetDateTime::now_utc()
+                );
+                return;
+            }
+            lifecycle.retry_later("Gateway プロセスが終了しました。".into());
+        }
+    }
+    if lifecycle
+        .retry
+        .as_ref()
+        .is_some_and(|retry| Instant::now() >= retry.due)
+    {
+        if let Err(reason) = resume_network(admin, &mut lifecycle).await
+            && lifecycle.retry.is_none()
+        {
+            eprintln!(
+                "{} 接続受付を再開できません。{reason}",
+                time::OffsetDateTime::now_utc()
+            );
+        }
+    }
 }
 
 async fn start_network(
@@ -336,7 +443,7 @@ async fn start_network(
     network_server: &mut Option<NetworkServer>,
     settings: network_hosting::Settings,
     save_on_start: bool,
-) -> Result<(), String> {
+) -> Result<(), gateway_process::StartError> {
     let address = settings.bind;
     let public_ip = settings.advertise_ip;
     let mut server = admin.server.lock().await;
@@ -370,14 +477,21 @@ async fn start_network(
     );
     let listener = tokio::net::TcpListener::bind(address)
         .await
-        .map_err(|_| "TLS の待受を開始できません。IP とポートを確認してください。")?;
+        .map_err(|error| {
+            use std::io::ErrorKind;
+            match error.kind() {
+                ErrorKind::AddrNotAvailable => gateway_process::StartError::EndpointUnavailable(format!("このPCに待受IP {} が割り当てられていません。LANへの接続とIP設定を確認してください。", address.ip())),
+                ErrorKind::AddrInUse => gateway_process::StartError::EndpointUnavailable("TLS の待受を開始できません。IP とポートを確認してください。".into()),
+                _ => "TLS の待受を開始できません。IP とポートを確認してください。".into(),
+            }
+        })?;
     let local = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|_| "内部管理の待受を開始できません。")?;
     let local_address = local
         .local_addr()
         .map_err(|_| "内部管理の待受を確認できません。")?;
-    let gateway = GatewayProcess::start_with_network(
+    let gateway = GatewayProcess::start_companion(
         &std::env::current_exe().map_err(|_| "実行ファイルを確認できません。")?,
         format!("http://{local_address}"),
         admin.path.parent().ok_or("保存先がありません。")?,
@@ -412,13 +526,14 @@ async fn start_network(
             let stopped = gateway.stop().await;
             drop(listener);
             drop(local);
-            return Err(if stopped {
+            return Err((if stopped {
                 format!("{error} ネットワークの起動を取り消しました。")
             } else {
                 format!(
                     "{error} Hubの中継プロセスの終了を確認できません。Hubを再起動してください。"
                 )
-            });
+            })
+            .into());
         }
     }
     let local_router = service::router_with_registered_gateway(
@@ -486,11 +601,20 @@ async fn start_network(
         runtime,
         renewal,
     });
+    eprintln!(
+        "{} 接続受付を開始しました。{address}",
+        time::OffsetDateTime::now_utc()
+    );
     Ok(())
 }
 pub(super) async fn stop_network(admin: &Admin) -> Result<(), String> {
-    let mut owner = admin.network_server.lock().await;
-    if let Some(mut server) = owner.take() {
+    let mut lifecycle = admin.network_server.lock().await;
+    lifecycle.retry = None;
+    stop_listeners(admin, &mut lifecycle).await
+}
+
+async fn stop_listeners(admin: &Admin, lifecycle: &mut NetworkLifecycle) -> Result<(), String> {
+    if let Some(mut server) = lifecycle.server.take() {
         server.renewal.abort();
         let _ = server.renewal.await;
         // Close admission before canceling this Hub's model relay connections.
@@ -509,11 +633,24 @@ pub(super) async fn stop_network(admin: &Admin) -> Result<(), String> {
             server.task.abort();
         }
         gateway_result?;
+        eprintln!(
+            "{} 接続受付を停止しました。",
+            time::OffsetDateTime::now_utc()
+        );
     }
     Ok(())
 }
 pub(super) async fn hub_network_stop(admin: &Admin) -> Result<(), String> {
-    stop_network(admin).await
+    let mut lifecycle = admin.network_server.lock().await;
+    // Shutdown and Gateway recovery close the same listeners without changing the next launch.
+    admin
+        .network_hosting
+        .lock()
+        .map_err(|_| "ネットワーク起動設定を開けません。")?
+        .pause()
+        .map_err(|reason| format!("受付の停止状態を保存できません。{reason}"))?;
+    lifecycle.retry = None;
+    stop_listeners(admin, &mut lifecycle).await
 }
 
 fn export_value(admin: &Admin, hub_url: &str) -> Result<Value, String> {

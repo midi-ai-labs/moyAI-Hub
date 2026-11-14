@@ -17,6 +17,7 @@ pub struct LaunchReport {
     pub already_running: bool,
     pub web_url: String,
     pub network_running: bool,
+    pub network_paused: bool,
     pub needs_setup: bool,
     pub network_error: Option<String>,
     pub firewall_status: LaunchFirewallStatus,
@@ -284,6 +285,7 @@ pub async fn launch_server(
         already_running,
         web_url,
         network_running: false,
+        network_paused: false,
         needs_setup: false,
         network_error: None,
         firewall_status: LaunchFirewallStatus::NotChecked,
@@ -316,6 +318,8 @@ pub async fn launch_server(
         report.network_error = Some(error.to_owned());
     } else if hosting["configured"] == false {
         report.needs_setup = true;
+    } else if hosting["operator_paused"] == true {
+        report.network_paused = true;
     } else {
         match client.dispatch("hub_network_start_saved", json!({})).await {
             Ok(_) => {
@@ -328,6 +332,10 @@ pub async fn launch_server(
                 };
                 report.network_running = state["server"]["running"] == true
                     && state["server"]["gateway_bind"].is_string();
+                if !report.network_running && state["hosting"]["operator_paused"] == true {
+                    report.network_paused = true;
+                    return Ok(report);
+                }
                 if !report.network_running {
                     report.network_error = Some("Hub・Gateway の開始完了を確認できません。管理画面で状態を確認してください。".into());
                 }

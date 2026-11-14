@@ -4,7 +4,7 @@ use super::*;
 
 const MAX_DELEGATED_CONTEXTS: usize = 14;
 const MAX_APPROVE_CONTEXTS: usize = 15;
-const MAX_DELEGATIONS_PER_CLIENT: usize = 4096;
+const MAX_CLOSED_DELEGATIONS: usize = 4096;
 
 #[derive(Clone)]
 pub(super) struct DelegatedContext {
@@ -81,6 +81,14 @@ impl HubCore {
                 return Err(HubError::WrongOwner);
             }
         }
+        // An older execution that is still active retains its exact owner above.
+        if client
+            .retired_delegation_through
+            .as_deref()
+            .is_some_and(|end| execution <= end)
+        {
+            return Err(HubError::TurnClosed);
+        }
         let reviewed = client
             .contexts
             .get(parent)
@@ -90,11 +98,6 @@ impl HubCore {
                 current_revision: self.store.revision,
             });
         }
-        let active_count = client
-            .contexts
-            .values()
-            .filter(|context| context.delegated.is_some())
-            .count();
         let role_count = client
             .contexts
             .values()
@@ -110,10 +113,7 @@ impl HubCore {
         } else {
             MAX_DELEGATED_CONTEXTS
         };
-        if client.contexts.len() >= MAX_CONTEXTS_PER_CLIENT
-            || role_count >= role_limit
-            || active_count + client.closed_delegations.len() >= MAX_DELEGATIONS_PER_CLIENT
-        {
+        if client.contexts.len() >= MAX_CONTEXTS_PER_CLIENT || role_count >= role_limit {
             return Err(HubError::RegistryFull);
         }
         self.clients
@@ -170,16 +170,6 @@ impl HubCore {
             if !client.contexts.contains_key(parent) {
                 return Err(HubError::SelectionRequired);
             }
-            if client
-                .contexts
-                .values()
-                .filter(|context| context.delegated.is_some())
-                .count()
-                + client.closed_delegations.len()
-                >= MAX_DELEGATIONS_PER_CLIENT
-            {
-                return Err(HubError::RegistryFull);
-            }
             for other in ["main", "side_chat", "approve"] {
                 if other != parent
                     && client
@@ -189,12 +179,28 @@ impl HubCore {
                     return Err(HubError::WrongOwner);
                 }
             }
+            if client
+                .retired_delegation_through
+                .as_deref()
+                .is_some_and(|end| execution <= end)
+            {
+                return Err(HubError::TurnClosed);
+            }
         }
         let client = self.clients.get_mut(id).ok_or(HubError::UnknownClient)?;
         client.contexts.remove(&context_id);
         client
             .closed_delegations
             .insert(execution.into(), parent.into());
+        if client.closed_delegations.len() > MAX_CLOSED_DELEGATIONS
+            && let Some((oldest, _)) = client.closed_delegations.pop_first()
+            && client
+                .retired_delegation_through
+                .as_ref()
+                .is_none_or(|end| end < &oldest)
+        {
+            client.retired_delegation_through = Some(oldest);
+        }
         Ok(context_id)
     }
 

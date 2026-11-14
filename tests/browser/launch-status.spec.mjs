@@ -33,8 +33,24 @@ test("Repeated launches retain the same Hub and explain the existing instance in
         expect(reply.web_url).toBe(hub.url);
     }
     await page.goto(`${replies[0].web_url}#hub-already-running`);
-    await expect(page.locator("#notice")).toHaveText("moyAI Hub は起動済みです。稼働中の Hub の管理画面を開きました。");
+    await expect(page.locator("#notice-text")).toHaveText("moyAI Hub は起動済みです。稼働中の Hub の管理画面を開きました。");
     await expect(page.locator("#header-status")).toHaveText("Hub本体は稼働中");
     await expect(page).toHaveURL(hub.url);
     await testInfo.attach("existing-hub-status", { body: await page.screenshot(), contentType: "image/png" });
+});
+
+test("recovering from a failed poll clears the error and retains the operation notice", async ({ page, hub }, testInfo) => {
+    await page.goto(hub.url + "#hub-started");
+    await expect(page.locator("#notice")).toContainText("moyAI Hub を起動しました");
+    const route = "**/admin/command";
+    await page.route(route, request => request.request().postDataJSON()?.command === "hub_snapshot"
+        ? request.fulfill({ status: 503, json: { error: "試験用の一時停止" } }) : request.continue());
+    await expect(page.getByText("試験用の一時停止", { exact: true })).toBeVisible();
+    await page.unroute(route);
+    await expect(page.locator("#header-status")).toHaveText("Hub本体は稼働中");
+    await expect(page.getByText("試験用の一時停止", { exact: true })).toBeHidden();
+    await expect(page.locator("#notice")).toContainText("moyAI Hub を起動しました");
+    await testInfo.attach("recovered", { body: await page.screenshot(), contentType: "image/png" });
+    await page.locator("#notice").getByRole("button", { name: "閉じる" }).click();
+    await expect(page.locator("#notice")).toBeHidden();
 });

@@ -37,6 +37,48 @@ struct ClientToken {
     device: Option<String>,
 }
 
+fn register_session(
+    core: &mut HubCore,
+    tokens: &mut BTreeMap<String, ClientToken>,
+    label: &str,
+    peer: SocketAddr,
+    device: Option<String>,
+) -> Result<(String, String), (StatusCode, Json<Value>)> {
+    let now = now_ms();
+    let id = ulid::Ulid::new().to_string();
+    let secret = format!("{}{}", ulid::Ulid::new(), ulid::Ulid::new());
+    let retired = core
+        .register_client_in_registry(
+            &id,
+            label,
+            &peer.ip().to_string(),
+            now,
+            tokens.keys(),
+            tokens.len() >= 128,
+        )
+        .map_err(|error| match error {
+            HubError::RegistryFull => (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({"error":"registry_full"})),
+            ),
+            _ => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error":"invalid_registration"})),
+            ),
+        })?;
+    if let Some(old) = retired {
+        tokens.remove(&old);
+    }
+    tokens.insert(
+        id.clone(),
+        ClientToken {
+            secret: secret.clone(),
+            device,
+        },
+    );
+    Ok((id, secret))
+}
+
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -159,12 +201,6 @@ async fn device_session(
     Json(_): Json<DeviceSessionRequest>,
 ) -> ApiResult {
     let mut tokens = state.client_tokens.lock().map_err(|_| failed())?;
-    if tokens.len() >= 128 {
-        return Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({"error":"registry_full"})),
-        ));
-    }
     let network = state
         .network
         .as_ref()
@@ -176,17 +212,13 @@ async fn device_session(
         .map_err(crate::network::api::error)?;
     let label = projection["label"].as_str().ok_or_else(failed)?;
     let mut core = state.core.lock().map_err(|_| failed())?;
-    let id = ulid::Ulid::new().to_string();
-    let secret = format!("{}{}", ulid::Ulid::new(), ulid::Ulid::new());
-    core.register_client(&id, label, &identity.address.ip().to_string(), now_ms())
-        .map_err(|_| failed())?;
-    tokens.insert(
-        id.clone(),
-        ClientToken {
-            secret: secret.clone(),
-            device: Some(identity.device_id),
-        },
-    );
+    let (id, secret) = register_session(
+        &mut core,
+        &mut tokens,
+        label,
+        identity.address,
+        Some(identity.device_id),
+    )?;
     // Hub owns this initial automatic receiver policy. Desktop does not select a
     // first model independently, and must review the exact returned revision.
     let default_selection = initial_model_selection(&core.catalog_store().catalog);
@@ -357,29 +389,8 @@ async fn register(
 ) -> ApiResult {
     authorize(&headers, &state.token)?;
     let mut tokens = state.client_tokens.lock().map_err(|_| failed())?;
-    if tokens.len() >= 128 {
-        return Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({"error":"registry_full"})),
-        ));
-    }
-    let id = ulid::Ulid::new().to_string();
-    let secret = format!("{}{}", ulid::Ulid::new(), ulid::Ulid::new());
     let mut core = state.core.lock().map_err(|_| failed())?;
-    core.register_client(&id, &request.label, &peer.ip().to_string(), now_ms())
-        .map_err(|_| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error":"invalid_registration"})),
-            )
-        })?;
-    tokens.insert(
-        id.clone(),
-        ClientToken {
-            secret: secret.clone(),
-            device: None,
-        },
-    );
+    let (id, secret) = register_session(&mut core, &mut tokens, &request.label, peer, None)?;
     Ok(Json(
         json!({"id":id,"client_token":secret,"hub_id":core.catalog_store().hub_id,"revision":core.catalog_store().revision.to_string(),"heartbeat_interval_ms":10000,"supports_turn_heartbeat":true,"supports_delegated_execution":true,"identity_scope":"server_session"}),
     ))

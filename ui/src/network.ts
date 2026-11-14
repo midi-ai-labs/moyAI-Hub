@@ -20,7 +20,7 @@ export function attachDeviceNetwork(host: HTMLElement, clientsHost: HTMLElement,
         <details id="network-gateway-settings" data-details-key="network-gateway-settings"><summary>モデル通信ポートを変更する（通常は変更不要）</summary><form id="network-settings-form"><label>Gatewayポート<input id="network-gateway-port" inputmode="numeric" autocomplete="off" placeholder="9472" /></label><p class="footnote">通常は変更・保存せず、そのまま開始できます。標準ポートは9472です。変更は次回開始時に適用します。空欄または0にすると、開始するたびに空きポートを選びます。</p><p class="footnote">GatewayはAIとの通信を中継します。</p><button type="submit" class="secondary">ポート設定を保存</button></form></details>
         <form id="network-server-form"><div class="network-fields"><label>このHubのIP<input id="network-ip" placeholder="例: 192.168.1.10" required autocomplete="off" spellcheck="false" aria-describedby="network-ip-help" /></label><label>Hubポート<input id="network-port" value="9471" inputmode="numeric" required /></label></div>
         <p id="network-ip-help" class="footnote">参加PCから届くLANのIPを選んでください。同じPCのDesktopもこのIPを使います。127.0.0.1は、このPCだけで試す場合に使います。</p>
-        <p class="footnote">一度開始できたIPとポートは保存されます。次回はStart-Hub.cmdから同じ設定で再開できます。モデル接続とGatewayもまとめて開始・停止します。</p><p id="network-hosting-error" class="field-status error" role="status" hidden></p><div class="network-actions"><button id="network-start" class="primary">接続の受付を開始</button><button id="network-stop" type="button" class="danger" hidden>接続の受付を停止</button><button id="network-diagnose" type="button" class="secondary">接続状態を診断</button></div></form>
+        <p class="footnote">受付を開始できたIPとポートは保存されます。「接続の受付を停止」でPCの接続とモデル通信が止まり、Hubを起動し直しても停止を保ちます。再開するには「接続の受付を開始」を押してください。</p><p id="network-hosting-error" class="field-status error" role="status" hidden></p><div class="network-actions"><button id="network-start" class="primary">接続の受付を開始</button><button id="network-stop" type="button" class="danger" hidden>接続の受付を停止</button><button id="network-diagnose" type="button" class="secondary">接続状態を診断</button></div></form>
         <section id="network-diagnostic-result" aria-label="接続診断の結果" aria-live="polite" hidden></section>
         <details data-details-key="network-connection-details"><summary>接続と証明書の詳細</summary><p class="footnote">接続先のIPを変更した場合は、同じHub・同じCAの接続ファイルをDesktopで読み込み、変更先を確認してください。別Hubへの変更には接続のリセットが必要です。</p><p id="network-identity" class="network-mono"></p><p id="network-ca" class="network-mono"></p>
           <p id="network-gateway-bind" class="network-mono"></p>
@@ -126,7 +126,8 @@ export function attachDeviceNetwork(host: HTMLElement, clientsHost: HTMLElement,
             node("network-config-preview").hidden = true;
             node<HTMLTextAreaElement>("network-config-text").value = "";
         }
-        node("network-server-status").textContent = snapshot.server.running ? "稼働中" : "停止中";
+        const retry = snapshot.server.retry;
+        node("network-server-status").textContent = snapshot.server.running ? "稼働中" : retry ? "再試行待ち" : "停止中";
         firewall.refresh(networkDiagnosticTarget(snapshot), snapshot.server.running);
         const external = node<HTMLInputElement>("network-firewall-external-confirm").checked;
         const step = networkSetupStep(snapshot, firewallState, external);
@@ -143,15 +144,18 @@ export function attachDeviceNetwork(host: HTMLElement, clientsHost: HTMLElement,
         node("network-firewall-prerequisite").textContent = snapshot.server.running ? "現在のHubとGatewayのポートを使って受信許可を設定します。設定後の接続確認はDesktopで行ってください。" : "手順1で接続の受付を開始してから、受信許可を設定してください。";
         node("network-server-status").className = `badge ${snapshot.server.running ? "green" : "gray"}`;
         node("network-start").hidden = snapshot.server.running;
-        node("network-stop").hidden = !snapshot.server.running;
+        node("network-stop").hidden = !snapshot.server.running && !retry;
+        node("network-stop").textContent = retry ? "自動再試行を停止" : "接続の受付を停止";
         const address = owner.serverAddress();
         if (address && !node("network-server-form").contains(document.activeElement)) {
             node<HTMLInputElement>("network-ip").value = address.ip;
             node<HTMLInputElement>("network-port").value = address.port;
         }
-        node("network-hosting-error").hidden = !snapshot.hosting.error;
-        node("network-hosting-error").textContent = snapshot.hosting.error
-            ? `${snapshot.hosting.error} IPとポートを確認して接続の受付を開始すると、起動設定を保存し直せます。` : "";
+        const hostingError = retry
+            ? `${retry.reason} ${retry.delay_seconds}秒の間隔を空けて保存済みの設定で再試行します。`
+            : snapshot.hosting.error && `${snapshot.hosting.error} IPとポートを確認して接続の受付を開始すると、起動設定を保存し直せます。`;
+        node("network-hosting-error").hidden = !hostingError;
+        node("network-hosting-error").textContent = hostingError ?? "";
         node("network-identity").textContent = `Hub: ${snapshot.hub_id} / ${snapshot.server.bind ?? "停止中"} / 更新 ${snapshot.revision}`;
         node("network-ca").textContent = `公開CA SHA-256: ${snapshot.ca_sha256}`;
         const gatewayPort = node<HTMLInputElement>("network-gateway-port");

@@ -202,6 +202,33 @@ pub struct GatewayProcess {
     stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
 }
+
+#[derive(Debug)]
+pub(crate) enum StartError {
+    EndpointUnavailable(String),
+    Other(String),
+}
+
+impl StartError {
+    pub(crate) fn into_message(self) -> String {
+        match self {
+            Self::EndpointUnavailable(message) | Self::Other(message) => message,
+        }
+    }
+}
+
+impl From<String> for StartError {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+
+impl From<&str> for StartError {
+    fn from(message: &str) -> Self {
+        Self::Other(message.to_owned())
+    }
+}
+
 impl GatewayProcess {
     pub async fn start(
         executable: &Path,
@@ -216,6 +243,16 @@ impl GatewayProcess {
         directory: &Path,
         network: Option<GatewayNetwork>,
     ) -> Result<Self, String> {
+        Self::start_companion(executable, hub_url, directory, network)
+            .await
+            .map_err(StartError::into_message)
+    }
+    pub(crate) async fn start_companion(
+        executable: &Path,
+        hub_url: String,
+        directory: &Path,
+        network: Option<GatewayNetwork>,
+    ) -> Result<Self, StartError> {
         if execution_running(directory) {
             return Err(
                 "前回の Gateway の終了処理中です。完了後にもう一度開始してください。".into(),
@@ -273,7 +310,7 @@ impl GatewayProcess {
                 return Err("Gateway の起動に失敗し、子プロセスの終了を確認できません。".into());
             }
             return Err(match failure.startup_error {
-                StartupError::NetworkBindFailed => "Gateway の待受を開始できません。指定した IP とポートの使用状況を確認してください。".into(),
+                StartupError::NetworkBindFailed => StartError::EndpointUnavailable("Gateway の待受を開始できません。指定した IP とポートの使用状況を確認してください。".into()),
             });
         }
         let base = value
@@ -292,7 +329,13 @@ impl GatewayProcess {
             stdout,
         })
     }
+    pub(crate) fn has_exited(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(Some(_)))
+    }
     pub async fn stop(mut self) -> bool {
+        if self.has_exited() {
+            return true;
+        }
         // EOF closes admission and cancels only this companion's HTTP connections.
         drop(self.stdin.take());
         let mut completion = String::new();

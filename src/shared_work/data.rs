@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 
 const MAX_FILE: usize = 8 * 1024 * 1024;
 const MAX_ARCHIVE: usize = 64 * 1024 * 1024;
+const MAX_ASSET_ROWS: u64 = 100_000;
 const MAX_STORE: u64 = 2 * 1024 * 1024 * 1024;
 const COLUMNS: &str = "id,project_id,job_id,kind,name,sha256,byte_length,base_sha256,created_at_ms,version,purged_at_ms";
 
@@ -387,7 +388,7 @@ fn insert(
         return Ok(asset);
     }
     let (size,count): (u64,u64) = db.query_row("SELECT COALESCE(SUM(CASE WHEN purged_at_ms IS NULL THEN byte_length ELSE 0 END),0),COUNT(*) FROM shared_assets",[],|r|Ok((r.get(0)?,r.get(1)?)))?;
-    if size.saturating_add(bytes.len() as u64) > MAX_STORE || count >= 100_000 {
+    if size.saturating_add(bytes.len() as u64) > MAX_STORE || count >= MAX_ASSET_ROWS {
         return Err(WorkError::Capacity);
     }
     let version: u64 = db.query_row("SELECT COALESCE(MAX(version),0)+1 FROM shared_assets WHERE project_id=?1 AND job_id IS ?2 AND name=?3 AND kind=?4",params![project,job,upload.name,kind],|r|r.get(0))?;
@@ -419,9 +420,12 @@ fn download(db: &Connection, asset: Asset) -> Result<AssetDownload> {
 
 pub(super) fn storage_status(db: &Connection) -> Result<Value> {
     let (bytes,count,purged):(u64,u64,u64)=db.query_row("SELECT COALESCE(SUM(CASE WHEN purged_at_ms IS NULL THEN byte_length ELSE 0 END),0),COUNT(*),COALESCE(SUM(purged_at_ms IS NOT NULL),0) FROM shared_assets",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
-    Ok(
-        serde_json::json!({"retained_bytes":bytes,"asset_count":count,"purged_asset_count":purged,"limit_bytes":MAX_STORE}),
-    )
+    let jobs: u64 = db.query_row("SELECT COUNT(*) FROM shared_jobs", [], |row| row.get(0))?;
+    Ok(serde_json::json!({
+        "retained_bytes": bytes, "limit_bytes": MAX_STORE,
+        "asset_count": count, "asset_limit": MAX_ASSET_ROWS, "purged_asset_count": purged,
+        "job_count": jobs, "job_limit": store::MAX_RETAINED_JOBS,
+    }))
 }
 const PRUNABLE:&str="a.purged_at_ms IS NULL AND a.created_at_ms < ?1
  AND (a.job_id IS NULL OR EXISTS(SELECT 1 FROM shared_jobs j WHERE j.id=a.job_id AND j.state IN ('succeeded','failed','cancelled') AND j.updated_at_ms < ?1

@@ -5,6 +5,8 @@ export interface WebStatus {
     local_url: string | null;
     remote_url: string | null;
     settings_error?: string | null;
+    remote_error?: string | null;
+    remote_certificate_expires_at_ms?: number | null;
 }
 export function attachWebManagement(): { refresh: () => Promise<void> } {
     const host = document.createElement("section");
@@ -43,8 +45,15 @@ export function attachWebManagement(): { refresh: () => Promise<void> } {
                 if (input.value !== value) input.value = value;
                 node<HTMLButtonElement>(button).disabled = !value;
             }
-            node("web-settings-error").hidden = !status.settings_error;
-            node("web-settings-error").textContent = status.settings_error ?? "";
+            const expires = status.remote_certificate_expires_at_ms;
+            const certificateNotice = expires != null && expires <= Date.now() + 7 * 24 * 60 * 60 * 1000
+                ? "別PCからのWeb管理に使う証明書の有効期限は " + new Date(expires).toLocaleString("ja-JP") + " です。証明書を交換してHubを再起動してください。"
+                : "";
+            const error = status.settings_error ?? (status.remote_error
+                ? "別PCからのWeb管理は停止中です。" + status.remote_error + " 設定を確認してHubを再起動してください。"
+                : certificateNotice);
+            node("web-settings-error").hidden = !error;
+            node("web-settings-error").textContent = error ?? "";
             node("web-status").textContent = feedback ?? (!status.enabled ? "Web管理は停止中です。Hubの起動状態を確認してください。"
                 : status.remote_url?.startsWith("http:") ? "他のPCからの管理にはHTTPSの管理URLが必要です。現在のHTTPのURLでは利用できません。"
                 : status.remote_url ? "他の端末からもWeb管理を利用できます。" : "Web管理はHubと同じPCから利用できます。");

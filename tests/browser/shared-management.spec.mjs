@@ -81,7 +81,11 @@ test("maintenance releases only the confirmed attempt and retention preserves qu
   finally { db.close(); }
   await info.attach("retention-time-fixture",{body:Buffer.from(JSON.stringify({aged_asset_ids:[unused.id,retained.id],created_at_ms:Date.UTC(2020,0,1),real_time_wait:false,runner_process:false,device_id:deviceId})),contentType:"application/json"});
   await hub.restart(); await open(page,hub);
-  await page.locator('[data-sa-tab="storage"]').click(); await operation(page,"prune_shared_data");
+  await page.locator('[data-sa-tab="storage"]').click();
+  const usage = (await sharedSnapshot(page,hub)).storage;
+  await expect(page.locator("#shared-admin-content")).toContainText("仕事の登録数　" + usage.job_count + " / 100,000");
+  await expect(page.locator("#shared-admin-content")).toContainText("成果ファイルの登録数　2 / 100,000");
+  await operation(page,"prune_shared_data");
   await page.locator("#shared-admin-cutoff").fill("2021-01-01"); await page.locator("#shared-admin-preview").click();
   await expect(page.locator("#shared-admin-preview-result")).toContainText(`1件 / ${bytes.length} bytes`);
   await page.locator('input[name="preview_confirmed"]').check(); await save(page);

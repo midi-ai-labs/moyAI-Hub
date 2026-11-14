@@ -297,6 +297,8 @@ pub(crate) struct Manager {
 struct Running {
     local_url: String,
     remote_url: Option<String>,
+    remote_error: Option<String>,
+    remote_certificate_expires_at_ms: Option<i64>,
     endpoints: Vec<Endpoint>,
 }
 struct Endpoint {
@@ -379,9 +381,16 @@ impl Manager {
     fn status(&self, admin: &Admin) -> Value {
         let running = self.running.as_ref().filter(|running| running.alive());
         json!({ "enabled": running.is_some() && admin.web_access.enabled(), "epoch": admin.web_access.epoch(),
-            "local_url": running.map(|running| &running.local_url), "remote_url": running.and_then(|running| running.remote_url.as_ref()), "settings": self.settings, "settings_error": self.settings_error })
+            "local_url": running.map(|running| &running.local_url), "remote_url": running.and_then(|running| running.remote_url.as_ref()), "settings": self.settings, "settings_error": self.settings_error,
+            "remote_error": running.and_then(|running| running.remote_error.as_ref()),
+            "remote_certificate_expires_at_ms": running.and_then(|running| running.remote_certificate_expires_at_ms) })
     }
-    async fn enable(&mut self, admin: &Arc<Admin>, settings: WebSettings) -> Result<(), String> {
+    async fn enable(
+        &mut self,
+        admin: &Arc<Admin>,
+        settings: WebSettings,
+        resume_saved: bool,
+    ) -> Result<(), String> {
         if self.running.as_ref().is_some_and(Running::alive) {
             return Err("Web管理は既に公開中です。設定変更は停止後に行ってください。".into());
         }
@@ -392,20 +401,6 @@ impl Manager {
             );
         }
         let settings = settings.validated()?;
-        let prepared = settings.clone();
-        let acceptor = tokio::task::spawn_blocking(move || match prepared.remote {
-            Remote::Https {
-                certificate_path,
-                private_key_path,
-                public_origin,
-                ..
-            } => https_acceptor(&certificate_path, &private_key_path, &public_origin).map(Some),
-            _ => Ok(None),
-        })
-        .await
-        .map_err(|_| "Web管理の証明書を確認できません。")??;
-        // Bind both sockets before issuing any management access. Failure drops
-        // all prepared sockets and keeps the last successfully saved settings.
         let local = TcpListener::bind((Ipv4Addr::LOCALHOST, settings.local_port))
             .await
             .map_err(|_| "ローカルWeb管理の待受を開始できません。ポートを確認してください。")?;
@@ -415,26 +410,10 @@ impl Manager {
                 .local_addr()
                 .map_err(|_| "ローカルWeb管理の待受を確認できません。")?
         );
-        let remote = match &settings.remote {
-            Remote::Off => None,
-            Remote::Http {
-                bind,
-                public_origin,
-            }
-            | Remote::Https {
-                bind,
-                public_origin,
-                ..
-            }
-            | Remote::Proxy {
-                bind,
-                public_origin,
-            } => {
-                let listener = TcpListener::bind(bind).await.map_err(
-                    |_| "リモートWeb管理の待受を開始できません。IPとポートを確認してください。",
-                )?;
-                Some((listener, public_origin.clone()))
-            }
+        let (remote, remote_error) = match prepare_remote(settings.remote.clone()).await {
+            Ok(remote) => (remote, None),
+            Err(reason) if resume_saved => (None, Some(reason)),
+            Err(reason) => return Err(reason),
         };
         admin.web_access.enable()?;
         let access_id = admin
@@ -445,8 +424,8 @@ impl Manager {
             let local = WebPolicy::new(&local_origin, access_id.clone())?.local_management();
             let remote = remote
                 .as_ref()
-                .map(|(_, origin)| {
-                    let policy = WebPolicy::new(origin, access_id.clone())?;
+                .map(|prepared| {
+                    let policy = WebPolicy::new(&prepared.origin, access_id.clone())?;
                     Ok::<_, String>(if matches!(settings.remote, Remote::Proxy { .. }) {
                         policy.loopback_only()
                     } else {
@@ -474,29 +453,35 @@ impl Manager {
             local_url: format!("{local_origin}/admin/"),
             remote_url: remote
                 .as_ref()
-                .map(|(_, origin)| format!("{origin}/admin/")),
+                .map(|prepared| format!("{}/admin/", prepared.origin)),
+            remote_certificate_expires_at_ms: remote
+                .as_ref()
+                .and_then(|prepared| prepared.tls.as_ref().map(|(_, expiry)| *expiry)),
+            remote_error,
             endpoints: vec![local_endpoint],
         };
-        if let Some((listener, _)) = remote {
+        if let Some(prepared) = remote {
             let app = router(
                 Arc::downgrade(admin),
                 remote_policy.expect("remote listener has its policy"),
             );
-            running.endpoints.push(match acceptor {
-                Some(acceptor) => serve_https(listener, acceptor, app),
-                None => serve_http(listener, app),
+            running.endpoints.push(match prepared.tls {
+                Some((acceptor, _)) => serve_https(prepared.listener, acceptor, app),
+                None => serve_http(prepared.listener, app),
             });
         }
-        let destination = self.path.clone();
-        let saved_settings = settings.clone();
-        let saved = tokio::task::spawn_blocking(move || save(&destination, saved_settings))
-            .await
-            .map_err(|_| "Web管理設定を保存できません。".to_string())
-            .and_then(|result| result);
-        if let Err(error) = saved {
-            admin.web_access.disable();
-            running.stop().await;
-            return Err(error);
+        if !resume_saved {
+            let destination = self.path.clone();
+            let saved_settings = settings.clone();
+            let saved = tokio::task::spawn_blocking(move || save(&destination, saved_settings))
+                .await
+                .map_err(|_| "Web管理設定を保存できません。".to_string())
+                .and_then(|result| result);
+            if let Err(error) = saved {
+                admin.web_access.disable();
+                running.stop().await;
+                return Err(error);
+            }
         }
         self.settings = settings;
         self.settings_error = None;
@@ -504,6 +489,60 @@ impl Manager {
         Ok(())
     }
 }
+struct PreparedRemote {
+    listener: TcpListener,
+    origin: String,
+    tls: Option<(TlsAcceptor, i64)>,
+}
+
+async fn prepare_remote(remote: Remote) -> Result<Option<PreparedRemote>, String> {
+    let (bind, origin, acceptor) = match remote {
+        Remote::Off => return Ok(None),
+        Remote::Http {
+            bind,
+            public_origin,
+        }
+        | Remote::Proxy {
+            bind,
+            public_origin,
+        } => (bind, public_origin, None),
+        Remote::Https {
+            bind,
+            public_origin,
+            certificate_path,
+            private_key_path,
+        } => {
+            let name = public_origin.clone();
+            let acceptor = tokio::task::spawn_blocking(move || {
+                https_acceptor(&certificate_path, &private_key_path, &name)
+            })
+            .await
+            .map_err(|_| "Web管理の証明書を確認できません。")??;
+            (bind, public_origin, Some(acceptor))
+        }
+    };
+    let listener = TcpListener::bind(bind)
+        .await
+        .map_err(|_| "リモートWeb管理の待受を開始できません。IPとポートを確認してください。")?;
+    Ok(Some(PreparedRemote {
+        listener,
+        origin,
+        tls: acceptor,
+    }))
+}
+
+pub(crate) async fn resume_saved(admin: &Arc<Admin>) -> Result<Value, String> {
+    let mut manager = admin.web_server.lock().await;
+    if let Some(reason) = &manager.settings_error {
+        return Err(format!(
+            "{reason} Web管理設定を明示して開始し直してください。"
+        ));
+    }
+    let settings = manager.settings.clone();
+    manager.enable(admin, settings, true).await?;
+    Ok(manager.status(admin))
+}
+
 fn read_pem(path: &Path) -> Result<String, String> {
     let file = std::fs::File::open(path).map_err(
         |_| "証明書または秘密鍵を開けません。絶対パスと読み取り権限を確認してください。",
@@ -520,7 +559,7 @@ fn https_acceptor(
     certificate_path: &Path,
     private_key_path: &Path,
     origin: &str,
-) -> Result<TlsAcceptor, String> {
+) -> Result<(TlsAcceptor, i64), String> {
     let certificate = read_pem(certificate_path)?;
     let key = read_pem(private_key_path)?;
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -534,6 +573,7 @@ fn https_acceptor(
     if !parsed.validity().is_valid() {
         return Err("Web管理の証明書が有効期間外です。新しい証明書を指定してください。".into());
     }
+    let expires_at_ms = parsed.validity().not_after.timestamp() * 1000;
     let url = reqwest::Url::parse(origin).map_err(|_| "公開先のHTTPS URLを確認してください。")?;
     let name = rustls::pki_types::ServerName::try_from(
         url.host_str()
@@ -555,7 +595,7 @@ fn https_acceptor(
         .with_single_cert(certs, key)
         .map_err(|_| "証明書と秘密鍵の組み合わせを確認してください。")?;
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Ok(TlsAcceptor::from(Arc::new(config)))
+    Ok((TlsAcceptor::from(Arc::new(config)), expires_at_ms))
 }
 fn save(path: &Path, settings: WebSettings) -> Result<(), String> {
     let parent = path
@@ -672,7 +712,7 @@ pub(crate) async fn controls(
                     Some(value) => serde_json::from_value(value.clone())
                         .map_err(|_| "Web管理設定の入力を確認してください。")?,
                 };
-                manager.enable(&admin, settings).await?;
+                manager.enable(&admin, settings, false).await?;
             }
             "hub_web_disable" => {
                 manager.stop(&admin).await;

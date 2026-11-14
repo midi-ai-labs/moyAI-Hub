@@ -101,7 +101,19 @@ test("connection setup guides the first PC through start permission file and app
   await expect(page.locator("#network-next-detail")).toContainText("Desktopで接続を診断");
   await expect(page.locator("#network-step-confirm")).toContainText("仕事を実行するPCでは");
   await info.attach("network-next-after-first-approval",{body:await page.locator(".network-next-action").screenshot(),contentType:"image/png"});
-  await page.locator("#network-stop").click(); await expect(page.locator("#network-next-title")).toContainText("1.");
+  await page.locator("#network-stop").click();
+  await expect(page.locator("#network-next-title")).toHaveText("管理者が接続受付を停止しています");
+  await expect(page.locator("#network-next-detail")).toContainText("接続の受付を開始");
+  await expect(page.locator("#network-start")).toBeEnabled();
+  await hub.restart();
+  await page.goto(hub.url); await page.locator('nav a[href="#device-network"]').click();
+  await expect(page.locator("#network-next-title")).toHaveText("管理者が接続受付を停止しています");
+  await expect(page.locator("#network-ip")).toHaveValue("127.0.0.1");
+  await expect(page.locator("#network-port")).toHaveValue(String(hub.networkPort));
+  await info.attach("network-paused-after-restart",{body:await page.locator(".network-next-action").screenshot(),contentType:"image/png"});
+  await page.locator("#network-start").click();
+  await expect(page.locator("#network-stop")).toBeVisible();
+  await expect.poll(async () => (await hub.observeNetwork()).hosting.operator_paused).toBe(false);
 });
 
 test("team preparation registers and names an exact PC and enables project access without a human login",async({page,hub},info)=>{
