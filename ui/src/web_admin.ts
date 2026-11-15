@@ -50,7 +50,7 @@ export function attachWebManagement(): { refresh: () => Promise<void> } {
                 ? "別PCからのWeb管理に使う証明書の有効期限は " + new Date(expires).toLocaleString("ja-JP") + " です。証明書を交換してHubを再起動してください。"
                 : "";
             const error = status.settings_error ?? (status.remote_error
-                ? "別PCからのWeb管理は停止中です。" + status.remote_error + " 設定を確認してHubを再起動してください。"
+                ? "別PCからのWeb管理は停止中です。" + status.remote_error + " Hubが自動で開始し直します（最長1分ごと）。待受ポートの競合を解消するか証明書を交換すると、Hubを再起動せずに再開します。"
                 : certificateNotice);
             node("web-settings-error").hidden = !error;
             node("web-settings-error").textContent = error ?? "";

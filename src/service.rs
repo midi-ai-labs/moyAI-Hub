@@ -37,6 +37,9 @@ struct ClientToken {
     device: Option<String>,
 }
 
+/// Session tokens one listener may issue before it must reclaim an abandoned one.
+const MAX_CLIENT_TOKENS: usize = 128;
+
 fn register_session(
     core: &mut HubCore,
     tokens: &mut BTreeMap<String, ClientToken>,
@@ -54,7 +57,7 @@ fn register_session(
             &peer.ip().to_string(),
             now,
             tokens.keys(),
-            tokens.len() >= 128,
+            tokens.len() >= MAX_CLIENT_TOKENS,
         )
         .map_err(|error| match error {
             HubError::RegistryFull => (

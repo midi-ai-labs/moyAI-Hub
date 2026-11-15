@@ -16,10 +16,15 @@ struct NetworkRetry {
 }
 
 impl NetworkLifecycle {
-    fn running(&self) -> bool {
+    /// The started listeners, unless their serving task has already ended.
+    fn active_server(&self) -> Option<&NetworkServer> {
         self.server
             .as_ref()
-            .is_some_and(|server| !server.task.is_finished())
+            .filter(|server| !server.task.is_finished())
+    }
+
+    fn running(&self) -> bool {
+        self.active_server().is_some()
     }
 
     fn retry_later(&mut self, reason: String) {
@@ -27,10 +32,7 @@ impl NetworkLifecycle {
             (old.delay * 2).min(Duration::from_secs(60))
         });
         if self.retry.as_ref().is_none_or(|old| old.reason != reason) {
-            eprintln!(
-                "{} 接続受付の再試行を待機します。{reason}",
-                time::OffsetDateTime::now_utc()
-            );
+            crate::host_process::log_event(format_args!("接続受付の再試行を待機します。{reason}"));
         }
         self.retry = Some(NetworkRetry {
             due: Instant::now() + delay,
@@ -50,9 +52,7 @@ pub(super) struct NetworkServer {
 
 pub(super) fn firewall_endpoints(lifecycle: &NetworkLifecycle) -> Result<(&str, &str), String> {
     let server = lifecycle
-        .server
-        .as_ref()
-        .filter(|server| !server.task.is_finished())
+        .active_server()
         .ok_or("先に社内LANのHubとGatewayを開始してください。")?;
     let gateway = server
         .runtime
@@ -157,11 +157,9 @@ pub(super) fn hub_network_settings(
         .map_err(message)
 }
 pub(super) async fn hub_network_renew_certificate(admin: &Admin) -> Result<(), String> {
-    let server = admin.network_server.lock().await;
-    let server = server
-        .server
-        .as_ref()
-        .filter(|server| !server.task.is_finished())
+    let lifecycle = admin.network_server.lock().await;
+    let server = lifecycle
+        .active_server()
         .ok_or("端末ネットワークを開始してください。")?;
     server.runtime.renew(true, now_ms()).await.map_err(|_| {
         "証明書を更新できませんでした。現在の証明書の期限とGatewayの稼働状態を確認してください。"
@@ -171,11 +169,9 @@ pub(super) async fn hub_network_renew_certificate(admin: &Admin) -> Result<(), S
 pub(super) async fn hub_network_diagnostics(
     admin: &Admin,
 ) -> Result<network::server_runtime::NetworkDiagnostics, String> {
-    let server = admin.network_server.lock().await;
-    let server = server
-        .server
-        .as_ref()
-        .filter(|server| !server.task.is_finished())
+    let lifecycle = admin.network_server.lock().await;
+    let server = lifecycle
+        .active_server()
         .ok_or("端末ネットワークを開始してください。")?;
     server.runtime.diagnostics().await.map_err(message)
 }
@@ -354,10 +350,7 @@ pub(super) async fn hub_network_start(
         .await
         .map_err(gateway_process::StartError::into_message)
         .inspect_err(|reason| {
-            eprintln!(
-                "{} 接続受付を開始できません。{reason}",
-                time::OffsetDateTime::now_utc()
-            )
+            crate::host_process::log_event(format_args!("接続受付を開始できません。{reason}"))
         })
 }
 
@@ -413,10 +406,7 @@ pub(super) async fn maintain(admin: &Arc<Admin>) {
             .is_some_and(GatewayProcess::has_exited);
         if gateway_exited {
             if let Err(reason) = stop_listeners(admin, &mut lifecycle).await {
-                eprintln!(
-                    "{} 接続受付を停止できません。{reason}",
-                    time::OffsetDateTime::now_utc()
-                );
+                crate::host_process::log_event(format_args!("接続受付を停止できません。{reason}"));
                 return;
             }
             lifecycle.retry_later("Gateway プロセスが終了しました。".into());
@@ -430,10 +420,7 @@ pub(super) async fn maintain(admin: &Arc<Admin>) {
         if let Err(reason) = resume_network(admin, &mut lifecycle).await
             && lifecycle.retry.is_none()
         {
-            eprintln!(
-                "{} 接続受付を再開できません。{reason}",
-                time::OffsetDateTime::now_utc()
-            );
+            crate::host_process::log_event(format_args!("接続受付を再開できません。{reason}"));
         }
     }
 }
@@ -601,10 +588,7 @@ async fn start_network(
         runtime,
         renewal,
     });
-    eprintln!(
-        "{} 接続受付を開始しました。{address}",
-        time::OffsetDateTime::now_utc()
-    );
+    crate::host_process::log_event(format_args!("接続受付を開始しました。{address}"));
     Ok(())
 }
 pub(super) async fn stop_network(admin: &Admin) -> Result<(), String> {
@@ -633,10 +617,7 @@ async fn stop_listeners(admin: &Admin, lifecycle: &mut NetworkLifecycle) -> Resu
             server.task.abort();
         }
         gateway_result?;
-        eprintln!(
-            "{} 接続受付を停止しました。",
-            time::OffsetDateTime::now_utc()
-        );
+        crate::host_process::log_event("接続受付を停止しました。");
     }
     Ok(())
 }

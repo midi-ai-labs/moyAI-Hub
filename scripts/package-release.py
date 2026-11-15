@@ -17,10 +17,29 @@ import zipfile
 REPO = Path(__file__).resolve().parent.parent
 HUB_URL = "https://github.com/midi-ai-labs/moyAI-Hub"
 DESKTOP_URL = "https://github.com/midi-ai-labs/moyAI"
+# Edited only in moyAI/scripts/deployment and copied here by moyAI/scripts/sync-shared-scripts.ps1.
+SHARED_SCRIPTS = ("component-install.ps1", "sandbox-service.ps1", "Setup-Component.ps1")
 
 
 def digest(data):
     return hashlib.sha256(data).hexdigest()
+
+
+def shared_script_digest(data):
+    """SHA-256 of the content with CRLF normalized to LF, independent of the Git checkout."""
+    return digest(data.replace(b"\r\n", b"\n"))
+
+
+def verify_shared_scripts(scripts):
+    lock = json.loads((scripts / "shared-scripts.lock.json").read_text(encoding="utf-8"))
+    if lock.get("schema") != 1 or sorted(lock.get("files", {})) != sorted(SHARED_SCRIPTS):
+        raise ValueError("Shared setup script lock has an unsupported format")
+    for name in SHARED_SCRIPTS:
+        if shared_script_digest((scripts / name).read_bytes()) != lock["files"][name]:
+            raise ValueError(
+                f"Shared setup script differs from its lock: {name}. "
+                "Edit moyAI/scripts/deployment and run moyAI/scripts/sync-shared-scripts.ps1"
+            )
 
 
 def json_bytes(value):
@@ -138,7 +157,8 @@ def payload(repo, executable, notices, version, commit, desktop_commit, cleanup=
         # cmd.exe can misinterpret UTF-8 batch files with LF-only line endings.
         files[source.name] = source.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
     files["LICENSE"] = (repo / "LICENSE").read_bytes()
-    for name in ("Setup-Hub.ps1", "component-install.ps1", "Setup-Component.ps1", "sandbox-service.ps1"):
+    verify_shared_scripts(repo / "scripts")
+    for name in ("Setup-Hub.ps1", *SHARED_SCRIPTS):
         files["scripts/" + name] = (repo / "scripts" / name).read_bytes()
     files["THIRD_PARTY_NOTICES.txt"] = notices.read_bytes()
     if not files["THIRD_PARTY_NOTICES.txt"].strip():

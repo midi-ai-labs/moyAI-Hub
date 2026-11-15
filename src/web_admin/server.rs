@@ -11,7 +11,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 use tokio_rustls::{
@@ -299,8 +299,17 @@ struct Running {
     remote_url: Option<String>,
     remote_error: Option<String>,
     remote_certificate_expires_at_ms: Option<i64>,
+    /// Set while a saved remote listener failed at start; the maintenance loop
+    /// retries it so a freed port or a replaced certificate needs no Hub restart.
+    remote_retry: Option<RemoteRetry>,
     endpoints: Vec<Endpoint>,
 }
+struct RemoteRetry {
+    due: Instant,
+    delay: Duration,
+}
+const REMOTE_RETRY_FIRST: Duration = Duration::from_secs(2);
+const REMOTE_RETRY_MAX: Duration = Duration::from_secs(60);
 struct Endpoint {
     task: JoinHandle<()>,
     stop: Option<oneshot::Sender<()>>,
@@ -457,6 +466,10 @@ impl Manager {
             remote_certificate_expires_at_ms: remote
                 .as_ref()
                 .and_then(|prepared| prepared.tls.as_ref().map(|(_, expiry)| *expiry)),
+            remote_retry: remote_error.as_ref().map(|_| RemoteRetry {
+                due: Instant::now() + REMOTE_RETRY_FIRST,
+                delay: REMOTE_RETRY_FIRST,
+            }),
             remote_error,
             endpoints: vec![local_endpoint],
         };
@@ -488,6 +501,80 @@ impl Manager {
         self.running = Some(running);
         Ok(())
     }
+
+    /// Start the saved remote listener that failed when Web management resumed.
+    /// Each attempt re-reads the certificate files and binds again; failures
+    /// double the wait up to one minute, like the connection listener retry.
+    async fn retry_remote(&mut self, admin: &Arc<Admin>) {
+        let remote = self.settings.remote.clone();
+        let Some(running) = self.running.as_mut().filter(|running| running.alive()) else {
+            return;
+        };
+        let Some(delay) = running
+            .remote_retry
+            .as_ref()
+            .filter(|retry| Instant::now() >= retry.due)
+            .map(|retry| retry.delay)
+        else {
+            return;
+        };
+        let proxy = matches!(remote, Remote::Proxy { .. });
+        let attempt = async {
+            let prepared = prepare_remote(remote)
+                .await?
+                .ok_or("別PCからのWeb管理は設定で無効です。")?;
+            let access_id = admin
+                .web_access
+                .epoch()
+                .ok_or("Web管理の起動状態を確認できません。")?;
+            let policy = WebPolicy::new(&prepared.origin, access_id)?;
+            let policy = if proxy {
+                policy.loopback_only()
+            } else {
+                policy
+            };
+            if policy.secure {
+                admin
+                    .web_access
+                    .set_remote_origin(Some(policy.origin.clone()))?;
+            }
+            Ok::<_, String>((prepared, policy))
+        }
+        .await;
+        match attempt {
+            Ok((prepared, policy)) => {
+                running.remote_url = Some(format!("{}/admin/", prepared.origin));
+                running.remote_certificate_expires_at_ms =
+                    prepared.tls.as_ref().map(|(_, expiry)| *expiry);
+                let app = router(Arc::downgrade(admin), policy);
+                running.endpoints.push(match prepared.tls {
+                    Some((acceptor, _)) => serve_https(prepared.listener, acceptor, app),
+                    None => serve_http(prepared.listener, app),
+                });
+                running.remote_error = None;
+                running.remote_retry = None;
+                crate::host_process::log_event("別PCからのWeb管理を開始しました。");
+            }
+            Err(reason) => {
+                let delay = (delay * 2).min(REMOTE_RETRY_MAX);
+                if running.remote_error.as_deref() != Some(reason.as_str()) {
+                    crate::host_process::log_event(format_args!(
+                        "別PCからのWeb管理を開始できません。{reason}"
+                    ));
+                }
+                running.remote_error = Some(reason);
+                running.remote_retry = Some(RemoteRetry {
+                    due: Instant::now() + delay,
+                    delay,
+                });
+            }
+        }
+    }
+}
+
+/// Called by the Hub maintenance loop; does nothing unless a remote retry is due.
+pub(crate) async fn maintain(admin: &Arc<Admin>) {
+    admin.web_server.lock().await.retry_remote(admin).await;
 }
 struct PreparedRemote {
     listener: TcpListener,

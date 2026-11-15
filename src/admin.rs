@@ -346,6 +346,7 @@ impl Admin {
                 _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
             }
             network_admin::maintain(self).await;
+            crate::web_admin::server::maintain(self).await;
         }
     }
 }

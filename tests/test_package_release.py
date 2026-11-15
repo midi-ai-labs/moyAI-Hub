@@ -36,6 +36,7 @@ class PackageReleaseTests(unittest.TestCase):
             (self.repo / "scripts" / name).write_bytes(b"@echo off\r\n")
         for name in ("Setup-Hub.ps1", "component-install.ps1", "Setup-Component.ps1", "sandbox-service.ps1"):
             (self.repo / "scripts" / name).write_text("# product installer fixture\n", encoding="utf-8")
+        self.write_shared_lock()
         (self.repo / "LICENSE").write_text("product license", encoding="utf-8")
         (self.repo / "README.md").write_text(
             "[Guide](docs/guide.md)\n![Management](logo/moyai-hub-screenshot.jpg)", encoding="utf-8",
@@ -56,8 +57,30 @@ class PackageReleaseTests(unittest.TestCase):
         self.notices = self.root / "notices.txt"
         self.notices.write_text("existing dependency notices", encoding="utf-8")
 
+    def write_shared_lock(self):
+        hashes = {name: package.shared_script_digest((self.repo / "scripts" / name).read_bytes())
+                  for name in package.SHARED_SCRIPTS}
+        (self.repo / "scripts/shared-scripts.lock.json").write_bytes(
+            package.json_bytes({"schema": 1, "canonical": "moyAI/scripts/deployment", "files": hashes}))
+
     def files(self):
         return package.payload(self.repo, self.exe, self.notices, "1.0.0", COMMIT, DESKTOP_COMMIT)
+
+    def test_shared_setup_scripts_must_match_their_lock_regardless_of_line_endings(self):
+        (self.repo / "docs/guide.md").write_text("Guide", encoding="utf-8")
+        shared = self.repo / "scripts/component-install.ps1"
+        lf = shared.read_bytes().replace(b"\r\n", b"\n")
+        for checkout in (lf, lf.replace(b"\n", b"\r\n")):
+            shared.write_bytes(checkout)
+            self.files()
+        shared.write_text("# edited only in the Hub copy\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "differs from its lock: component-install.ps1"):
+            self.files()
+        self.write_shared_lock()
+        self.files()
+        (self.repo / "scripts/shared-scripts.lock.json").unlink()
+        with self.assertRaises(FileNotFoundError):
+            self.files()
 
     def test_seed_launchers_notices_docs_and_archive_have_matching_integrity_records(self):
         files, rewrites = self.files()

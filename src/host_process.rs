@@ -2,6 +2,7 @@
 //! The browser never receives this credential; --status and --stop connect here.
 pub mod launch;
 pub(crate) mod private_file;
+mod session_end;
 
 use crate::admin::Admin;
 use axum::{
@@ -26,6 +27,11 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{Notify, Semaphore};
+
+/// Writes one timestamped line to standard error, which is the Hub process log.
+pub(crate) fn log_event(message: impl std::fmt::Display) {
+    eprintln!("{} {message}", time::OffsetDateTime::now_utc());
+}
 
 const DESCRIPTOR: &str = "host-control.json";
 const DESCRIPTOR_LIMIT: u64 = 16 * 1024;
@@ -441,12 +447,9 @@ pub async fn run_server(catalog_path: PathBuf, settings: Option<Value>) -> Resul
             ));
         }
     };
-    eprintln!("{} Hubを起動しました。", time::OffsetDateTime::now_utc());
+    log_event("Hubを起動しました。");
     if let Some(reason) = web["remote_error"].as_str() {
-        eprintln!(
-            "{} 別PCからのWeb管理を開始できません。{reason}",
-            time::OffsetDateTime::now_utc()
-        );
+        log_event(format_args!("別PCからのWeb管理を開始できません。{reason}"));
     }
     println!("moyAI Hub: {}", web["local_url"].as_str().unwrap_or(""));
     if let Some(url) = web["remote_url"].as_str() {
@@ -477,24 +480,35 @@ pub async fn run_server(catalog_path: PathBuf, settings: Option<Value>) -> Resul
             .await
             .map_err(|error| format!("Ctrl+C handler failed: {error}"))
     };
+    let session_end = session_end::wait();
     let (listener_failed, interrupt_error, reason) = tokio::select! {
         _ = state.shutdown.notified() => (false, None, "管理操作"),
         _ = &mut server => (true, None, "ローカル管理待受の終了"),
         result = interrupt => (false, result.err(), "Ctrl+C"),
+        reason = session_end => (false, None, reason),
     };
-    eprintln!(
-        "{} Hubを終了します。理由は{reason}です。",
-        time::OffsetDateTime::now_utc()
-    );
-    // A browser close never changes server ownership. Only explicit stop/Ctrl+C does.
+    log_event(format_args!("Hubを終了します。理由は{reason}です。"));
+    // A browser close never changes server ownership. Only explicit stop/Ctrl+C
+    // or the end of the Windows session does.
     let _ = stop_maintenance.send(());
-    let result = tokio::time::timeout(Duration::from_secs(20), async {
+    // Windows ends the process a few seconds after a session-end notification.
+    let deadline = if session_end::is_session_end(reason) {
+        SESSION_END_SHUTDOWN_DEADLINE
+    } else {
+        Duration::from_secs(20)
+    };
+    let result = tokio::time::timeout(deadline, async {
         let _ = maintenance.await;
         state.admin.shutdown().await
     })
     .await
     .map_err(|_| "Hub ホストの終了処理が期限切れです。".to_string())
     .and_then(|result| result);
+    log_event(match &result {
+        Ok(()) => "Hubの終了処理を完了しました。".to_string(),
+        Err(error) => format!("Hubの終了処理を完了できませんでした。{error}"),
+    });
+    session_end::exit_finished();
     if !listener_failed {
         server.abort();
         let _ = server.await;
@@ -507,6 +521,9 @@ pub async fn run_server(catalog_path: PathBuf, settings: Option<Value>) -> Resul
     }
     result
 }
+
+/// Shorter than the Windows grace period after a console close, sign-out or shutdown.
+const SESSION_END_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(4);
 
 #[cfg(test)]
 mod tests;

@@ -480,6 +480,128 @@ async fn resuming_saved_expired_https_keeps_local_management_and_preserves_the_p
     shutdown(&admin).await;
 }
 
+async fn make_remote_retry_due(admin: &Arc<Admin>) {
+    let mut manager = admin.web_server.lock().await;
+    let retry = manager
+        .running
+        .as_mut()
+        .and_then(|running| running.remote_retry.as_mut())
+        .expect("a failed saved remote listener schedules a retry");
+    retry.due = Instant::now();
+}
+
+#[tokio::test]
+async fn saved_remote_management_recovers_after_certificate_replacement_without_hub_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let admin = open(&directory);
+    let port = free_port().await;
+    let (certificate_path, private_key_path, _) =
+        certificate(directory.path(), vec!["127.0.0.1".into()], false);
+    let settings = WebSettings {
+        local_port: 0,
+        remote: Remote::Https {
+            bind: format!("127.0.0.1:{port}"),
+            public_origin: format!("https://127.0.0.1:{port}"),
+            certificate_path,
+            private_key_path,
+        },
+    };
+    enable(&admin, settings).await.unwrap();
+    shutdown(&admin).await;
+    certificate(directory.path(), vec!["127.0.0.1".into()], true);
+    let started = resume_saved(&admin).await.unwrap();
+    assert!(started["remote_url"].is_null());
+    assert!(
+        started["remote_error"]
+            .as_str()
+            .unwrap()
+            .contains("有効期間外")
+    );
+
+    // A due retry with the certificate still expired keeps the error and backs off.
+    make_remote_retry_due(&admin).await;
+    maintain(&admin).await;
+    {
+        let manager = admin.web_server.lock().await;
+        let running = manager.running.as_ref().unwrap();
+        assert!(running.remote_url.is_none());
+        assert_eq!(
+            running.remote_retry.as_ref().unwrap().delay,
+            REMOTE_RETRY_FIRST * 2
+        );
+    }
+    // A retry that is not yet due does nothing, even after the certificate is fixed.
+    certificate(directory.path(), vec!["127.0.0.1".into()], false);
+    maintain(&admin).await;
+    assert!(status(&admin).await["remote_url"].is_null());
+
+    make_remote_retry_due(&admin).await;
+    maintain(&admin).await;
+    let recovered = status(&admin).await;
+    assert_eq!(recovered["enabled"], true);
+    assert!(recovered["remote_url"].is_string());
+    assert!(recovered["remote_error"].is_null());
+    assert!(
+        recovered["remote_certificate_expires_at_ms"]
+            .as_i64()
+            .unwrap()
+            > time::OffsetDateTime::now_utc().unix_timestamp() * 1000
+    );
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+    );
+    assert_eq!(
+        client()
+            .get(recovered["local_url"].as_str().unwrap())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    shutdown(&admin).await;
+}
+
+#[tokio::test]
+async fn remote_retry_backoff_is_capped_at_one_minute() {
+    let directory = tempfile::tempdir().unwrap();
+    let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let port = occupied.local_addr().unwrap().port();
+    let settings = WebSettings {
+        local_port: 0,
+        remote: Remote::Http {
+            bind: format!("127.0.0.1:{port}"),
+            public_origin: format!("http://127.0.0.1:{port}"),
+        },
+    };
+    save(&directory.path().join("web-management.json"), settings).unwrap();
+    let admin = open(&directory);
+    let started = resume_saved(&admin).await.unwrap();
+    assert!(started["remote_error"].is_string());
+    for _ in 0..8 {
+        make_remote_retry_due(&admin).await;
+        maintain(&admin).await;
+    }
+    {
+        let manager = admin.web_server.lock().await;
+        let retry = manager
+            .running
+            .as_ref()
+            .unwrap()
+            .remote_retry
+            .as_ref()
+            .unwrap();
+        assert_eq!(retry.delay, REMOTE_RETRY_MAX);
+    }
+    drop(occupied);
+    make_remote_retry_due(&admin).await;
+    maintain(&admin).await;
+    assert!(status(&admin).await["remote_url"].is_string());
+    shutdown(&admin).await;
+}
+
 #[tokio::test]
 async fn external_https_requires_matching_current_certificate_but_no_client_certificate() {
     let directory = tempfile::tempdir().unwrap();
