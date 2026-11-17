@@ -32,7 +32,7 @@ function deferred<T>() {
     const promise = new Promise<T>(yes => { resolve = yes; });
     return { resolve, promise };
 }
-const running: WebStatus = { enabled: true, local_url: "http://127.0.0.1:9080/admin/", remote_url: null };
+const running: WebStatus = { enabled: true, local_url: "http://127.0.0.1:9080/admin/", remote_url: null, remote_url_for_other_pcs: false };
 async function withUi(status: () => Promise<WebStatus>, run: (value: {
     node: (id: string) => NodeFixture; ui: ReturnType<typeof attachWebManagement>; calls: string[]; copied: string[];
     host: () => NodeFixture; setClipboard: (value: unknown) => void;
@@ -77,9 +77,23 @@ test("authenticated browser shows server-owned URLs without keys or listener lif
 test("remote HTTP exposes both URLs and missing Clipboard API offers manual selection", async () => {
     await withUi(async () => ({ ...running, remote_url: "http://192.0.2.10:9081/admin/" }), async ({ ui, node, setClipboard }) => {
         await ui.refresh(); assert.equal(node("web-remote-address").hidden, false);
+        assert.match(node("web-status").textContent, /HTTPSの管理URLが必要/);
         assert.equal(node("web-remote-url").value, "http://192.0.2.10:9081/admin/");
         setClipboard(undefined); await node("web-copy-remote-url").click();
         assert.match(node("web-status").textContent, /URL欄から選択/);
+    });
+});
+
+test("the same public URL can switch between a local listener and a network-facing listener", async () => {
+    let status = { ...running, remote_url: "https://management.example/admin/" };
+    await withUi(async () => status, async ({ ui, node }) => {
+        await ui.refresh();
+        assert.equal(node("web-remote-url").value, status.remote_url);
+        assert.match(node("web-status").textContent, /別のPCから直接管理できません/);
+        await node("web-copy-remote-url").click();
+        status = { ...status, remote_url_for_other_pcs: true };
+        await ui.refresh();
+        assert.match(node("web-status").textContent, /管理を許可されたPCのDesktop/);
     });
 });
 

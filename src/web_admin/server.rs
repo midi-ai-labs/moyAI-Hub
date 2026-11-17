@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     io::Write,
-    net::{Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -49,6 +49,41 @@ pub(crate) enum Remote {
         bind: String,
         public_origin: String,
     },
+}
+
+impl Remote {
+    fn has_other_pc_management_address(&self) -> bool {
+        let public_origin = match self {
+            Self::Https {
+                bind,
+                public_origin,
+                ..
+            } => {
+                if !bind
+                    .parse::<SocketAddr>()
+                    .is_ok_and(|addr| !addr.ip().to_canonical().is_loopback())
+                {
+                    return false;
+                }
+                public_origin
+            }
+            // The proxy accepts other PCs at the public origin and forwards over loopback.
+            Self::Proxy { public_origin, .. } => public_origin,
+            Self::Off | Self::Http { .. } => return false,
+        };
+        let Ok(url) = reqwest::Url::parse(public_origin) else {
+            return false;
+        };
+        let Some(host) = url.host_str() else {
+            return false;
+        };
+        if let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>() {
+            let ip = ip.to_canonical();
+            return !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast();
+        }
+        let host = host.trim_end_matches('.');
+        host != "localhost" && !host.ends_with(".localhost")
+    }
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -389,8 +424,11 @@ impl Manager {
     }
     fn status(&self, admin: &Admin) -> Value {
         let running = self.running.as_ref().filter(|running| running.alive());
+        let remote_url = running.and_then(|running| running.remote_url.as_ref());
         json!({ "enabled": running.is_some() && admin.web_access.enabled(), "epoch": admin.web_access.epoch(),
-            "local_url": running.map(|running| &running.local_url), "remote_url": running.and_then(|running| running.remote_url.as_ref()), "settings": self.settings, "settings_error": self.settings_error,
+            "local_url": running.map(|running| &running.local_url), "remote_url": remote_url,
+            "remote_url_for_other_pcs": remote_url.is_some() && self.settings.remote.has_other_pc_management_address(),
+            "settings": self.settings, "settings_error": self.settings_error,
             "remote_error": running.and_then(|running| running.remote_error.as_ref()),
             "remote_certificate_expires_at_ms": running.and_then(|running| running.remote_certificate_expires_at_ms) })
     }

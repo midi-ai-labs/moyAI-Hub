@@ -1,6 +1,41 @@
 use super::*;
 
 #[test]
+fn https_management_for_another_pc_requires_a_network_listener_and_public_host() {
+    for (bind, host, expected) in [
+        ("0.0.0.0:443", "192.168.1.12", true),
+        ("[::]:443", "[2001:db8::1]", true),
+        ("0.0.0.0:443", "127.example", true),
+        ("127.0.0.1:443", "hub.example", false),
+        ("[::1]:443", "hub.example", false),
+        ("0.0.0.0:443", "127.16.0.2", false),
+        ("0.0.0.0:443", "localhost.", false),
+        ("0.0.0.0:443", "team.localhost", false),
+        ("[::]:443", "[::1]", false),
+        ("[::]:443", "[::ffff:127.0.0.1]", false),
+        ("[::]:443", "[::]", false),
+        ("0.0.0.0:443", "0.0.0.0", false),
+    ] {
+        let remote = Remote::Https {
+            bind: bind.into(),
+            public_origin: format!("https://{host}"),
+            certificate_path: PathBuf::new(),
+            private_key_path: PathBuf::new(),
+        };
+        assert_eq!(
+            remote.has_other_pc_management_address(),
+            expected,
+            "{bind} -> {host}"
+        );
+    }
+    let local_proxy = Remote::Proxy {
+        bind: "127.0.0.1:8090".into(),
+        public_origin: "https://localhost".into(),
+    };
+    assert!(!local_proxy.has_other_pc_management_address());
+}
+
+#[test]
 fn owned_https_file_relocation_respects_components_and_external_paths() {
     let (source, destination) = if cfg!(windows) {
         (
@@ -82,6 +117,7 @@ async fn local_management_is_independent_and_settings_restore_without_access() {
     assert!(started.get("key").is_none());
     assert!(started.get("key_id").is_none());
     assert_eq!(started["remote_url"], Value::Null);
+    assert_eq!(started["remote_url_for_other_pcs"], false);
     assert_eq!(client().get(&url).send().await.unwrap().status(), 200);
     let local_session: Value = client()
         .get(format!("{}session", url))
@@ -129,6 +165,7 @@ async fn proxy_listener_uses_fixed_public_origin_and_survives_network_stop() {
     };
     let started = enable(&admin, settings).await.unwrap();
     assert_eq!(started["remote_url"], "https://management.example/admin/");
+    assert_eq!(started["remote_url_for_other_pcs"], true);
     let url = format!("http://127.0.0.1:{port}/admin/");
     assert_eq!(
         client()
@@ -190,6 +227,7 @@ async fn explicit_http_listener_serves_guidance_but_requires_safe_transport_for_
     .await
     .unwrap();
     assert_eq!(started["remote_url"], format!("{origin}/admin/"));
+    assert_eq!(started["remote_url_for_other_pcs"], false);
     let url = format!("http://127.0.0.1:{port}/admin/");
     let response = client()
         .get(format!("{url}session"))
